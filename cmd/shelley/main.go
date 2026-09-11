@@ -497,6 +497,7 @@ func buildLLMModelSources(ctx context.Context, global GlobalConfig, config shell
 	openAIKey := os.Getenv("OPENAI_API_KEY")
 	geminiKey := os.Getenv("GEMINI_API_KEY")
 	fireworksKey := os.Getenv("FIREWORKS_API_KEY")
+	cursorKey := os.Getenv("CURSOR_API_KEY")
 	// DEPRECATED: Per-provider env-var credentials are frozen. Do NOT add new
 	// env vars or models here; new models belong to the exe.dev LLM gateway or
 	// an exe.dev LLM integration.
@@ -550,7 +551,13 @@ func buildLLMModelSources(ctx context.Context, global GlobalConfig, config shell
 		sources = append(sources, modelsources.Env(anthropicKey, openAIKey, geminiKey, fireworksKey))
 	}
 
-	// 4. Predictable always available.
+	// 4. Cursor SDK models (optional; only with CURSOR_API_KEY). These run
+	// the Cursor agent via the cursorbridge TypeScript SDK bridge.
+	if cursorKey != "" {
+		sources = append(sources, modelsources.Cursor(cursorKey))
+	}
+
+	// 5. Predictable always available.
 	sources = append(sources, modelsources.Predictable())
 	return defaultModel, sources
 }

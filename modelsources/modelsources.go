@@ -68,6 +68,21 @@ func (s *Source) labelFor(p models.Provider) string {
 	return s.label
 }
 
+// Cursor returns a Source that materializes Cursor SDK models when a
+// CURSOR_API_KEY is present. These models run through the Cursor TypeScript
+// SDK bridge (cursorbridge), not a raw model API.
+func Cursor(apiKey string) Source {
+	if apiKey == "" {
+		return Source{}
+	}
+	return Source{
+		label: "$CURSOR_API_KEY",
+		providers: map[models.Provider]*providerConn{
+			models.ProviderCursor: {apiKey: apiKey},
+		},
+	}
+}
+
 // Predictable returns a Source that materializes only the predictable
 // test model. Always safe to include in any deployment.
 func Predictable() Source {

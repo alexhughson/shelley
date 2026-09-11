@@ -1,0 +1,10 @@
+{
+  "name": "shelley-cursor-bridge-daemon",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "JSONL stdio bridge between Shelley's Go agent loop and the Cursor TypeScript SDK (@cursor/sdk).",
+  "dependencies": {
+    "@cursor/sdk": "^1.0.31"
+  }
+}

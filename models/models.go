@@ -17,6 +17,7 @@ import (
 	"shelley.exe.dev/llm/gem"
 	"shelley.exe.dev/llm/llmhttp"
 	"shelley.exe.dev/llm/oai"
+	"shelley.exe.dev/cursorbridge"
 	"shelley.exe.dev/llm/predictable"
 	"shelley.exe.dev/models/modelsdev"
 )
@@ -31,6 +32,9 @@ const (
 	ProviderGemini    Provider = "gemini"
 	ProviderXAI       Provider = "xai"
 	ProviderBuiltIn   Provider = "builtin"
+	// ProviderCursor marks models served through the Cursor TypeScript SDK
+	// bridge (cursorbridge) rather than a raw model API.
+	ProviderCursor Provider = "cursor"
 )
 
 // SourceCustomLabel is the label used for custom (DB-backed) models.
@@ -59,6 +63,9 @@ const (
 	APITypeOpenAIChat        APIType = "openai-chat-completions"
 	APITypeGemini            APIType = "gemini"
 	APITypeBuiltIn           APIType = "builtin"
+	// APITypeCursorSDK marks models served through the Cursor TypeScript
+	// SDK bridge (see cursorbridge).
+	APITypeCursorSDK APIType = "cursor-sdk"
 )
 
 // Model is one entry in Shelley's catalog of built-in models.
@@ -406,6 +413,25 @@ func All() []Model {
 			APIType:        APITypeBuiltIn,
 			DefaultBaseURL: "-",
 			Build:          func(url, apiKey string, httpc *http.Client) llm.Service { return predictable.NewService() },
+		},
+		// Cursor SDK models run the Cursor agent (Composer) through the
+		// cursorbridge TypeScript SDK bridge, not a raw model API. They appear
+		// only when CURSOR_API_KEY is set (see modelsources.Cursor).
+		{
+			ID: "cursor-composer-2.5", Provider: ProviderCursor,
+			Description: "Cursor Composer 2.5 via the Cursor TypeScript SDK bridge",
+			APIModelName: "composer-2.5", APIType: APITypeCursorSDK, DefaultBaseURL: "cursor-sdk",
+			Build: func(url, apiKey string, httpc *http.Client) llm.Service {
+				return &cursorbridge.Service{APIKey: apiKey, ModelID: "composer-2.5"}
+			},
+		},
+		{
+			ID: "cursor-auto-smart", Provider: ProviderCursor,
+			Description: "Cursor Router (auto-smart) via the Cursor TypeScript SDK bridge",
+			APIModelName: "auto-smart", APIType: APITypeCursorSDK, DefaultBaseURL: "cursor-sdk",
+			Build: func(url, apiKey string, httpc *http.Client) llm.Service {
+				return &cursorbridge.Service{APIKey: apiKey, ModelID: "auto-smart"}
+			},
 		},
 	}
 }
