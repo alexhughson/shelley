@@ -20,6 +20,7 @@ templates/*.tar.gz
 # UI build outputs
 ui/dist/
 ui/node_modules/
+cursorbridge/daemon/node_modules/
 ui/.next/
 ui/out/
 

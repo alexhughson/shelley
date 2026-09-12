@@ -42,14 +42,10 @@ type Service struct {
 	DisplayName string
 	// NodeBin is the node executable; "" means "node" from PATH.
 	NodeBin string
-	// DaemonScript is daemon.mjs; "" uses the copy embedded via
-	// go:embed in this package.
+	// DaemonScript is daemon.mjs; "" uses the vendored checkout copy.
 	DaemonScript string
 	// Logger receives bridge diagnostics; defaults to slog.Default().
 	Logger *slog.Logger
-
-	// workingDirs are the cursor agent store scopes to use when a request has
-	// no working directory (empty WorkingDir on llm.WithWorkingDir ctx).
 
 	mu       sync.Mutex // guards the fields below
 	proc     *daemonProcess
@@ -88,10 +84,9 @@ func (s *Service) DefaultReasoningLevel() string { return "" }
 // Claude for patch tooling purposes.
 func (s *Service) PatchProfile() string { return "flat" }
 
-// Do executes one agent turn: it replays conversation history to the Cursor
-// agent and delivers new messages (text, tool results, images). Tool calls
-// made by the Cursor agent are executed via the tools carried on the request
-// and their results returned within the same turn.
+// Do runs one Shelley LLM round against a durable Cursor agent.
+// It returns at the next loop boundary: StopReasonToolUse (Shelley runs the
+// tool) or StopReasonEndTurn. Conversation id comes from ctx.
 func (s *Service) Do(ctx context.Context, req *llm.Request) (*llm.Response, error) {
 	if strings.TrimSpace(s.APIKey) == "" {
 		return nil, errors.New("cursor bridge: CURSOR_API_KEY is not set")
@@ -151,7 +146,7 @@ func (s *Service) startDaemonLocked(ctx context.Context) (*daemonProcess, error)
 		return nil, errors.New("cursor bridge: no daemon script available")
 	}
 	s.logger().Info("Starting Cursor SDK bridge daemon", "node", node, "script", script)
-	cmd := exec.CommandContext(ctx, node, script)
+	cmd := exec.Command(node, script)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -172,17 +167,18 @@ func (s *Service) startDaemonLocked(ctx context.Context) (*daemonProcess, error)
 		return nil, fmt.Errorf("cursor bridge: start daemon: %w", err)
 	}
 	p := &daemonProcess{
-		svc:    s,
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: stdout,
-		reqs:   make(map[string]chan *daemonLine),
-		tools:  make(map[string]chan *daemonLine),
+		svc:      s,
+		cmd:      cmd,
+		stdin:    stdin,
+		stdout:   stdout,
+		reqs:     make(map[string]chan *daemonLine),
+		sessions: make(map[string]*liveSession),
 	}
 	go p.readLoop()
 	go p.stderrLoop(stderr)
-	// Handshake: ping must answer before we trust the process.
-	pingCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Handshake is independent of the request ctx so a cancelled first Do
+	// does not kill the shared daemon.
+	pingCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := p.ping(pingCtx); err != nil {
 		p.kill()

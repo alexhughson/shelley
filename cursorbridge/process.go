@@ -2,14 +2,14 @@ package cursorbridge
 
 import (
 	"bufio"
-	"strconv"
-	"strings"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 
 	"shelley.exe.dev/llm"
@@ -23,10 +23,11 @@ type daemonProcess struct {
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
 
-	mu    sync.Mutex
-	reqs  map[string]chan *daemonLine // request id -> response line channel
-	tools map[string]chan *daemonLine // tool call id -> tool_call event channel
-	dead  bool
+	mu        sync.Mutex
+	reqs      map[string]chan *daemonLine // request/agent id -> event channel
+	sessions  map[string]*liveSession     // conversation id -> pending tool_use
+	lateTools map[string][]*daemonLine    // agent id -> tool_calls that missed the batch window
+	dead      bool
 }
 
 // flexStatus decodes a JSON field that may be a number (HTTP status on
@@ -49,18 +50,19 @@ func (f flexStatus) Int() int {
 
 // daemonLine is one decoded JSON line from the daemon.
 type daemonLine struct {
-	ID        string `json:"id"`
-	Op        string `json:"op"`
-	Event     string `json:"event"`
-	Req       string `json:"req"` // owning request id on tool_call events
-	OK        bool   `json:"ok"`
-	Node      string `json:"node"`
-	Error     string `json:"error"`
-	Err       string `json:"err"`
-	Retryable *bool  `json:"retryable"`
+	ID        string     `json:"id"`
+	Op        string     `json:"op"`
+	Event     string     `json:"event"`
+	Req       string     `json:"req"` // owning request id on tool_call events
+	Agent     string     `json:"agent"`
+	OK        bool       `json:"ok"`
+	Node      string     `json:"node"`
+	Error     string     `json:"error"`
+	Err       string     `json:"err"`
+	Retryable *bool      `json:"retryable"`
 	Status    flexStatus `json:"status"`
-	Code      string `json:"code"`
-	Cancelled bool   `json:"cancelled"`
+	Code      string     `json:"code"`
+	Cancelled bool       `json:"cancelled"`
 
 	// prompt events
 	Kind   string          `json:"kind"`   // "text" | "thinking" (delta)
@@ -136,11 +138,7 @@ func (p *daemonProcess) readLoop() {
 			// Response to a sync op (ping/models) — route by id.
 			p.routeReq(dl)
 		case "tool_call":
-			// The daemon wants Shelley to run a tool. Tool calls are tagged
-			// with the owning request id (daemon threads it through the
-			// custom tool closure), so they ride the request's event channel;
-			// do() spawns runTool which answers via op=tool_result keyed by
-			// the tool call id in p.tools (for late/routing edge cases).
+			// Tagged with req (current Do id). collect() yields StopReasonToolUse.
 			p.routeReq(dl)
 		default:
 			// delta / result for an in-flight prompt; routed via reqs.
@@ -157,13 +155,8 @@ func (p *daemonProcess) readLoop() {
 		}
 		delete(p.reqs, id)
 	}
-	for id, ch := range p.tools {
-		select {
-		case ch <- &daemonLine{ID: id}:
-		default:
-		}
-		delete(p.tools, id)
-	}
+	p.sessions = nil
+	p.lateTools = nil
 	p.mu.Unlock()
 }
 
@@ -174,6 +167,25 @@ func (p *daemonProcess) routeReq(dl daemonLine) {
 	}
 	p.mu.Lock()
 	ch := p.reqs[key]
+	if ch == nil && dl.Req != "" {
+		ch = p.reqs[dl.Req]
+	}
+	if ch == nil && dl.Agent != "" {
+		ch = p.reqs[dl.Agent]
+	}
+	if ch == nil && dl.Event == "tool_call" && dl.Agent != "" {
+		// The turn already yielded to Shelley and this call missed the batch
+		// window. Stash it so the next continueTurn delivers it instead of
+		// dropping it on the floor (a dropped call wedges the Cursor run until
+		// its 10-minute tool timeout).
+		if p.lateTools == nil {
+			p.lateTools = make(map[string][]*daemonLine)
+		}
+		p.lateTools[dl.Agent] = append(p.lateTools[dl.Agent], &dl)
+		p.mu.Unlock()
+		p.svc.logger().Warn("cursor bridge: tool call arrived after turn yielded; deferred to next round", "tool", dl.Name, "agent", dl.Agent)
+		return
+	}
 	p.mu.Unlock()
 	if ch != nil {
 		cl := dl
@@ -204,7 +216,7 @@ func (p *daemonProcess) send(v any) error {
 	return err
 }
 
-func (p *daemonProcess) sendToolResult(toolCallID string, out toolOutcome) error {
+func (p *daemonProcess) sendToolResult(toolCallID, reqID string, out toolOutcome) error {
 	content := make([]map[string]any, 0, len(out.Content))
 	for _, c := range out.Content {
 		switch c.Type {
@@ -223,12 +235,16 @@ func (p *daemonProcess) sendToolResult(toolCallID string, out toolOutcome) error
 	if len(content) == 0 {
 		content = append(content, map[string]any{"type": "text", "text": ""})
 	}
-	return p.send(map[string]any{
+	msg := map[string]any{
 		"id":      toolCallID,
 		"op":      "tool_result",
 		"content": content,
 		"isError": out.IsError,
-	})
+	}
+	if reqID != "" {
+		msg["req"] = reqID
+	}
+	return p.send(msg)
 }
 
 // ping performs the startup handshake.
