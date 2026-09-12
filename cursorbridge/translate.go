@@ -65,14 +65,13 @@ func (p *daemonProcess) do(ctx context.Context, svc *Service, req *llm.Request) 
 
 	prompt := buildPrompt(req)
 	payload := map[string]any{
-		"id":           reqID,
-		"op":           "prompt",
-		"apiKey":       svc.APIKey,
-		"model":        modelSelection(svc),
-		"systemPrompt": systemPromptText(req),
-		"cwd":          workingDirFor(ctx, req),
-		"message":      prompt.text,
-		"tools":        toolDescriptors(req),
+		"id":      reqID,
+		"op":      "prompt",
+		"apiKey":  svc.APIKey,
+		"model":   modelSelection(svc),
+		"cwd":     workingDirFor(ctx, req),
+		"message": promptText(req),
+		"tools":   toolDescriptors(req),
 	}
 	if len(prompt.images) > 0 {
 		payload["images"] = prompt.images
@@ -267,6 +266,19 @@ func workingDirFor(ctx context.Context, req *llm.Request) string {
 		return wd
 	}
 	return "/"
+}
+
+// promptText combines Shelley's system prompt and the rendered prompt into the
+// single user message the Cursor agent receives. The SDK's systemPrompt option
+// replaces Cursor's own agent-loop prompt and is gated per account, so the
+// bridge never uses it; instead the identity is stated inline, where the
+// Cursor agent treats it as part of the user's instructions.
+func promptText(req *llm.Request) string {
+	sys := systemPromptText(req)
+	if strings.TrimSpace(sys) == "" {
+		return buildPrompt(req).text
+	}
+	return "<system_instructions>\n" + strings.TrimSpace(sys) + "\n</system_instructions>\n\n" + buildPrompt(req).text
 }
 
 // systemPromptText concatenates Shelley's system prompt entries.

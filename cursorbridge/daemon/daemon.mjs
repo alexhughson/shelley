@@ -16,7 +16,7 @@
  *   {"id": "...", "op": "ping"}                                      -> {"id","ok":true,"node":"..."}
  *   {"id": "...", "op": "models"}                                    -> {"id","ok":true,"models":[{id,displayName,...}]}
  *   {"id": "...", "op": "prompt",
- *    "apiKey": "...", "model": "composer-2.5", "systemPrompt": "...",
+ *    "apiKey": "...", "model": {"id":"...","params":[...]},
  *    "cwd": "...", "message": "text...", "images": [{"data","mimeType"}...],
  *    "tools": [{"name","description","inputSchema"}...]}             -> streamed "events" lines then final result line
  *
@@ -205,7 +205,7 @@ async function execPrompt(req) {
     const agent = await Agent.create({
       apiKey: req.apiKey,
       model: req.model && typeof req.model === "object" ? req.model : { id: req.model },
-      systemPrompt: req.systemPrompt || undefined,
+      systemPrompt: undefined, // never used: gated per Cursor account; the prompt carries system text inline
       ...(customTools ? { tools: ["mcp"] } : { tools: [] }),
       local: {
         ...(req.cwd ? { cwd: req.cwd } : {}),
