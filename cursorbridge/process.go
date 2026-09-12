@@ -23,11 +23,10 @@ type daemonProcess struct {
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
 
-	mu        sync.Mutex
-	reqs      map[string]chan *daemonLine // request/agent id -> event channel
-	sessions  map[string]*liveSession     // conversation id -> pending tool_use
-	lateTools map[string][]*daemonLine    // agent id -> tool_calls that missed the batch window
-	dead      bool
+	mu       sync.Mutex
+	reqs     map[string]chan *daemonLine // request/agent id -> event channel
+	sessions map[string]*liveSession     // agent id -> in-flight run
+	dead     bool
 }
 
 // flexStatus decodes a JSON field that may be a number (HTTP status on
@@ -67,9 +66,10 @@ type daemonLine struct {
 	// prompt events
 	Kind   string          `json:"kind"`   // "text" | "thinking" (delta)
 	Text   string          `json:"text"`   // delta text or final result text
-	Name   string          `json:"name"`   // tool_call name
-	Result json.RawMessage `json:"result"` // tool_call completion payload
-	Args   json.RawMessage `json:"args"`   // tool_call args
+	Name   string          `json:"name"`   // single-call fallback name
+	Result json.RawMessage `json:"result"` // unused; kept for older daemon lines
+	Args   json.RawMessage `json:"args"`   // single-call fallback args
+	Calls  []bridgeCall    `json:"calls"`  // tool_calls batch
 
 	// models op
 	Models []CursorModel `json:"models"`
@@ -77,6 +77,13 @@ type daemonLine struct {
 	// result event
 	Usage *BridgeUsage `json:"usage"`
 	Model string       `json:"model"`
+}
+
+// bridgeCall is one custom-tool invocation in a tool_calls event.
+type bridgeCall struct {
+	ID   string          `json:"id"`
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args"`
 }
 
 // CursorModel is one entry of the daemon's models op response.
@@ -156,41 +163,25 @@ func (p *daemonProcess) readLoop() {
 		delete(p.reqs, id)
 	}
 	p.sessions = nil
-	p.lateTools = nil
 	p.mu.Unlock()
 }
 
 func (p *daemonProcess) routeReq(dl daemonLine) {
-	key := dl.ID
-	if dl.Event == "tool_call" && dl.Req != "" {
-		key = dl.Req
-	}
 	p.mu.Lock()
-	ch := p.reqs[key]
+	ch := p.reqs[dl.ID]
 	if ch == nil && dl.Req != "" {
 		ch = p.reqs[dl.Req]
 	}
 	if ch == nil && dl.Agent != "" {
 		ch = p.reqs[dl.Agent]
 	}
-	if ch == nil && dl.Event == "tool_call" && dl.Agent != "" {
-		// The turn already yielded to Shelley and this call missed the batch
-		// window. Stash it so the next continueTurn delivers it instead of
-		// dropping it on the floor (a dropped call wedges the Cursor run until
-		// its 10-minute tool timeout).
-		if p.lateTools == nil {
-			p.lateTools = make(map[string][]*daemonLine)
-		}
-		p.lateTools[dl.Agent] = append(p.lateTools[dl.Agent], &dl)
-		p.mu.Unlock()
-		p.svc.logger().Warn("cursor bridge: tool call arrived after turn yielded; deferred to next round", "tool", dl.Name, "agent", dl.Agent)
+	p.mu.Unlock()
+	if ch == nil {
+		p.svc.logger().Error("cursor bridge: event with no listener", "event", dl.Event, "id", dl.ID, "req", dl.Req, "agent", dl.Agent)
 		return
 	}
-	p.mu.Unlock()
-	if ch != nil {
-		cl := dl
-		ch <- &cl // buffered (256); do() drains continuously so this never blocks long
-	}
+	cl := dl
+	ch <- &cl
 }
 
 func (p *daemonProcess) stderrLoop(r io.Reader) {
@@ -223,13 +214,15 @@ func (p *daemonProcess) sendToolResult(toolCallID, reqID string, out toolOutcome
 		case llm.ContentTypeText:
 			content = append(content, map[string]any{"type": "text", "text": c.Text})
 		default:
-			// Best-effort JSON dump for anything richer (images, etc.).
-			if b, err := json.Marshal(c); err == nil {
-				var m map[string]any
-				if json.Unmarshal(b, &m) == nil {
-					content = append(content, m)
-				}
+			b, err := json.Marshal(c)
+			if err != nil {
+				return fmt.Errorf("cursor bridge: encode tool result: %w", err)
 			}
+			var m map[string]any
+			if err := json.Unmarshal(b, &m); err != nil {
+				return fmt.Errorf("cursor bridge: encode tool result: %w", err)
+			}
+			content = append(content, m)
 		}
 	}
 	if len(content) == 0 {

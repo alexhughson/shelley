@@ -3,6 +3,7 @@ package cursorbridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -50,17 +51,15 @@ type pendingTool struct {
 type liveSession struct {
 	agentID string
 	pending []pendingTool
+	events  chan *daemonLine // lives until the Cursor run ends
 }
 
-func conversationKey(ctx context.Context) string {
-	return llmhttp.ConversationIDFromContext(ctx)
-}
-
-func agentIDFor(ctx context.Context) string {
-	if id := conversationKey(ctx); id != "" {
-		return id
+func conversationAgentID(ctx context.Context, modelID string) string {
+	id := llmhttp.ConversationIDFromContext(ctx)
+	if id == "" {
+		return newRequestID() + ":" + modelID
 	}
-	return newRequestID()
+	return id + ":" + modelID
 }
 
 func (p *daemonProcess) sessionOf(key string) *liveSession {
@@ -84,6 +83,28 @@ func (p *daemonProcess) clearSession(key string) {
 	delete(p.sessions, key)
 }
 
+func (p *daemonProcess) attach(id string, ch chan *daemonLine) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reqs[id] = ch
+}
+
+func (p *daemonProcess) detach(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.reqs, id)
+}
+
+func (p *daemonProcess) endRun(reqID, agentID string) {
+	p.mu.Lock()
+	delete(p.reqs, reqID)
+	if agentID != "" {
+		delete(p.reqs, agentID)
+		delete(p.sessions, agentID)
+	}
+	p.mu.Unlock()
+}
+
 // do runs one Shelley LLM round. Cursor owns the durable agent; this returns
 // at the next native loop boundary: tool_use (loop runs the tool) or end_turn.
 func (p *daemonProcess) do(ctx context.Context, svc *Service, req *llm.Request) (*llm.Response, error) {
@@ -91,10 +112,7 @@ func (p *daemonProcess) do(ctx context.Context, svc *Service, req *llm.Request) 
 	if purpose != "" {
 		return p.oneshot(ctx, svc, req, purpose)
 	}
-	key := conversationKey(ctx)
-	if key == "" {
-		key = agentIDFor(ctx)
-	}
+	key := conversationAgentID(ctx, svc.ModelID)
 	if st := p.sessionOf(key); st != nil && len(st.pending) > 0 {
 		return p.continueTurn(ctx, svc, req, key, st)
 	}
@@ -104,49 +122,67 @@ func (p *daemonProcess) do(ctx context.Context, svc *Service, req *llm.Request) 
 func (p *daemonProcess) oneshot(ctx context.Context, svc *Service, req *llm.Request, purpose string) (*llm.Response, error) {
 	reqID := newRequestID()
 	events := make(chan *daemonLine, 256)
-	p.mu.Lock()
-	p.reqs[reqID] = events
-	p.mu.Unlock()
-	defer p.dropReq(reqID)
+	p.attach(reqID, events)
+	defer p.detach(reqID)
 
+	cwd, err := workingDirFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tools, err := toolDescriptors(req)
+	if err != nil {
+		return nil, err
+	}
 	payload := map[string]any{
 		"id":      reqID,
 		"op":      "prompt",
 		"oneshot": true,
-		"apiKey":  svc.APIKey,
 		"model":   modelSelection(svc),
-		"cwd":     workingDirFor(ctx),
+		"cwd":     cwd,
 		"seed":    seedPrompt(req),
 		"message": oneshotMessage(req),
-		"tools":   toolDescriptors(req),
+		"tools":   tools,
+	}
+	if imgs := allImages(req); len(imgs) > 0 {
+		payload["seedImages"] = imgs
 	}
 	if err := p.send(payload); err != nil {
 		return nil, &bridgeError{msg: err.Error(), retryable: true}
 	}
-	resp, err := p.collect(ctx, svc, req, reqID, events, "", nil, nil)
-	if err == nil && purpose == "compaction" {
-		if id := conversationKey(ctx); id != "" {
-			p.resetAgent(id)
+	resp, err := p.collect(ctx, svc, req, reqID, events, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	if purpose == "compaction" {
+		if id := llmhttp.ConversationIDFromContext(ctx); id != "" {
+			if err := p.resetAgent(ctx, id+":"+svc.ModelID); err != nil {
+				return nil, err
+			}
 		}
 	}
-	return resp, err
+	return resp, nil
 }
 
-func (p *daemonProcess) resetAgent(agentID string) {
+func (p *daemonProcess) resetAgent(ctx context.Context, agentID string) error {
 	reqID := newRequestID()
 	ch := make(chan *daemonLine, 4)
-	p.mu.Lock()
-	p.reqs[reqID] = ch
-	p.mu.Unlock()
-	defer p.dropReq(reqID)
+	p.attach(reqID, ch)
+	defer p.detach(reqID)
 	if err := p.send(map[string]any{"id": reqID, "op": "reset", "agentId": agentID}); err != nil {
-		return
+		return &bridgeError{msg: err.Error(), retryable: true}
 	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	select {
-	case <-ch:
-	case <-time.After(3 * time.Second):
+	case <-ctx.Done():
+		return fmt.Errorf("cursor bridge: reset %s: %w", agentID, ctx.Err())
+	case dl := <-ch:
+		if !dl.OK {
+			return fmt.Errorf("cursor bridge: reset %s: %s", agentID, dl.ErrorOrErr())
+		}
+		p.clearSession(agentID)
+		return nil
 	}
-	p.clearSession(agentID)
 }
 
 func oneshotMessage(req *llm.Request) string {
@@ -161,26 +197,32 @@ func (p *daemonProcess) startTurn(ctx context.Context, svc *Service, req *llm.Re
 	reqID := newRequestID()
 	events := make(chan *daemonLine, 256)
 	agentID := key
-	p.mu.Lock()
-	p.reqs[reqID] = events
-	p.reqs[agentID] = events
-	p.mu.Unlock()
-	defer func() {
-		p.dropReq(reqID)
-		p.dropReq(agentID)
-	}()
+	st := &liveSession{agentID: agentID, events: events}
+	p.attach(reqID, events)
+	p.attach(agentID, events)
+	defer p.detach(reqID)
 
+	cwd, err := workingDirFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tools, err := toolDescriptors(req)
+	if err != nil {
+		return nil, err
+	}
 	message, images := newUserPrompt(req)
 	payload := map[string]any{
 		"id":      reqID,
 		"op":      "prompt",
 		"agentId": agentID,
-		"apiKey":  svc.APIKey,
 		"model":   modelSelection(svc),
-		"cwd":     workingDirFor(ctx),
+		"cwd":     cwd,
 		"seed":    seedPrompt(req),
 		"message": message,
-		"tools":   toolDescriptors(req),
+		"tools":   tools,
+	}
+	if seedImgs := allImages(req); len(seedImgs) > 0 {
+		payload["seedImages"] = seedImgs
 	}
 	if len(images) > 0 {
 		payload["images"] = images
@@ -188,46 +230,69 @@ func (p *daemonProcess) startTurn(ctx context.Context, svc *Service, req *llm.Re
 	if err := p.send(payload); err != nil {
 		return nil, &bridgeError{msg: err.Error(), retryable: true}
 	}
-	st := &liveSession{agentID: agentID}
-	return p.collect(ctx, svc, req, reqID, events, key, st, nil)
+	return p.collect(ctx, svc, req, reqID, events, key, st)
 }
 
 func (p *daemonProcess) continueTurn(ctx context.Context, svc *Service, req *llm.Request, key string, st *liveSession) (*llm.Response, error) {
-	// Tool calls that missed the previous batch window were stashed by
-	// routeReq. Re-yield them as tool_use blocks so Shelley executes them
-	// normally this round instead of wedging the Cursor run on a result
-	// that would never arrive.
-	late := p.takeLateTools(st.agentID)
 	reqID := newRequestID()
-	events := make(chan *daemonLine, 256)
-	p.mu.Lock()
-	p.reqs[reqID] = events
-	p.reqs[st.agentID] = events
-	p.mu.Unlock()
-	defer func() {
-		p.dropReq(reqID)
-		p.dropReq(st.agentID)
-	}()
+	events := st.events
+	if events == nil {
+		return nil, errors.New("cursor bridge: session has no event channel")
+	}
+	p.attach(reqID, events)
+	p.attach(st.agentID, events)
+	defer p.detach(reqID)
 
 	results, extra, err := matchToolResults(req, st.pending)
 	if err != nil {
 		return nil, &bridgeError{msg: err.Error(), retryable: false}
 	}
+	sent := make(map[string]bool, len(results))
 	for _, r := range results {
 		if err := p.sendToolResult(r.id, reqID, r.out); err != nil {
+			var keep []pendingTool
+			for _, pt := range st.pending {
+				if !sent[pt.id] {
+					keep = append(keep, pt)
+				}
+			}
+			st.pending = keep
+			p.putSession(key, st)
 			return nil, &bridgeError{msg: err.Error(), retryable: true}
 		}
+		sent[r.id] = true
 	}
 	st.pending = nil
 	if extra != "" {
-		_ = p.send(map[string]any{
-			"id":      reqID,
-			"op":      "steer",
-			"agentId": st.agentID,
-			"text":    extra,
-		})
+		if err := p.steer(ctx, st.agentID, extra); err != nil {
+			return nil, err
+		}
 	}
-	return p.collect(ctx, svc, req, reqID, events, key, st, late)
+	return p.collect(ctx, svc, req, reqID, events, key, st)
+}
+
+func (p *daemonProcess) steer(ctx context.Context, agentID, text string) error {
+	id := newRequestID()
+	ch := make(chan *daemonLine, 4)
+	p.attach(id, ch)
+	defer p.detach(id)
+	if err := p.send(map[string]any{
+		"id":      id,
+		"op":      "steer",
+		"agentId": agentID,
+		"text":    text,
+	}); err != nil {
+		return &bridgeError{msg: err.Error(), retryable: true}
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case dl := <-ch:
+		if !dl.OK {
+			return fmt.Errorf("cursor bridge: steer: %s", dl.ErrorOrErr())
+		}
+		return nil
+	}
 }
 
 type namedResult struct {
@@ -272,21 +337,6 @@ func matchToolResults(req *llm.Request, pending []pendingTool) ([]namedResult, s
 	return results, strings.TrimSpace(extra.String()), nil
 }
 
-func (p *daemonProcess) dropReq(id string) {
-	p.mu.Lock()
-	delete(p.reqs, id)
-	p.mu.Unlock()
-}
-
-// takeLateTools pops the deferred tool calls stashed for one agent.
-func (p *daemonProcess) takeLateTools(agentID string) []*daemonLine {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	out := p.lateTools[agentID]
-	delete(p.lateTools, agentID)
-	return out
-}
-
 func (p *daemonProcess) collect(
 	ctx context.Context,
 	svc *Service,
@@ -295,7 +345,6 @@ func (p *daemonProcess) collect(
 	events chan *daemonLine,
 	key string,
 	st *liveSession,
-	late []*daemonLine, // tool_calls deferred from the previous batch window
 ) (*llm.Response, error) {
 	start := time.Now()
 	stopCancel := context.AfterFunc(ctx, func() {
@@ -311,21 +360,6 @@ func (p *daemonProcess) collect(
 	var thinking strings.Builder
 	var usage llm.Usage
 	var toolUses []llm.Content
-	// Deferred tool calls from the previous window are yielded immediately:
-	// Shelley must run them before the Cursor run can make progress.
-	deferred := len(late) > 0
-	for _, dl := range late {
-		args := dl.Args
-		if len(args) == 0 {
-			args = json.RawMessage("{}")
-		}
-		toolUses = append(toolUses, llm.Content{
-			Type:      llm.ContentTypeToolUse,
-			ID:        dl.ID,
-			ToolName:  dl.Name,
-			ToolInput: args,
-		})
-	}
 
 	handleDelta := func(dl *daemonLine) {
 		if dl.Kind == "thinking" {
@@ -341,22 +375,33 @@ func (p *daemonProcess) collect(
 		}
 	}
 
-	addTool := func(dl *daemonLine) {
-		args := dl.Args
-		if len(args) == 0 {
-			args = json.RawMessage("{}")
+	addCalls := func(dl *daemonLine) {
+		calls := dl.Calls
+		if len(calls) == 0 && (dl.Name != "" || dl.Event == "tool_call") {
+			args := dl.Args
+			if len(args) == 0 {
+				args = json.RawMessage("{}")
+			}
+			calls = []bridgeCall{{ID: dl.ID, Name: dl.Name, Args: args}}
 		}
-		toolUses = append(toolUses, llm.Content{
-			Type:      llm.ContentTypeToolUse,
-			ID:        dl.ID,
-			ToolName:  dl.Name,
-			ToolInput: args,
-		})
+		for _, c := range calls {
+			args := c.Args
+			if len(args) == 0 {
+				args = json.RawMessage("{}")
+			}
+			id := c.ID
+			if id == "" {
+				id = dl.ID
+			}
+			toolUses = append(toolUses, llm.Content{
+				Type:      llm.ContentTypeToolUse,
+				ID:        id,
+				ToolName:  c.Name,
+				ToolInput: args,
+			})
+		}
 	}
 
-	const batchGrace = 300 * time.Millisecond
-	// yieldTools flushes the collected tool batch to Shelley: records it as
-	// the session's pending set and returns a tool_use response.
 	yieldNow := func() *llm.Response {
 		if st != nil {
 			st.pending = pendingFrom(toolUses)
@@ -365,84 +410,52 @@ func (p *daemonProcess) collect(
 		return finishResponse(svc, text.String(), thinking.String(), toolUses, usage, llm.StopReasonToolUse, start)
 	}
 
-	for {
-		if deferred {
-			// Late tools from the previous window: skip waiting for new
-			// events and yield them (plus anything already queued) now.
-			for {
-				select {
-				case more := <-events:
-					switch more.Event {
-					case "tool_call":
-						addTool(more)
-					case "delta":
-						handleDelta(more)
-					default:
-					}
-				default:
-					return yieldNow(), nil
-				}
-			}
+	endFailed := func(err error) (*llm.Response, error) {
+		if st != nil {
+			p.endRun(reqID, st.agentID)
+		} else if key != "" {
+			p.clearSession(key)
 		}
+		return nil, err
+	}
+
+	for {
 		select {
 		case <-ctx.Done():
-			if key != "" {
-				p.clearSession(key)
-			}
-			return nil, ctx.Err()
+			return endFailed(ctx.Err())
 		case dl, ok := <-events:
 			if !ok {
-				return nil, &bridgeError{msg: "cursor bridge: event channel closed", retryable: true}
+				return endFailed(&bridgeError{msg: "cursor bridge: event channel closed", retryable: true})
 			}
 			switch dl.Event {
 			case "":
-				// sync ack (steer/reset); ignore
+				// sync ack for an op multiplexed on this channel; ignore
 			case "delta":
 				handleDelta(dl)
-			case "tool_call":
-				addTool(dl)
-				// The Cursor agent may emit several custom-tool calls in one
-				// burst; there is no explicit batch-end signal in the SDK.
-				// Collect siblings until a short grace period passes with no
-				// new call (or the run ends), then yield the batch to Shelley.
-				for {
-					select {
-					case more := <-events:
-						switch more.Event {
-						case "tool_call":
-							addTool(more)
-						case "delta":
-							handleDelta(more)
-						case "result":
-							// The run ended while tools were pending (results already
-							// delivered by a previous round). Yield anyway so the
-							// tool_use blocks are still persisted.
-							return yieldNow(), nil
-						default:
-						}
-					case <-time.After(batchGrace):
-						return yieldNow(), nil
-					case <-ctx.Done():
-						return yieldNow(), nil
-					}
-				}
+			case "tool_call", "tool_calls":
+				addCalls(dl)
+				return yieldNow(), nil
 			case "result":
-				if !dl.OK {
-					if key != "" {
-						p.clearSession(key)
+				if dl.Cancelled {
+					if err := ctx.Err(); err != nil {
+						return endFailed(err)
 					}
+					return endFailed(context.Canceled)
+				}
+				if !dl.OK {
 					retryable := dl.Retryable != nil && *dl.Retryable
-					return nil, &bridgeError{msg: fmt.Sprintf("cursor agent run failed: %s", dl.ErrorOrErr()), retryable: retryable}
+					return endFailed(&bridgeError{msg: fmt.Sprintf("cursor agent run failed: %s", dl.ErrorOrErr()), retryable: retryable})
 				}
 				if dl.Usage != nil {
 					usage = usageFromBridge(dl.Usage)
 				}
-				// Deltas this round only. result.text is the whole Cursor run.
 				final := text.String()
 				if strings.TrimSpace(final) == "" {
 					final = dl.Text
 				}
-				if key != "" {
+				if st != nil {
+					p.endRun(reqID, st.agentID)
+				} else if key != "" {
 					p.clearSession(key)
 				}
 				return finishResponse(svc, final, thinking.String(), nil, usage, llm.StopReasonEndTurn, start), nil
@@ -460,12 +473,21 @@ func pendingFrom(tools []llm.Content) []pendingTool {
 	return out
 }
 
+// usageFromBridge maps Cursor TokenUsage onto llm.Usage.
+// Cursor's inputTokens is the full prompt. cacheRead/cacheWrite are a
+// breakdown of that prompt, not extra tokens. Subtract them so
+// TotalInputTokens() does not count the cached span twice.
 func usageFromBridge(u *BridgeUsage) llm.Usage {
 	if u == nil {
 		return llm.Usage{}
 	}
+	input := u.InputTokens
+	cached := u.CacheReadTokens + u.CacheWriteTokens
+	if cached > 0 && input >= cached {
+		input -= cached
+	}
 	return llm.Usage{
-		InputTokens:              u.InputTokens,
+		InputTokens:              input,
 		OutputTokens:             u.OutputTokens,
 		CacheCreationInputTokens: u.CacheWriteTokens,
 		CacheReadInputTokens:     u.CacheReadTokens,
@@ -506,19 +528,20 @@ func cmpOr(a, b string) string {
 	return b
 }
 
-func workingDirFor(ctx context.Context) string {
+func workingDirFor(ctx context.Context) (string, error) {
 	if wd := llm.WorkingDir(ctx); wd != "" {
-		return wd
+		return wd, nil
 	}
-	if wd, err := os.Getwd(); err == nil {
-		return wd
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("cursor bridge: working directory: %w", err)
 	}
-	return "/"
+	return wd, nil
 }
 
-func toolDescriptors(req *llm.Request) []map[string]any {
+func toolDescriptors(req *llm.Request) ([]map[string]any, error) {
 	if len(req.Tools) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]map[string]any, 0, len(req.Tools))
 	for _, t := range req.Tools {
@@ -531,7 +554,7 @@ func toolDescriptors(req *llm.Request) []map[string]any {
 		}
 		var schemaObj map[string]any
 		if err := json.Unmarshal(schema, &schemaObj); err != nil {
-			schemaObj = map[string]any{"type": "object", "properties": map[string]any{}}
+			return nil, fmt.Errorf("cursor bridge: tool %s schema: %w", t.Name, err)
 		}
 		desc := t.Description
 		if t.CustomGrammar != "" {
@@ -544,7 +567,7 @@ func toolDescriptors(req *llm.Request) []map[string]any {
 		})
 	}
 	if len(out) == 0 {
-		return nil
+		return nil, nil
 	}
-	return out
+	return out, nil
 }

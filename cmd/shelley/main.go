@@ -498,9 +498,8 @@ func buildLLMModelSources(ctx context.Context, global GlobalConfig, config shell
 	geminiKey := os.Getenv("GEMINI_API_KEY")
 	fireworksKey := os.Getenv("FIREWORKS_API_KEY")
 	cursorKey := os.Getenv("CURSOR_API_KEY")
-	// DEPRECATED: Per-provider env-var credentials are frozen. Do NOT add new
-	// env vars or models here; new models belong to the exe.dev LLM gateway or
-	// an exe.dev LLM integration.
+	// DEPRECATED: Per-provider env-var credentials are frozen for raw model
+	// APIs. CURSOR_API_KEY is the Cursor agent SDK, not a raw model API.
 
 	var sources []modelsources.Source
 

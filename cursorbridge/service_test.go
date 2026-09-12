@@ -11,7 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"shelley.exe.dev/llm"
 	"shelley.exe.dev/llm/llmhttp"
@@ -26,7 +25,6 @@ const pending = new Map(); // toolCallId -> {resolve, session}
 const agents = new Set();
 const sessions = new Map(); // agentId -> {currentReqId, cancelled}
 const send = (o) => process.stdout.write(JSON.stringify(o) + "\n");
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function emit(session, obj) {
   send({ id: session.currentReqId, agent: session.agentId, ...obj });
@@ -47,8 +45,14 @@ rl.on("line", (line) => {
     }
     return;
   }
-  if (req.op === "steer") { send({ id: req.id, ok: true, outcome: "complete_delivered" }); return; }
-  if (req.op === "reset") { agents.delete(req.agentId); sessions.delete(req.agentId); send({ id: req.id, ok: true }); return; }
+  if (req.op === "steer") {
+    if ((req.text || "").includes("STEER_FAIL")) { send({ id: req.id, ok: false, error: "steer refused" }); return; }
+    send({ id: req.id, ok: true, outcome: "complete_delivered" }); return;
+  }
+  if (req.op === "reset") {
+    if ((req.agentId || "").includes("resetfail")) { send({ id: req.id, ok: false, error: "reset refused" }); return; }
+    agents.delete(req.agentId); sessions.delete(req.agentId); send({ id: req.id, ok: true }); return;
+  }
   if (req.op === "cancel") {
     const sess = sessions.get(req.agentId);
     if (sess) sess.cancelled = true;
@@ -71,21 +75,29 @@ rl.on("line", (line) => {
       sessions.set(agentId, session);
       const text = created ? (req.seed || req.message || "") : (req.message || "");
       if (text.includes("SLOW")) {
+        emit(session, { event: "delta", kind: "text", text: "SLOW_STARTED" });
         await new Promise((resolve) => pending.set("__slow__" + agentId, { resolve }));
         emit(session, { event: "result", ok: false, error: "run cancelled", cancelled: true });
         return;
       }
       emit(session, { event: "delta", kind: "text", text: "Hello " });
-      if ((req.message || "").includes("LATE")) {
-        // Two tool calls separated by more than the Go batch grace window:
-        // the second arrives after the turn has already yielded. It must be
-        // deferred and re-yielded, not dropped.
+      if ((req.message || "").includes("BATCH")) {
         const t1 = req.tools[0];
         const t2 = req.tools[1];
-        emit(session, { id: "call-late-a", req: session.currentReqId, event: "tool_call", name: t1.name, args: { n: "a" } });
-        await sleep(600);
-        emit(session, { id: "call-late-b", req: session.currentReqId, event: "tool_call", name: t2.name, args: { n: "b" } });
-        return; // run stays open; results arrive via tool_result op
+        emit(session, { event: "tool_calls", calls: [
+          { id: "call-batch-a", name: t1.name, args: { n: "a" } },
+          { id: "call-batch-b", name: t2.name, args: { n: "b" } },
+        ] });
+        return;
+      }
+      if ((req.message || "").includes("LATE")) {
+        // Two tool_calls events. collect yields the first; the second stays
+        // on the persistent agent channel and must be re-yielded next Do.
+        const t1 = req.tools[0];
+        const t2 = req.tools[1];
+        emit(session, { event: "tool_calls", calls: [{ id: "call-late-a", name: t1.name, args: { n: "a" } }] });
+        emit(session, { event: "tool_calls", calls: [{ id: "call-late-b", name: t2.name, args: { n: "b" } }] });
+        return;
       }
       emit(session, { event: "delta", kind: "text", text: "from bridge." });
       if (req.tools && req.tools.length > 0) {
@@ -93,7 +105,7 @@ rl.on("line", (line) => {
         const callId = "call-1";
         const result = await new Promise((resolve) => {
           pending.set(callId, { resolve, session });
-          emit(session, { id: callId, req: session.currentReqId, event: "tool_call", name: t.name, args: { value: 42 } });
+          emit(session, { event: "tool_calls", calls: [{ id: callId, name: t.name, args: { value: 42 } }] });
         });
         emit(session, { event: "delta", kind: "text", text: " Tool ran: " + JSON.stringify(result.content) });
       }
@@ -153,8 +165,11 @@ func TestDoSimplePrompt(t *testing.T) {
 	if resp.StopReason != llm.StopReasonEndTurn {
 		t.Errorf("stop reason = %v", resp.StopReason)
 	}
-	if resp.Usage.InputTokens != 10 || resp.Usage.OutputTokens != 5 || resp.Usage.CacheReadInputTokens != 2 || resp.Usage.CacheCreationInputTokens != 1 {
+	if resp.Usage.InputTokens != 7 || resp.Usage.OutputTokens != 5 || resp.Usage.CacheReadInputTokens != 2 || resp.Usage.CacheCreationInputTokens != 1 {
 		t.Errorf("usage = %+v", resp.Usage)
+	}
+	if resp.Usage.TotalInputTokens() != 10 {
+		t.Errorf("total input = %d, want 10 (cache counted once)", resp.Usage.TotalInputTokens())
 	}
 	if resp.StartTime == nil || resp.EndTime == nil || !resp.EndTime.After(*resp.StartTime) && resp.EndTime.Equal(*resp.StartTime) {
 		// zero duration is possible on a fast fake; just require both set
@@ -260,17 +275,35 @@ func TestUsageDoesNotUnderflow(t *testing.T) {
 	}
 }
 
+func cancelWhenStarted(t *testing.T, cancel context.CancelFunc) func(llm.StreamDelta) {
+	t.Helper()
+	started := make(chan struct{})
+	go func() {
+		select {
+		case <-started:
+			cancel()
+		case <-t.Context().Done():
+		}
+	}()
+	return func(d llm.StreamDelta) {
+		if !strings.Contains(d.Text, "SLOW_STARTED") {
+			return
+		}
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+	}
+}
+
 func TestDoCancellation(t *testing.T) {
 	svc := testService(t)
 	ctx, cancel := context.WithCancel(convCtx("c-cancel"))
-	req := &llm.Request{
+	_, err := svc.Do(ctx, &llm.Request{
 		Messages: []llm.Message{llm.UserStringMessage("SLOW please")},
-	}
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
-	_, err := svc.Do(ctx, req)
+		OnStream: cancelWhenStarted(t, cancel),
+	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
@@ -279,11 +312,10 @@ func TestDoCancellation(t *testing.T) {
 func TestDaemonSurvivesRequestCancel(t *testing.T) {
 	svc := testService(t)
 	ctx1, cancel := context.WithCancel(convCtx("c-die"))
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
-	_, err := svc.Do(ctx1, &llm.Request{Messages: []llm.Message{llm.UserStringMessage("SLOW")}})
+	_, err := svc.Do(ctx1, &llm.Request{
+		Messages: []llm.Message{llm.UserStringMessage("SLOW")},
+		OnStream: cancelWhenStarted(t, cancel),
+	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("first Do: %v", err)
 	}
@@ -463,8 +495,8 @@ func TestLateToolCallNotDropped(t *testing.T) {
 	tools := []*llm.Tool{mk("tool_a"), mk("tool_b")}
 	ctx := convCtx("c-late")
 
-	// First round: fake daemon emits tool_a, then tool_b 600ms later — after
-	// the 300ms batch grace. tool_a yields now; tool_b must be deferred.
+	// First round: fake daemon emits two tool_calls events. collect yields
+	// the first; the second stays on the persistent agent channel.
 	resp, err := svc.Do(ctx, &llm.Request{
 		Messages: []llm.Message{llm.UserStringMessage("LATE test")},
 		Tools:    tools,
@@ -508,5 +540,111 @@ func TestLateToolCallNotDropped(t *testing.T) {
 	}
 	if !sawB {
 		t.Fatalf("deferred tool_b was dropped; content: %+v", resp2.Content)
+	}
+}
+
+func TestUsageFromBridgeDoesNotRepeatCache(t *testing.T) {
+	u := usageFromBridge(&BridgeUsage{InputTokens: 34363, CacheReadTokens: 22592, OutputTokens: 270})
+	if u.InputTokens != 34363-22592 {
+		t.Fatalf("uncached input = %d, want %d", u.InputTokens, 34363-22592)
+	}
+	if u.CacheReadInputTokens != 22592 {
+		t.Fatalf("cache read = %d", u.CacheReadInputTokens)
+	}
+	if u.TotalInputTokens() != 34363 {
+		t.Fatalf("TotalInputTokens = %d, want 34363 (cache counted once)", u.TotalInputTokens())
+	}
+	if u.ContextWindowUsed() != 34363+270 {
+		t.Fatalf("ContextWindowUsed = %d, want %d", u.ContextWindowUsed(), 34363+270)
+	}
+}
+
+func TestUsageFromBridgeKeepsSeparateWhenInputSmaller(t *testing.T) {
+	u := usageFromBridge(&BridgeUsage{InputTokens: 50, CacheReadTokens: 80, OutputTokens: 5})
+	if u.InputTokens != 50 {
+		t.Fatalf("input = %d, want 50 (do not subtract when input < cache)", u.InputTokens)
+	}
+	if u.TotalInputTokens() != 130 {
+		t.Fatalf("TotalInputTokens = %d, want 130", u.TotalInputTokens())
+	}
+}
+
+func TestToolCallsBatchYieldsTogether(t *testing.T) {
+	svc := testService(t)
+	mk := func(name string) *llm.Tool {
+		return &llm.Tool{
+			Name: name, Description: name, InputSchema: llm.EmptySchema(),
+			Run: func(ctx context.Context, input json.RawMessage) llm.ToolOut {
+				return llm.ToolOut{LLMContent: llm.TextContent("ok")}
+			},
+		}
+	}
+	resp, err := svc.Do(convCtx("c-batch"), &llm.Request{
+		Messages: []llm.Message{llm.UserStringMessage("BATCH please")},
+		Tools:    []*llm.Tool{mk("tool_a"), mk("tool_b")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, c := range resp.Content {
+		if c.Type == llm.ContentTypeToolUse {
+			ids[c.ID] = true
+		}
+	}
+	if !ids["call-batch-a"] || !ids["call-batch-b"] {
+		t.Fatalf("batch missing calls: %+v", resp.Content)
+	}
+}
+
+func TestSteerErrorSurfaces(t *testing.T) {
+	svc := testService(t)
+	ctx := convCtx("c-steer")
+	tool := &llm.Tool{
+		Name: "my_tool", Description: "t", InputSchema: llm.EmptySchema(),
+		Run: func(ctx context.Context, input json.RawMessage) llm.ToolOut {
+			return llm.ToolOut{LLMContent: llm.TextContent("ok")}
+		},
+	}
+	resp, err := svc.Do(ctx, &llm.Request{
+		Messages: []llm.Message{llm.UserStringMessage("use the tool")},
+		Tools:    []*llm.Tool{tool},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var callID string
+	for _, c := range resp.Content {
+		if c.Type == llm.ContentTypeToolUse {
+			callID = c.ID
+		}
+	}
+	history := []llm.Message{
+		llm.UserStringMessage("use the tool"),
+		resp.ToMessage(),
+		{Role: llm.MessageRoleUser, Content: []llm.Content{
+			{Type: llm.ContentTypeToolResult, ToolUseID: callID, ToolResult: llm.TextContent("ok")},
+			{Type: llm.ContentTypeText, Text: "STEER_FAIL please"},
+		}},
+	}
+	_, err = svc.Do(ctx, &llm.Request{Messages: history, Tools: []*llm.Tool{tool}})
+	if err == nil || !strings.Contains(err.Error(), "steer refused") {
+		t.Fatalf("want steer error, got %v", err)
+	}
+}
+
+func TestCompactResetFailure(t *testing.T) {
+	svc := testService(t)
+	if _, err := svc.Do(convCtx("c-resetfail"), &llm.Request{
+		Messages: []llm.Message{llm.UserStringMessage("hello")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := llm.WithPurpose(convCtx("c-resetfail"), "compaction")
+	_, err := svc.Do(ctx, &llm.Request{
+		Messages: []llm.Message{llm.UserStringMessage("summarize")},
+	})
+	if err == nil || !strings.Contains(err.Error(), "reset refused") {
+		t.Fatalf("want reset error, got %v", err)
 	}
 }

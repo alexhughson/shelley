@@ -104,6 +104,14 @@ func toolInputString(input json.RawMessage) string {
 	return string(input)
 }
 
+func allImages(req *llm.Request) []map[string]string {
+	var out []map[string]string
+	for _, m := range req.Messages {
+		out = append(out, messageImages(m)...)
+	}
+	return out
+}
+
 func messageImages(m llm.Message) []map[string]string {
 	var out []map[string]string
 	var walk func(cs []llm.Content)

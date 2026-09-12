@@ -2,14 +2,14 @@
 /**
  * Shelley <-> Cursor SDK bridge daemon.
  *
- * JSONL over stdin/stdout. One Cursor Agent per Shelley conversation.
+ * JSONL over stdin/stdout. One Cursor Agent per Shelley conversation+model.
  * Tool calls stay pending until Shelley’s loop runs them and sends tool_result.
  *
  * Requests:
  *   {id, op:"ping"}
- *   {id, op:"models", apiKey?}
- *   {id, op:"prompt", agentId, oneshot?, resetAgentId?,
- *    apiKey, model, cwd, seed, message, images, tools}
+ *   {id, op:"models"}
+ *   {id, op:"prompt", agentId, oneshot?,
+ *    model, cwd, seed, seedImages, message, images, tools}
  *   {id, op:"tool_result", req?, content, isError}
  *   {id, op:"steer", agentId, text}
  *   {id, op:"reset", agentId}
@@ -17,18 +17,23 @@
  *
  * Prompt events (id = current request):
  *   {id, agent, event:"delta", kind:"text"|"thinking", text}
- *   {id, agent, event:"tool_call", name, args}     // execute() is waiting
+ *   {id, agent, event:"tool_calls", calls:[{id,name,args}]}  // execute() waiting
  *   {id, agent, event:"result", ok, text?, usage?, created?, error?}
  */
 
 import { createInterface } from "node:readline";
-import { Agent, Cursor, JsonlLocalAgentStore } from "@cursor/sdk";
+import {
+  Agent,
+  AgentNotFoundError,
+  Cursor,
+  JsonlLocalAgentStore,
+} from "@cursor/sdk";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const pendingToolResults = new Map(); // toolCallId -> {resolve, session}
-const sessions = new Map();           // agentId -> {agent, run, currentReqId, agentId}
+const sessions = new Map();           // agentId -> session
 const inflight = new Set();
 
 let sawStdinEnd = false;
@@ -36,6 +41,10 @@ let sawStdinEnd = false;
 const storeRoot = path.join(os.homedir(), ".cache", "shelley-cursor-agents");
 fs.mkdirSync(storeRoot, { recursive: true });
 const store = new JsonlLocalAgentStore(storeRoot);
+
+function isMissingAgent(e) {
+  return e instanceof AgentNotFoundError || (e && e.code === "agent_not_found");
+}
 
 function normalizeError(e) {
   const info = {
@@ -56,11 +65,7 @@ function isRetryableErr(e) {
 }
 
 function send(obj) {
-  try {
-    process.stdout.write(JSON.stringify(obj) + "\n");
-  } catch {
-    // stdout gone
-  }
+  process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
 function emit(session, obj) {
@@ -86,16 +91,22 @@ function modelSelection(model) {
   return model && typeof model === "object" ? model : { id: model };
 }
 
+function flushToolCalls(session) {
+  session.flushScheduled = false;
+  const calls = session.pendingEmits;
+  session.pendingEmits = [];
+  if (calls.length === 0) return;
+  emit(session, { event: "tool_calls", calls });
+}
+
 function runToolOnShelley(session, toolCallId, name, args) {
   return new Promise((resolve) => {
     pendingToolResults.set(toolCallId, { resolve, session });
-    emit(session, {
-      id: toolCallId,
-      req: session.currentReqId,
-      event: "tool_call",
-      name,
-      args,
-    });
+    session.pendingEmits.push({ id: toolCallId, name, args });
+    if (!session.flushScheduled) {
+      session.flushScheduled = true;
+      setImmediate(() => flushToolCalls(session));
+    }
     const timeout = setTimeout(() => {
       if (pendingToolResults.has(toolCallId)) {
         pendingToolResults.delete(toolCallId);
@@ -127,12 +138,23 @@ function buildCustomTools(tools, session) {
   return out;
 }
 
+function newSession(req, agentId) {
+  return {
+    agent: null,
+    run: null,
+    currentReqId: req.id,
+    agentId,
+    pendingEmits: [],
+    flushScheduled: false,
+    needForce: false,
+  };
+}
+
 function agentOptions(req, session) {
   const customTools = buildCustomTools(req.tools, session);
   return {
-    apiKey: req.apiKey,
     model: modelSelection(req.model),
-    ...(customTools ? { tools: ["mcp"] } : { tools: [] }),
+    ...(customTools ? { tools: ["mcp"], mcpServers: [] } : { tools: [] }),
     local: {
       ...(req.cwd ? { cwd: req.cwd } : {}),
       store,
@@ -155,13 +177,19 @@ async function resetAgent(agentId) {
   const s = sessions.get(agentId);
   if (s) {
     if (s.run) {
-      try { await s.run.cancel(); } catch {}
+      await s.run.cancel();
       s.run = null;
     }
-    try { await s.agent[Symbol.asyncDispose](); } catch {}
+    if (s.agent) {
+      await s.agent[Symbol.asyncDispose]();
+    }
     sessions.delete(agentId);
   }
-  try { await Agent.delete(agentId); } catch {}
+  try {
+    await Agent.delete(agentId);
+  } catch (e) {
+    if (!isMissingAgent(e)) throw e;
+  }
 }
 
 async function getOrCreateAgent(agentId, req) {
@@ -170,29 +198,39 @@ async function getOrCreateAgent(agentId, req) {
     existing.currentReqId = req.id;
     return { session: existing, created: false };
   }
-  const session = {
-    agent: null,
-    run: null,
-    currentReqId: req.id,
-    agentId,
-  };
+  const session = newSession(req, agentId);
   const opts = agentOptions(req, session);
-  let created = false;
   try {
     session.agent = await Agent.resume(agentId, opts);
-  } catch {
-    session.agent = await Agent.create({ ...opts, agentId });
-    created = true;
+    sessions.set(agentId, session);
+    return { session, created: false };
+  } catch (e) {
+    if (!isMissingAgent(e)) throw e;
   }
+  session.agent = await Agent.create({ ...opts, agentId });
   sessions.set(agentId, session);
-  return { session, created };
+  return { session, created: true };
 }
 
 function sendPayload(req, created) {
   const text = created ? (req.seed || req.message || "") : (req.message || "");
+  const images = created ? (req.seedImages || req.images) : req.images;
   return {
     text,
-    ...(req.images && req.images.length ? { images: req.images } : {}),
+    ...(images && images.length ? { images } : {}),
+  };
+}
+
+function sendOptions(session, customTools) {
+  const local = {};
+  if (session.needForce) {
+    local.force = true;
+    session.needForce = false;
+  }
+  if (customTools) local.customTools = customTools;
+  return {
+    onDelta: onDelta(session),
+    ...(Object.keys(local).length ? { local } : {}),
   };
 }
 
@@ -221,23 +259,16 @@ async function finishRun(session, run, created) {
 }
 
 async function execOneshot(req) {
-  const session = {
-    agent: null,
-    run: null,
-    currentReqId: req.id,
-    agentId: req.agentId || `oneshot-${req.id}`,
-  };
+  const session = newSession(req, req.agentId || `oneshot-${req.id}`);
   const opts = agentOptions(req, session);
   const agent = await Agent.create(opts);
   session.agent = agent;
   try {
-    const run = await agent.send(sendPayload(req, true), {
-      onDelta: onDelta(session),
-      ...(opts.local.customTools ? { customTools: opts.local.customTools } : {}),
-    });
+    const customTools = buildCustomTools(req.tools, session);
+    const run = await agent.send(sendPayload(req, true), sendOptions(session, customTools));
     await finishRun(session, run, true);
   } finally {
-    try { await agent[Symbol.asyncDispose](); } catch {}
+    await agent[Symbol.asyncDispose]();
   }
 }
 
@@ -245,9 +276,6 @@ async function execPrompt(req) {
   const id = req.id;
   inflight.add(id);
   try {
-    if (req.resetAgentId) {
-      await resetAgent(req.resetAgentId);
-    }
     if (req.oneshot) {
       await execOneshot(req);
       return;
@@ -260,15 +288,12 @@ async function execPrompt(req) {
     const { session, created } = await getOrCreateAgent(agentId, req);
     session.currentReqId = id;
     if (session.run) {
-      try { await session.run.cancel(); } catch {}
+      await session.run.cancel();
       session.run = null;
+      session.needForce = true;
     }
     const customTools = buildCustomTools(req.tools, session);
-    const run = await session.agent.send(sendPayload(req, created), {
-      force: true,
-      onDelta: onDelta(session),
-      ...(customTools ? { customTools } : {}),
-    });
+    const run = await session.agent.send(sendPayload(req, created), sendOptions(session, customTools));
     await finishRun(session, run, created);
   } catch (e) {
     const err = normalizeError(e);
@@ -288,38 +313,32 @@ async function dispatch(req) {
     return;
   }
   if (req.op === "models") {
-    try {
-      const models = await Cursor.models.list(req.apiKey ? { apiKey: req.apiKey } : {});
-      send({ id: req.id, ok: true, models });
-    } catch (e) {
-      send({ id: req.id, ...normalizeError(e) });
-    }
+    const models = await Cursor.models.list();
+    send({ id: req.id, ok: true, models });
     return;
   }
   if (req.op === "tool_result") {
     const p = pendingToolResults.get(req.id);
-    if (p) {
-      if (req.req && p.session) p.session.currentReqId = req.req;
-      pendingToolResults.delete(req.id);
-      p.resolve({
-        content: req.content || [{ type: "text", text: "" }],
-        isError: !!req.isError,
-      });
+    if (!p) {
+      send({ id: req.id, ok: false, error: `cursor bridge: no pending tool ${req.id}` });
+      return;
     }
+    if (req.req && p.session) p.session.currentReqId = req.req;
+    pendingToolResults.delete(req.id);
+    p.resolve({
+      content: req.content || [{ type: "text", text: "" }],
+      isError: !!req.isError,
+    });
     return;
   }
   if (req.op === "steer") {
     const s = sessions.get(req.agentId);
-    if (s && s.run && typeof s.run.steer === "function") {
-      try {
-        const outcome = await s.run.steer(req.text || "");
-        send({ id: req.id, ok: true, outcome });
-      } catch (e) {
-        send({ id: req.id, ...normalizeError(e) });
-      }
-    } else {
+    if (!s || !s.run || typeof s.run.steer !== "function") {
       send({ id: req.id, ok: false, error: "no active run to steer" });
+      return;
     }
+    const outcome = await s.run.steer(req.text || "");
+    send({ id: req.id, ok: true, outcome });
     return;
   }
   if (req.op === "reset") {
@@ -329,10 +348,13 @@ async function dispatch(req) {
   }
   if (req.op === "cancel") {
     const s = req.agentId ? sessions.get(req.agentId) : null;
-    const run = s && s.run;
-    if (run) {
-      try { await run.cancel(); } catch {}
+    if (s) {
+      s.needForce = true;
+      if (s.run) {
+        await s.run.cancel();
+      }
     }
+    send({ id: req.id, ok: true });
     return;
   }
   if (req.op === "prompt") {
@@ -359,7 +381,7 @@ rl.on("close", () => {
   sawStdinEnd = true;
   for (const s of sessions.values()) {
     if (s.run) {
-      try { s.run.cancel(); } catch {}
+      s.run.cancel();
     }
   }
   if (inflight.size === 0) process.exit(0);

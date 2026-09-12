@@ -47,9 +47,8 @@ type Service struct {
 	// Logger receives bridge diagnostics; defaults to slog.Default().
 	Logger *slog.Logger
 
-	mu       sync.Mutex // guards the fields below
-	proc     *daemonProcess
-	startErr error
+	mu   sync.Mutex // guards the fields below
+	proc *daemonProcess
 }
 
 func (s *Service) logger() *slog.Logger {
@@ -110,10 +109,6 @@ func (s *Service) daemon(ctx context.Context) (*daemonProcess, error) {
 	}
 	p, err := s.startDaemonLocked(ctx)
 	if err != nil {
-		s.startErr = err
-		// Daemon start failures are persistent configuration problems (node
-		// missing, SDK not installed) except transient spawn errors; retry on
-		// the next request either way by clearing proc.
 		s.proc = nil
 		return nil, err
 	}
@@ -132,18 +127,14 @@ func (s *Service) startDaemonLocked(ctx context.Context) (*daemonProcess, error)
 	script := s.DaemonScript
 	var dir string
 	if script == "" {
-		// Use the vendored daemon + node_modules from the checkout at
-		// ~/.config/shelley/shelley-customization when present; otherwise the
-		// embedded single-file script (requires @cursor/sdk resolvable from CWD).
-		if d := daemonVendoredDir(); d != "" {
-			script = filepath.Join(d, "daemon.mjs")
-			dir = d
+		d, err := packageDaemonDir()
+		if err != nil {
+			return nil, err
 		}
+		script = filepath.Join(d, "daemon.mjs")
+		dir = d
 	} else {
 		dir = filepath.Dir(script)
-	}
-	if script == "" {
-		return nil, errors.New("cursor bridge: no daemon script available")
 	}
 	s.logger().Info("Starting Cursor SDK bridge daemon", "node", node, "script", script)
 	cmd := exec.Command(node, script)
@@ -200,25 +191,31 @@ func checkNodeVersion(ctx context.Context, node string) error {
 	if len(parts) < 2 {
 		return fmt.Errorf("unexpected node version output %q", v)
 	}
-	major, _ := strconv.Atoi(parts[0])
-	minor, _ := strconv.Atoi(parts[1])
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return fmt.Errorf("unexpected node version output %q", v)
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return fmt.Errorf("unexpected node version output %q", v)
+	}
 	if major < 22 || (major == 22 && minor < 13) {
 		return fmt.Errorf("node %s is too old", v)
 	}
 	return nil
 }
 
-func daemonVendoredDir() string {
+func packageDaemonDir() (string, error) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		return ""
+		return "", fmt.Errorf("cursor bridge: unsupported OS %s", runtime.GOOS)
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", errors.New("cursor bridge: cannot resolve package path")
 	}
-	d := filepath.Join(home, ".config", "shelley", "shelley-customization", "cursorbridge", "daemon")
-	if st, err := os.Stat(filepath.Join(d, "daemon.mjs")); err == nil && !st.IsDir() {
-		return d
+	d := filepath.Join(filepath.Dir(file), "daemon")
+	if _, err := os.Stat(filepath.Join(d, "daemon.mjs")); err != nil {
+		return "", fmt.Errorf("cursor bridge: daemon.mjs missing at %s", d)
 	}
-	return ""
+	return d, nil
 }
