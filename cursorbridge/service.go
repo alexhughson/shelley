@@ -35,6 +35,9 @@ type Service struct {
 	APIKey string
 	// ModelID is the Cursor model id (e.g. "composer-2.5"). Required.
 	ModelID string
+	// ModelParams are Cursor model parameters (e.g. effort=high, fast=true)
+	// passed as ModelSelection.params to the SDK. Optional.
+	ModelParams []ModelParam
 	// DisplayName is used in Provider() strings; defaults to ModelID.
 	DisplayName string
 	// NodeBin is the node executable; "" means "node" from PATH.

@@ -52,7 +52,7 @@ rl.on("line", (line) => {
         });
         send({ id, event: "delta", kind: "text", text: " Tool ran: " + JSON.stringify(result.content) });
       }
-      send({ id, event: "result", ok: true, text: "FINAL TEXT", usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 1, reasoningTokens: 1, totalTokens: 18 }, model: req.model });
+      send({ id, event: "result", ok: true, text: "FINAL TEXT", usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 1, reasoningTokens: 1, totalTokens: 18 }, model: req.model && req.model.id ? req.model.id : req.model });
     })();
     return;
   }

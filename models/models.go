@@ -426,6 +426,18 @@ func All() []Model {
 			},
 		},
 		{
+			ID: "cursor-grok-4.6-high-fast", Provider: ProviderCursor,
+			Description: "Cursor Grok 4.6 (high effort, fast) via the Cursor TypeScript SDK bridge",
+			APIModelName: "grok-4.6", APIType: APITypeCursorSDK, DefaultBaseURL: "cursor-sdk",
+			Build: func(url, apiKey string, httpc *http.Client) llm.Service {
+				return &cursorbridge.Service{
+					APIKey:      apiKey,
+					ModelID:     "grok-4.6",
+					ModelParams: []cursorbridge.ModelParam{{ID: "effort", Value: "high"}, {ID: "fast", Value: "true"}},
+				}
+			},
+		},
+		{
 			ID: "cursor-auto-smart", Provider: ProviderCursor,
 			Description: "Cursor Router (auto-smart) via the Cursor TypeScript SDK bridge",
 			APIModelName: "auto-smart", APIType: APITypeCursorSDK, DefaultBaseURL: "cursor-sdk",

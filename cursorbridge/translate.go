@@ -11,6 +11,25 @@ import (
 	"shelley.exe.dev/llm"
 )
 
+// ModelParam is one Cursor model parameter (e.g. {ID: "effort", Value: "high"}).
+type ModelParam struct {
+	ID    string `json:"id"`
+	Value string `json:"value"`
+}
+
+// modelSelection builds the SDK ModelSelection payload: {id, params?}.
+func modelSelection(svc *Service) map[string]any {
+	m := map[string]any{"id": svc.ModelID}
+	if len(svc.ModelParams) > 0 {
+		params := make([]map[string]string, len(svc.ModelParams))
+		for i, p := range svc.ModelParams {
+			params[i] = map[string]string{"id": p.ID, "value": p.Value}
+		}
+		m["params"] = params
+	}
+	return m
+}
+
 // bridgeError carries retryability across the process boundary.
 type bridgeError struct {
 	msg       string
@@ -49,7 +68,7 @@ func (p *daemonProcess) do(ctx context.Context, svc *Service, req *llm.Request) 
 		"id":           reqID,
 		"op":           "prompt",
 		"apiKey":       svc.APIKey,
-		"model":        svc.ModelID,
+		"model":        modelSelection(svc),
 		"systemPrompt": systemPromptText(req),
 		"cwd":          workingDirFor(ctx, req),
 		"message":      prompt.text,

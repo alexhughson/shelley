@@ -177,6 +177,10 @@ function tokenUsageToBridge(usage) {
   return u;
 }
 
+function modelId(model) {
+  return model && typeof model === "object" ? model.id : model;
+}
+
 function storeDirFor(model, cwd) {
   // One JSONL store directory per (model, cwd): agents must be durable across
   // sends so conversation state accumulates, but separate conversations must
@@ -195,12 +199,12 @@ function storeDirFor(model, cwd) {
 async function execPrompt(req) {
   const id = req.id;
   inflight.add(id);
-  const store = new JsonlLocalAgentStore(storeDirFor(req.model, req.cwd));
+  const store = new JsonlLocalAgentStore(storeDirFor(modelId(req.model), req.cwd));
   const customTools = buildCustomTools(req.tools, req.id);
   try {
     const agent = await Agent.create({
       apiKey: req.apiKey,
-      model: { id: req.model },
+      model: req.model && typeof req.model === "object" ? req.model : { id: req.model },
       systemPrompt: req.systemPrompt || undefined,
       ...(customTools ? { tools: ["mcp"] } : { tools: [] }),
       local: {
