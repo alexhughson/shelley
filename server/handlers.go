@@ -2865,6 +2865,9 @@ func (s *Server) getModelList() []ModelInfo {
 				info.BaseURL = modelInfo.BaseURL
 				info.APIType = modelInfo.APIType
 				info.MaxContextTokens, _ = modelsdev.LookupContextLimit(modelInfo.BaseURL, modelInfo.APIModelName)
+				if info.MaxContextTokens == 0 && modelInfo.APIType == string(models.APITypeCursorSDK) {
+					info.MaxContextTokens = models.CursorContextWindowTokens
+				}
 			}
 			modelList = append(modelList, info)
 		}

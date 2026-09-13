@@ -30,9 +30,19 @@ func newUserPrompt(req *llm.Request) (text string, images []map[string]string) {
 	var b strings.Builder
 	for _, m := range req.Messages[lastAssistant+1:] {
 		for _, c := range m.Content {
-			if c.Type == llm.ContentTypeText && c.Text != "" {
-				b.WriteString(c.Text)
-				b.WriteString("\n")
+			switch c.Type {
+			case llm.ContentTypeText:
+				if c.Text != "" {
+					b.WriteString(c.Text)
+					b.WriteString("\n")
+				}
+			case llm.ContentTypeToolResult:
+				for _, rc := range c.ToolResult {
+					if rc.Type == llm.ContentTypeText && rc.Text != "" {
+						b.WriteString(rc.Text)
+						b.WriteString("\n")
+					}
+				}
 			}
 		}
 		images = append(images, messageImages(m)...)

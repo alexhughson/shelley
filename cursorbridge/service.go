@@ -20,6 +20,33 @@ import (
 
 var requestCounter atomic.Uint64
 
+var (
+	liveMu       sync.Mutex
+	liveServices = map[*Service]struct{}{}
+)
+
+func registerLive(s *Service) {
+	liveMu.Lock()
+	liveServices[s] = struct{}{}
+	liveMu.Unlock()
+}
+
+// DeleteConversationAgents drops Cursor agents for a deleted Shelley conversation.
+func DeleteConversationAgents(conversationID string) {
+	if strings.TrimSpace(conversationID) == "" {
+		return
+	}
+	liveMu.Lock()
+	services := make([]*Service, 0, len(liveServices))
+	for s := range liveServices {
+		services = append(services, s)
+	}
+	liveMu.Unlock()
+	for _, s := range services {
+		s.deletePrefix(conversationID)
+	}
+}
+
 func newRequestID() string {
 	return fmt.Sprintf("req-%d-%d", time.Now().UnixMilli(), requestCounter.Add(1))
 }
@@ -42,7 +69,7 @@ type Service struct {
 	DisplayName string
 	// NodeBin is the node executable; "" means "node" from PATH.
 	NodeBin string
-	// DaemonScript is daemon.mjs; "" uses the vendored checkout copy.
+	// DaemonScript is daemon.mjs; "" uses the embedded daemon extracted to cache.
 	DaemonScript string
 	// Logger receives bridge diagnostics; defaults to slog.Default().
 	Logger *slog.Logger
@@ -162,7 +189,7 @@ func (s *Service) startDaemonLocked(ctx context.Context) (*daemonProcess, error)
 		cmd:      cmd,
 		stdin:    stdin,
 		stdout:   stdout,
-		reqs:     make(map[string]chan *daemonLine),
+		reqs:     make(map[string]*eventQueue),
 		sessions: make(map[string]*liveSession),
 	}
 	go p.readLoop()
@@ -175,7 +202,22 @@ func (s *Service) startDaemonLocked(ctx context.Context) (*daemonProcess, error)
 		p.kill()
 		return nil, fmt.Errorf("cursor bridge: daemon handshake failed: %w", err)
 	}
+	registerLive(s)
 	return p, nil
+}
+
+func (s *Service) deletePrefix(conversationID string) {
+	s.mu.Lock()
+	proc := s.proc
+	s.mu.Unlock()
+	if proc == nil || !proc.alive() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := proc.deletePrefix(ctx, conversationID); err != nil {
+		s.logger().Warn("cursor bridge: delete agents", "conversation", conversationID, "error", err)
+	}
 }
 
 func checkNodeVersion(ctx context.Context, node string) error {
@@ -209,13 +251,5 @@ func packageDaemonDir() (string, error) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		return "", fmt.Errorf("cursor bridge: unsupported OS %s", runtime.GOOS)
 	}
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		return "", errors.New("cursor bridge: cannot resolve package path")
-	}
-	d := filepath.Join(filepath.Dir(file), "daemon")
-	if _, err := os.Stat(filepath.Join(d, "daemon.mjs")); err != nil {
-		return "", fmt.Errorf("cursor bridge: daemon.mjs missing at %s", d)
-	}
-	return d, nil
+	return extractEmbeddedDaemon()
 }

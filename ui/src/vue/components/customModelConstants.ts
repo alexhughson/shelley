@@ -52,6 +52,7 @@ export const API_TYPE_LABELS: Record<string, string> = {
   "openai-responses": "OpenAI (Responses API)",
   gemini: "Google Gemini",
   builtin: "Built-in",
+  "cursor-sdk": "Cursor SDK",
 };
 
 export const REASONING_EFFORT_SUGGESTIONS = [

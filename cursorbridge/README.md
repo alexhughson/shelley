@@ -29,7 +29,11 @@ stay on that channel for the next `Do`.
 
 Cursor `inputTokens` is the full prompt. `cacheRead` / `cacheWrite` are a
 breakdown of that prompt. The bridge subtracts them so Shelley's
-`TotalInputTokens()` does not count the cached span twice.
+`TotalInputTokens()` does not count the cached span twice. When the
+breakdown is larger than `inputTokens`, uncached input is 0.
+`run.wait().usage` is a cumulative cost sum across internal turns. The
+bridge records the last `turn-ended` usage so the UX context readout is
+the last prompt size, not that sum.
 
 ## Architecture
 
@@ -51,8 +55,8 @@ loop.Do
 - `history.go` — seed transcript for `create`; tail text for `resume`.
 - `daemon/daemon.mjs` — Agent map, pending `execute()`, steer, reset.
 
-The daemon script is resolved from this package directory via `runtime.Caller`.
-`npm install` in `cursorbridge/daemon` must have been run on this machine.
+The daemon script is embedded in the Shelley binary and extracted to a
+content-hashed cache directory. `npm ci` runs there on first use.
 
 ## Setup
 

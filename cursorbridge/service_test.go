@@ -53,6 +53,7 @@ rl.on("line", (line) => {
     if ((req.agentId || "").includes("resetfail")) { send({ id: req.id, ok: false, error: "reset refused" }); return; }
     agents.delete(req.agentId); sessions.delete(req.agentId); send({ id: req.id, ok: true }); return;
   }
+  if (req.op === "delete_prefix") { send({ id: req.id, ok: true, deleted: 0 }); return; }
   if (req.op === "cancel") {
     const sess = sessions.get(req.agentId);
     if (sess) sess.cancelled = true;
@@ -69,6 +70,7 @@ rl.on("line", (line) => {
         return;
       }
       const agentId = req.agentId;
+      if (req.reseed) { agents.delete(agentId); sessions.delete(agentId); }
       const created = !agents.has(agentId);
       agents.add(agentId);
       const session = { agentId, currentReqId: id, cancelled: false };
@@ -78,6 +80,15 @@ rl.on("line", (line) => {
         emit(session, { event: "delta", kind: "text", text: "SLOW_STARTED" });
         await new Promise((resolve) => pending.set("__slow__" + agentId, { resolve }));
         emit(session, { event: "result", ok: false, error: "run cancelled", cancelled: true });
+        return;
+      }
+      if ((req.message || "").includes("ECHO_CWD")) {
+        emit(session, { event: "result", ok: true, text: "cwd=" + (req.cwd || ""), usage: { inputTokens: 3, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+        return;
+      }
+      if ((req.message || "").includes("CUMULATIVE")) {
+        emit(session, { event: "usage", usage: { inputTokens: 10000, outputTokens: 20, cacheReadTokens: 2000, cacheWriteTokens: 1000 } });
+        emit(session, { event: "result", ok: true, text: "done", usage: { inputTokens: 4300000, outputTokens: 40, cacheReadTokens: 2000000, cacheWriteTokens: 300000 } });
         return;
       }
       emit(session, { event: "delta", kind: "text", text: "Hello " });
@@ -559,13 +570,18 @@ func TestUsageFromBridgeDoesNotRepeatCache(t *testing.T) {
 	}
 }
 
-func TestUsageFromBridgeKeepsSeparateWhenInputSmaller(t *testing.T) {
-	u := usageFromBridge(&BridgeUsage{InputTokens: 50, CacheReadTokens: 80, OutputTokens: 5})
-	if u.InputTokens != 50 {
-		t.Fatalf("input = %d, want 50 (do not subtract when input < cache)", u.InputTokens)
+func TestUsageFromBridgeDoesNotAddWhenCacheExceedsInput(t *testing.T) {
+	// Cursor sometimes reports cacheRead+cacheWrite a bit above inputTokens.
+	// Adding both produced the 4.3M context readout.
+	u := usageFromBridge(&BridgeUsage{InputTokens: 2_150_000, CacheReadTokens: 2_000_000, CacheWriteTokens: 200_000, OutputTokens: 5})
+	if u.InputTokens != 0 {
+		t.Fatalf("uncached input = %d, want 0", u.InputTokens)
 	}
-	if u.TotalInputTokens() != 130 {
-		t.Fatalf("TotalInputTokens = %d, want 130", u.TotalInputTokens())
+	if u.TotalInputTokens() != 2_200_000 {
+		t.Fatalf("TotalInputTokens = %d, want 2200000 (cache counted once)", u.TotalInputTokens())
+	}
+	if u.ContextWindowUsed() != 2_200_005 {
+		t.Fatalf("ContextWindowUsed = %d", u.ContextWindowUsed())
 	}
 }
 
@@ -646,5 +662,86 @@ func TestCompactResetFailure(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "reset refused") {
 		t.Fatalf("want reset error, got %v", err)
+	}
+}
+
+func TestUsagePrefersTurnEventOverCumulativeResult(t *testing.T) {
+	svc := testService(t)
+	resp, err := svc.Do(convCtx("c-cum"), &llm.Request{
+		Messages: []llm.Message{llm.UserStringMessage("CUMULATIVE please")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Usage.TotalInputTokens() != 10000 {
+		t.Fatalf("TotalInputTokens = %d, want 10000 (last turn, not cumulative 4.3M)", resp.Usage.TotalInputTokens())
+	}
+	if resp.Usage.ContextWindowUsed() != 10020 {
+		t.Fatalf("ContextWindowUsed = %d, want 10020", resp.Usage.ContextWindowUsed())
+	}
+}
+
+func TestWorkingDirFromContext(t *testing.T) {
+	svc := testService(t)
+	ctx := llm.WithWorkingDir(convCtx("c-cwd"), "/tmp/cursor-cwd-test")
+	resp, err := svc.Do(ctx, &llm.Request{
+		Messages: []llm.Message{llm.UserStringMessage("ECHO_CWD")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := llm.FirstText(resp); got != "cwd=/tmp/cursor-cwd-test" {
+		t.Fatalf("text = %q, want cwd from context", got)
+	}
+}
+
+func TestMatchToolResultsIgnoresInjectedAssistant(t *testing.T) {
+	pending := []pendingTool{{id: "call-1", name: "my_tool", args: json.RawMessage(`{}`)}}
+	req := &llm.Request{Messages: []llm.Message{
+		llm.UserStringMessage("go"),
+		{Role: llm.MessageRoleAssistant, Content: []llm.Content{
+			{Type: llm.ContentTypeToolUse, ID: "call-1", ToolName: "my_tool"},
+		}},
+		{Role: llm.MessageRoleUser, Content: []llm.Content{
+			{Type: llm.ContentTypeToolResult, ToolUseID: "call-1", ToolResult: llm.TextContent("ok")},
+		}},
+		{Role: llm.MessageRoleAssistant, Content: []llm.Content{
+			{Type: llm.ContentTypeToolUse, ID: "sub-done", ToolName: "subagent_done"},
+		}},
+		{Role: llm.MessageRoleUser, Content: []llm.Content{
+			{Type: llm.ContentTypeToolResult, ToolUseID: "sub-done", ToolResult: llm.TextContent("child finished")},
+			{Type: llm.ContentTypeText, Text: "injected note"},
+		}},
+	}}
+	results, extra, err := matchToolResults(req, pending)
+	if err != nil {
+		t.Fatalf("matchToolResults: %v", err)
+	}
+	if len(results) != 1 || results[0].id != "call-1" {
+		t.Fatalf("results = %+v", results)
+	}
+	if extra != "" {
+		t.Fatalf("extra = %q, want empty (injected text is not steer)", extra)
+	}
+}
+
+func TestHasResolvedToolContinuation(t *testing.T) {
+	req := &llm.Request{Messages: []llm.Message{
+		llm.UserStringMessage("go"),
+		{Role: llm.MessageRoleAssistant, Content: []llm.Content{
+			{Type: llm.ContentTypeToolUse, ID: "call-1", ToolName: "my_tool"},
+		}},
+		{Role: llm.MessageRoleUser, Content: []llm.Content{
+			{Type: llm.ContentTypeToolResult, ToolUseID: "call-1", ToolResult: llm.TextContent("ok")},
+		}},
+	}}
+	if !hasResolvedToolContinuation(req) {
+		t.Fatal("want resolved continuation")
+	}
+	endTurn := &llm.Request{Messages: append(req.Messages, llm.Message{
+		Role: llm.MessageRoleAssistant, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "done"}},
+	})}
+	if hasResolvedToolContinuation(endTurn) {
+		t.Fatal("final assistant text is not a tool continuation")
 	}
 }

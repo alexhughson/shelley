@@ -51,7 +51,7 @@ type pendingTool struct {
 type liveSession struct {
 	agentID string
 	pending []pendingTool
-	events  chan *daemonLine // lives until the Cursor run ends
+	events  *eventQueue // lives until the Cursor run ends
 }
 
 func conversationAgentID(ctx context.Context, modelID string) string {
@@ -83,10 +83,10 @@ func (p *daemonProcess) clearSession(key string) {
 	delete(p.sessions, key)
 }
 
-func (p *daemonProcess) attach(id string, ch chan *daemonLine) {
+func (p *daemonProcess) attach(id string, q *eventQueue) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.reqs[id] = ch
+	p.reqs[id] = q
 }
 
 func (p *daemonProcess) detach(id string) {
@@ -121,7 +121,7 @@ func (p *daemonProcess) do(ctx context.Context, svc *Service, req *llm.Request) 
 
 func (p *daemonProcess) oneshot(ctx context.Context, svc *Service, req *llm.Request, purpose string) (*llm.Response, error) {
 	reqID := newRequestID()
-	events := make(chan *daemonLine, 256)
+	events := newEventQueue()
 	p.attach(reqID, events)
 	defer p.detach(reqID)
 
@@ -139,6 +139,7 @@ func (p *daemonProcess) oneshot(ctx context.Context, svc *Service, req *llm.Requ
 		"oneshot": true,
 		"model":   modelSelection(svc),
 		"cwd":     cwd,
+		"system":  systemPromptText(req),
 		"seed":    seedPrompt(req),
 		"message": oneshotMessage(req),
 		"tools":   tools,
@@ -163,9 +164,30 @@ func (p *daemonProcess) oneshot(ctx context.Context, svc *Service, req *llm.Requ
 	return resp, nil
 }
 
+func (p *daemonProcess) deletePrefix(ctx context.Context, prefix string) error {
+	reqID := newRequestID()
+	ch := newEventQueue()
+	p.attach(reqID, ch)
+	defer p.detach(reqID)
+	if err := p.send(map[string]any{"id": reqID, "op": "delete_prefix", "agentId": prefix}); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("cursor bridge: delete_prefix %s: %w", prefix, ctx.Err())
+	case dl := <-ch.recv():
+		if !dl.OK {
+			return fmt.Errorf("cursor bridge: delete_prefix %s: %s", prefix, dl.ErrorOrErr())
+		}
+		return nil
+	}
+}
+
 func (p *daemonProcess) resetAgent(ctx context.Context, agentID string) error {
 	reqID := newRequestID()
-	ch := make(chan *daemonLine, 4)
+	ch := newEventQueue()
 	p.attach(reqID, ch)
 	defer p.detach(reqID)
 	if err := p.send(map[string]any{"id": reqID, "op": "reset", "agentId": agentID}); err != nil {
@@ -176,7 +198,7 @@ func (p *daemonProcess) resetAgent(ctx context.Context, agentID string) error {
 	select {
 	case <-ctx.Done():
 		return fmt.Errorf("cursor bridge: reset %s: %w", agentID, ctx.Err())
-	case dl := <-ch:
+	case dl := <-ch.recv():
 		if !dl.OK {
 			return fmt.Errorf("cursor bridge: reset %s: %s", agentID, dl.ErrorOrErr())
 		}
@@ -195,7 +217,7 @@ func oneshotMessage(req *llm.Request) string {
 
 func (p *daemonProcess) startTurn(ctx context.Context, svc *Service, req *llm.Request, key string) (*llm.Response, error) {
 	reqID := newRequestID()
-	events := make(chan *daemonLine, 256)
+	events := newEventQueue()
 	agentID := key
 	st := &liveSession{agentID: agentID, events: events}
 	p.attach(reqID, events)
@@ -217,9 +239,15 @@ func (p *daemonProcess) startTurn(ctx context.Context, svc *Service, req *llm.Re
 		"agentId": agentID,
 		"model":   modelSelection(svc),
 		"cwd":     cwd,
+		"system":  systemPromptText(req),
 		"seed":    seedPrompt(req),
 		"message": message,
 		"tools":   tools,
+	}
+	if hasResolvedToolContinuation(req) {
+		// No live pending session, but Shelley already ran the tools.
+		// Recreate the agent from seed so the tool results are not dropped.
+		payload["reseed"] = true
 	}
 	if seedImgs := allImages(req); len(seedImgs) > 0 {
 		payload["seedImages"] = seedImgs
@@ -273,7 +301,7 @@ func (p *daemonProcess) continueTurn(ctx context.Context, svc *Service, req *llm
 
 func (p *daemonProcess) steer(ctx context.Context, agentID, text string) error {
 	id := newRequestID()
-	ch := make(chan *daemonLine, 4)
+	ch := newEventQueue()
 	p.attach(id, ch)
 	defer p.detach(id)
 	if err := p.send(map[string]any{
@@ -287,7 +315,7 @@ func (p *daemonProcess) steer(ctx context.Context, agentID, text string) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case dl := <-ch:
+	case dl := <-ch.recv():
 		if !dl.OK {
 			return fmt.Errorf("cursor bridge: steer: %s", dl.ErrorOrErr())
 		}
@@ -305,10 +333,18 @@ func matchToolResults(req *llm.Request, pending []pendingTool) ([]namedResult, s
 	for _, pt := range pending {
 		want[pt.id] = pt
 	}
+	start := assistantIndexWithToolIDs(req.Messages, want)
+	if start < 0 {
+		start = lastAssistantIndex(req.Messages)
+	}
 	var results []namedResult
 	var extra strings.Builder
-	last := lastAssistantIndex(req.Messages)
-	for _, m := range req.Messages[last+1:] {
+	sawInjectedAssistant := false
+	for _, m := range req.Messages[start+1:] {
+		if m.Role == llm.MessageRoleAssistant {
+			sawInjectedAssistant = true
+			continue
+		}
 		for _, c := range m.Content {
 			switch c.Type {
 			case llm.ContentTypeToolResult:
@@ -320,7 +356,7 @@ func matchToolResults(req *llm.Request, pending []pendingTool) ([]namedResult, s
 					delete(want, c.ToolUseID)
 				}
 			case llm.ContentTypeText:
-				if strings.TrimSpace(c.Text) != "" {
+				if !sawInjectedAssistant && strings.TrimSpace(c.Text) != "" {
 					extra.WriteString(c.Text)
 					extra.WriteString("\n")
 				}
@@ -337,12 +373,56 @@ func matchToolResults(req *llm.Request, pending []pendingTool) ([]namedResult, s
 	return results, strings.TrimSpace(extra.String()), nil
 }
 
+func assistantIndexWithToolIDs(msgs []llm.Message, want map[string]pendingTool) int {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != llm.MessageRoleAssistant {
+			continue
+		}
+		for _, c := range msgs[i].Content {
+			if c.Type == llm.ContentTypeToolUse {
+				if _, ok := want[c.ID]; ok {
+					return i
+				}
+			}
+		}
+	}
+	return -1
+}
+
+// hasResolvedToolContinuation reports that the last assistant message issued
+// tool calls and later messages already contain every matching tool result.
+// That is the restart-mid-turn shape: Shelley ran the tools, but this process
+// has no live pending execute() to resume.
+func hasResolvedToolContinuation(req *llm.Request) bool {
+	last := lastAssistantIndex(req.Messages)
+	if last < 0 {
+		return false
+	}
+	remaining := map[string]bool{}
+	for _, c := range req.Messages[last].Content {
+		if c.Type == llm.ContentTypeToolUse && c.ID != "" {
+			remaining[c.ID] = true
+		}
+	}
+	if len(remaining) == 0 {
+		return false
+	}
+	for _, m := range req.Messages[last+1:] {
+		for _, c := range m.Content {
+			if c.Type == llm.ContentTypeToolResult && remaining[c.ToolUseID] {
+				delete(remaining, c.ToolUseID)
+			}
+		}
+	}
+	return len(remaining) == 0
+}
+
 func (p *daemonProcess) collect(
 	ctx context.Context,
 	svc *Service,
 	req *llm.Request,
 	reqID string,
-	events chan *daemonLine,
+	events *eventQueue,
 	key string,
 	st *liveSession,
 ) (*llm.Response, error) {
@@ -359,6 +439,7 @@ func (p *daemonProcess) collect(
 	var text strings.Builder
 	var thinking strings.Builder
 	var usage llm.Usage
+	haveTurnUsage := false
 	var toolUses []llm.Content
 
 	handleDelta := func(dl *daemonLine) {
@@ -423,7 +504,7 @@ func (p *daemonProcess) collect(
 		select {
 		case <-ctx.Done():
 			return endFailed(ctx.Err())
-		case dl, ok := <-events:
+		case dl, ok := <-events.recv():
 			if !ok {
 				return endFailed(&bridgeError{msg: "cursor bridge: event channel closed", retryable: true})
 			}
@@ -432,6 +513,13 @@ func (p *daemonProcess) collect(
 				// sync ack for an op multiplexed on this channel; ignore
 			case "delta":
 				handleDelta(dl)
+			case "usage":
+				// Per-turn usage from turn-ended. Prefer this over wait()'s
+				// cumulative run total, which is a cost sum, not context size.
+				if dl.Usage != nil {
+					usage = usageFromBridge(dl.Usage)
+					haveTurnUsage = true
+				}
 			case "tool_call", "tool_calls":
 				addCalls(dl)
 				return yieldNow(), nil
@@ -446,7 +534,7 @@ func (p *daemonProcess) collect(
 					retryable := dl.Retryable != nil && *dl.Retryable
 					return endFailed(&bridgeError{msg: fmt.Sprintf("cursor agent run failed: %s", dl.ErrorOrErr()), retryable: retryable})
 				}
-				if dl.Usage != nil {
+				if dl.Usage != nil && !haveTurnUsage {
 					usage = usageFromBridge(dl.Usage)
 				}
 				final := text.String()
@@ -477,14 +565,21 @@ func pendingFrom(tools []llm.Content) []pendingTool {
 // Cursor's inputTokens is the full prompt. cacheRead/cacheWrite are a
 // breakdown of that prompt, not extra tokens. Subtract them so
 // TotalInputTokens() does not count the cached span twice.
+// When the breakdown is slightly larger than inputTokens, uncached is 0
+// so TotalInputTokens stays at the cache total instead of adding both.
 func usageFromBridge(u *BridgeUsage) llm.Usage {
 	if u == nil {
 		return llm.Usage{}
 	}
 	input := u.InputTokens
 	cached := u.CacheReadTokens + u.CacheWriteTokens
-	if cached > 0 && input >= cached {
+	switch {
+	case cached == 0:
+		// inputTokens is the whole prompt
+	case input >= cached:
 		input -= cached
+	default:
+		input = 0
 	}
 	return llm.Usage{
 		InputTokens:              input,

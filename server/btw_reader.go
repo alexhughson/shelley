@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"shelley.exe.dev/cursorbridge"
 	"shelley.exe.dev/db"
 	"shelley.exe.dev/db/generated"
 	"shelley.exe.dev/llm"
@@ -207,6 +208,9 @@ func (s *Server) stopDeletedConversationManagers(ids []string) {
 	s.mu.Unlock()
 	for _, manager := range managers {
 		manager.stopLoop()
+	}
+	for _, id := range ids {
+		cursorbridge.DeleteConversationAgents(id)
 	}
 }
 

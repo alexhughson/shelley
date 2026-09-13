@@ -107,16 +107,6 @@ function runToolOnShelley(session, toolCallId, name, args) {
       session.flushScheduled = true;
       setImmediate(() => flushToolCalls(session));
     }
-    const timeout = setTimeout(() => {
-      if (pendingToolResults.has(toolCallId)) {
-        pendingToolResults.delete(toolCallId);
-        resolve({
-          content: [{ type: "text", text: `Shelley bridge: tool result for ${name} never arrived (timeout).` }],
-          isError: true,
-        });
-      }
-    }, 10 * 60 * 1000);
-    if (timeout.unref) timeout.unref();
   });
 }
 
@@ -147,6 +137,8 @@ function newSession(req, agentId) {
     pendingEmits: [],
     flushScheduled: false,
     needForce: false,
+    lastUsage: undefined,
+    system: "",
   };
 }
 
@@ -169,6 +161,9 @@ function onDelta(session) {
       emit(session, { event: "delta", kind: "text", text: update.text });
     } else if (update.type === "thinking-delta") {
       emit(session, { event: "delta", kind: "thinking", text: update.text });
+    } else if (update.type === "turn-ended" && update.usage) {
+      session.lastUsage = tokenUsageToBridge(update.usage);
+      emit(session, { event: "usage", usage: session.lastUsage });
     }
   };
 }
@@ -212,8 +207,13 @@ async function getOrCreateAgent(agentId, req) {
   return { session, created: true };
 }
 
-function sendPayload(req, created) {
-  const text = created ? (req.seed || req.message || "") : (req.message || "");
+function sendPayload(req, session, created) {
+  let text = created ? (req.seed || req.message || "") : (req.message || "");
+  const nextSystem = req.system || "";
+  if (!created && nextSystem && nextSystem !== session.system) {
+    text = `<system_instructions>\n${nextSystem}\n</system_instructions>\n\n${text}`;
+  }
+  session.system = nextSystem;
   const images = created ? (req.seedImages || req.images) : req.images;
   return {
     text,
@@ -248,7 +248,7 @@ async function finishRun(session, run, created) {
         event: "result",
         ok: true,
         text: result.result ?? "",
-        usage: tokenUsageToBridge(result.usage),
+        usage: session.lastUsage || tokenUsageToBridge(result.usage),
         model: result.model && result.model.id,
         created: !!created,
       });
@@ -265,7 +265,7 @@ async function execOneshot(req) {
   session.agent = agent;
   try {
     const customTools = buildCustomTools(req.tools, session);
-    const run = await agent.send(sendPayload(req, true), sendOptions(session, customTools));
+    const run = await agent.send(sendPayload(req, session, true), sendOptions(session, customTools));
     await finishRun(session, run, true);
   } finally {
     await agent[Symbol.asyncDispose]();
@@ -285,6 +285,9 @@ async function execPrompt(req) {
       send({ id, event: "result", ok: false, error: "cursor bridge: prompt missing agentId" });
       return;
     }
+    if (req.reseed) {
+      await resetAgent(agentId);
+    }
     const { session, created } = await getOrCreateAgent(agentId, req);
     session.currentReqId = id;
     if (session.run) {
@@ -293,7 +296,7 @@ async function execPrompt(req) {
       session.needForce = true;
     }
     const customTools = buildCustomTools(req.tools, session);
-    const run = await session.agent.send(sendPayload(req, created), sendOptions(session, customTools));
+    const run = await session.agent.send(sendPayload(req, session, created), sendOptions(session, customTools));
     await finishRun(session, run, created);
   } catch (e) {
     const err = normalizeError(e);
@@ -344,6 +347,38 @@ async function dispatch(req) {
   if (req.op === "reset") {
     await resetAgent(req.agentId);
     send({ id: req.id, ok: true });
+    return;
+  }
+  if (req.op === "delete_prefix") {
+    const prefix = req.agentId || "";
+    if (!prefix) {
+      send({ id: req.id, ok: false, error: "delete_prefix missing agentId" });
+      return;
+    }
+    const ids = new Set();
+    for (const id of sessions.keys()) {
+      if (id === prefix || id.startsWith(prefix + ":")) ids.add(id);
+    }
+    const storeFile = path.join(storeRoot, "agents.ndjson");
+    if (fs.existsSync(storeFile)) {
+      for (const line of fs.readFileSync(storeFile, "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        let rec;
+        try {
+          rec = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const id = rec && rec.agentId;
+        if (id === prefix || (typeof id === "string" && id.startsWith(prefix + ":"))) {
+          ids.add(id);
+        }
+      }
+    }
+    for (const id of ids) {
+      await resetAgent(id);
+    }
+    send({ id: req.id, ok: true, deleted: ids.size });
     return;
   }
   if (req.op === "cancel") {

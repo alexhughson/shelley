@@ -141,6 +141,15 @@ func NewLoop(config Config) *Loop {
 	}
 }
 
+func (l *Loop) currentWorkingDir() string {
+	if l.getWorkingDir != nil {
+		if wd := l.getWorkingDir(); wd != "" {
+			return wd
+		}
+	}
+	return l.workingDir
+}
+
 // Retry signals the loop to re-attempt the next LLM request without queueing
 // a new user message. The loop's in-memory history is unchanged (failed
 // requests don't append anything to history, and error messages are persisted
@@ -413,6 +422,9 @@ func (l *Loop) processLLMRequest(ctx context.Context) error {
 			llmCtx, cancel := context.WithTimeout(ctx, maxTurnDuration)
 			defer cancel()
 			llmCtx, requestTrace = llm.WithRequestTrace(llmCtx)
+			if wd := l.currentWorkingDir(); wd != "" {
+				llmCtx = llm.WithWorkingDir(llmCtx, wd)
+			}
 			const maxRetries = 2
 			var resp *llm.Response
 			var err error
@@ -649,11 +661,7 @@ func (l *Loop) checkGitStateChange(ctx context.Context) {
 		return
 	}
 
-	// Get current working directory
-	workingDir := l.workingDir
-	if l.getWorkingDir != nil {
-		workingDir = l.getWorkingDir()
-	}
+	workingDir := l.currentWorkingDir()
 
 	// Get current git state
 	currentState := gitstate.GetGitState(workingDir)

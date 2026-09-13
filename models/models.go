@@ -37,6 +37,11 @@ const (
 	ProviderCursor Provider = "cursor"
 )
 
+// CursorContextWindowTokens is the context window advertised for Cursor SDK
+// models when models.dev has no entry. The UX uses this as the denominator
+// on the context readout.
+const CursorContextWindowTokens = 1_000_000
+
 // SourceCustomLabel is the label used for custom (DB-backed) models.
 const SourceCustomLabel = "custom"
 

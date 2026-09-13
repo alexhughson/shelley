@@ -24,9 +24,31 @@ type daemonProcess struct {
 	stdout io.ReadCloser
 
 	mu       sync.Mutex
-	reqs     map[string]chan *daemonLine // request/agent id -> event channel
-	sessions map[string]*liveSession     // agent id -> in-flight run
+	reqs     map[string]*eventQueue  // request/agent id -> event queue
+	sessions map[string]*liveSession // agent id -> in-flight run
 	dead     bool
+}
+
+// eventQueue is an unbounded mailbox. routeReq never blocks the stdout
+// reader: a full channel would stall every conversation on this daemon.
+type eventQueue struct {
+	ch chan *daemonLine
+}
+
+func newEventQueue() *eventQueue {
+	return &eventQueue{ch: make(chan *daemonLine, 256)}
+}
+
+func (q *eventQueue) recv() <-chan *daemonLine {
+	return q.ch
+}
+
+func (q *eventQueue) send(dl *daemonLine) {
+	select {
+	case q.ch <- dl:
+	default:
+		go func() { q.ch <- dl }()
+	}
 }
 
 // flexStatus decodes a JSON field that may be a number (HTTP status on
@@ -156,10 +178,7 @@ func (p *daemonProcess) readLoop() {
 	p.mu.Lock()
 	p.dead = true
 	for id, ch := range p.reqs {
-		select {
-		case ch <- &daemonLine{ID: id, Event: "result", Error: "cursor bridge: daemon exited"}:
-		default:
-		}
+		ch.send(&daemonLine{ID: id, Event: "result", Error: "cursor bridge: daemon exited"})
 		delete(p.reqs, id)
 	}
 	p.sessions = nil
@@ -168,20 +187,20 @@ func (p *daemonProcess) readLoop() {
 
 func (p *daemonProcess) routeReq(dl daemonLine) {
 	p.mu.Lock()
-	ch := p.reqs[dl.ID]
-	if ch == nil && dl.Req != "" {
-		ch = p.reqs[dl.Req]
+	q := p.reqs[dl.ID]
+	if q == nil && dl.Req != "" {
+		q = p.reqs[dl.Req]
 	}
-	if ch == nil && dl.Agent != "" {
-		ch = p.reqs[dl.Agent]
+	if q == nil && dl.Agent != "" {
+		q = p.reqs[dl.Agent]
 	}
 	p.mu.Unlock()
-	if ch == nil {
+	if q == nil {
 		p.svc.logger().Error("cursor bridge: event with no listener", "event", dl.Event, "id", dl.ID, "req", dl.Req, "agent", dl.Agent)
 		return
 	}
 	cl := dl
-	ch <- &cl
+	q.send(&cl)
 }
 
 func (p *daemonProcess) stderrLoop(r io.Reader) {
@@ -243,9 +262,9 @@ func (p *daemonProcess) sendToolResult(toolCallID, reqID string, out toolOutcome
 // ping performs the startup handshake.
 func (p *daemonProcess) ping(ctx context.Context) error {
 	id := newRequestID()
-	ch := make(chan *daemonLine, 4)
+	q := newEventQueue()
 	p.mu.Lock()
-	p.reqs[id] = ch
+	p.reqs[id] = q
 	p.mu.Unlock()
 	defer func() {
 		p.mu.Lock()
@@ -258,7 +277,7 @@ func (p *daemonProcess) ping(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case dl := <-ch:
+	case dl := <-q.recv():
 		if dl.OK {
 			return nil
 		}
