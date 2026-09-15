@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,13 +27,45 @@ import (
 type Provider string
 
 const (
-	ProviderOpenAI    Provider = "openai"
-	ProviderAnthropic Provider = "anthropic"
-	ProviderFireworks Provider = "fireworks"
-	ProviderGemini    Provider = "gemini"
-	ProviderXAI       Provider = "xai"
-	ProviderBuiltIn   Provider = "builtin"
+	ProviderOpenAI     Provider = "openai"
+	ProviderAnthropic  Provider = "anthropic"
+	ProviderFireworks  Provider = "fireworks"
+	ProviderGemini     Provider = "gemini"
+	ProviderXAI        Provider = "xai"
+	ProviderOpenCodeGo Provider = "opencode-go"
+	ProviderBuiltIn    Provider = "builtin"
 )
+
+// IsOpenCodeGoURL reports whether raw is the OpenCode Go API
+// (https://opencode.ai/zen/go/...).
+func IsOpenCodeGoURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.TrimPrefix(strings.ToLower(u.Hostname()), "www.")
+	if host != "opencode.ai" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(u.Path), "/zen/go")
+}
+
+// RequestProvider is the vendor id written into llmhttp context.
+// The official Go URL wins so a listing that says "openai" still
+// gets X-OpenCode-Session.
+func RequestProvider(provider Provider, endpoint string) Provider {
+	if IsOpenCodeGoURL(endpoint) {
+		return ProviderOpenCodeGo
+	}
+	return provider
+}
 
 // SourceCustomLabel is the label used for custom (DB-backed) models.
 const SourceCustomLabel = "custom"
@@ -643,7 +677,7 @@ func (m *Manager) loadCustomModelsLocked(dbModels []generated.Model) {
 		}
 		m.services[model.ModelID] = serviceEntry{
 			service:      svc,
-			provider:     Provider(model.ProviderType),
+			provider:     RequestProvider(Provider(model.ProviderType), model.Endpoint),
 			modelID:      model.ModelID,
 			source:       SourceCustomLabel,
 			displayName:  model.DisplayName,

@@ -30,6 +30,24 @@ func predictableBuilt() Built {
 	}
 }
 
+func TestRequestProvider(t *testing.T) {
+	if got := RequestProvider(ProviderOpenAI, "https://api.openai.com/v1"); got != ProviderOpenAI {
+		t.Fatalf("openai url = %q", got)
+	}
+	if got := RequestProvider(ProviderOpenAI, "https://opencode.ai/zen/go/v1"); got != ProviderOpenCodeGo {
+		t.Fatalf("go url = %q", got)
+	}
+	if got := RequestProvider(ProviderOpenCodeGo, "https://proxy.example/v1"); got != ProviderOpenCodeGo {
+		t.Fatalf("listed opencode-go = %q", got)
+	}
+	if !IsOpenCodeGoURL("https://opencode.ai/zen/go/v1/responses") {
+		t.Fatal("expected go responses url")
+	}
+	if IsOpenCodeGoURL("https://opencode.ai/zen/v1") {
+		t.Fatal("zen paid url is not go")
+	}
+}
+
 func TestAll(t *testing.T) {
 	models := All()
 	if len(models) == 0 {
