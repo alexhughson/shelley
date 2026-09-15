@@ -425,11 +425,11 @@ func TestLLMIntegrationCustomProviderSourceNamesProvider(t *testing.T) {
 	}
 }
 
-func TestLLMIntegrationOpenCodeGoURLSetsProvider(t *testing.T) {
+func TestLLMIntegrationOpenCodeGoProviderFromModelsJSON(t *testing.T) {
 	integ := &LLMIntegrationConfig{
-		Name: "llm", Host: "opencode.ai", URL: "https://opencode.ai/zen/go/v1",
+		Name: "llm", Host: "llm.int.exe.xyz", URL: "https://llm.int.exe.xyz",
 		Models: []IntegrationModel{
-			{ID: "muse-spark-1.3-contributor", Provider: "openai", NativeID: "muse-spark-1.3-contributor", APIs: []string{"openai_responses"}},
+			{ID: "muse-spark-1.3-contributor", Provider: "opencode-go", NativeID: "muse-spark-1.3-contributor", APIs: []string{"openai_responses"}},
 		},
 	}
 
@@ -441,15 +441,15 @@ func TestLLMIntegrationOpenCodeGoURLSetsProvider(t *testing.T) {
 	if built.Provider != models.ProviderOpenCodeGo {
 		t.Fatalf("provider = %q, want %q", built.Provider, models.ProviderOpenCodeGo)
 	}
-	if built.Source != "opencode.ai" {
+	if built.Source != "llm.int.exe.xyz" {
 		t.Fatalf("source = %q, want host only", built.Source)
 	}
 	service, ok := built.Service.(*oai.ResponsesService)
 	if !ok {
 		t.Fatalf("service = %T, want *oai.ResponsesService", built.Service)
 	}
-	if service.ProviderName != "openai" {
-		t.Fatalf("wire ProviderName = %q, want openai", service.ProviderName)
+	if service.ProviderName != "opencode-go" {
+		t.Fatalf("wire ProviderName = %q, want opencode-go", service.ProviderName)
 	}
 }
 

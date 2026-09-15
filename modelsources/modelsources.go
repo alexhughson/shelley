@@ -195,12 +195,11 @@ func Build(catalog []models.Model, sources []Source, httpc *http.Client, logger 
 					continue
 				}
 				seen[id] = true
-				provider := models.RequestProvider(models.Provider(m.Provider), src.integration.URL)
 				out = append(out, models.Built{
 					ID:           id,
 					DisplayName:  id,
-					Provider:     provider,
-					Source:       integrationSourceLabel(src.label, provider),
+					Provider:     models.Provider(m.Provider),
+					Source:       integrationSourceLabel(src.label, models.Provider(m.Provider)),
 					ReleaseDate:  modelReleaseDate(src.integration.URL, m.apiModelName()),
 					Service:      svc,
 					APIType:      apiType,
