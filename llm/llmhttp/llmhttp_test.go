@@ -89,6 +89,10 @@ func TestTransportAddsHeaders(t *testing.T) {
 		t.Errorf("Shelley-Conversation-Id = %q, want %q", got, "test-conv-id")
 	}
 
+	if got := receivedHeaders.Get("X-OpenCode-Session"); got != "test-conv-id" {
+		t.Errorf("X-OpenCode-Session = %q, want %q", got, "test-conv-id")
+	}
+
 	// Verify x-session-affinity is NOT added for non-fireworks providers
 	if got := receivedHeaders.Get("x-session-affinity"); got != "" {
 		t.Errorf("x-session-affinity = %q, want empty for non-fireworks", got)

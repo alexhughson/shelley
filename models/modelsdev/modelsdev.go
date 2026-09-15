@@ -369,9 +369,11 @@ func modelNames(modelName string) []string {
 	return names
 }
 
-// firstPartyProviders are the models.dev catalogs scanned by bare model name
-// for cost lookups, in preference order.
-var firstPartyProviders = []string{"anthropic", "openai", "google", "fireworks-ai", "xai"}
+// firstPartyProviders are the models.dev objects scanned by bare model name
+// when the integration URL host is unknown. Preference order matters:
+// grok-4.6 is in both xai and opencode-go; xai wins. opencode-go is last
+// so a custom host (not opencode.ai) still finds muse-spark-1.3-contributor.
+var firstPartyProviders = []string{"anthropic", "openai", "google", "fireworks-ai", "xai", "opencode-go"}
 
 // dateSuffixRe matches provider snapshot date suffixes like "-2026-04-23".
 var dateSuffixRe = regexp.MustCompile(`-\d{4}-\d{2}-\d{2}$`)

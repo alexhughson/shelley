@@ -175,6 +175,8 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Add conversation ID header if present
 	if conversationID := ConversationIDFromContext(req.Context()); conversationID != "" {
 		req.Header.Set("Shelley-Conversation-Id", conversationID)
+		// OpenCode Go requires this on every request. Other hosts ignore it.
+		req.Header.Set("X-OpenCode-Session", conversationID)
 
 		// Add x-session-affinity header for Fireworks to enable prompt caching
 		if ProviderFromContext(req.Context()) == "fireworks" {

@@ -198,6 +198,26 @@ func TestLookupReasoningCapabilities(t *testing.T) {
 			}},
 		},
 		{
+			name:     "opencode-go model on unknown host",
+			endpoint: "https://gateway.example/v1",
+			model:    "muse-spark-1.3-contributor",
+			found:    true,
+			want: ReasoningCapabilities{Supported: true, Levels: []llm.ThinkingLevel{
+				llm.ThinkingLevelMinimal, llm.ThinkingLevelLow, llm.ThinkingLevelMedium,
+				llm.ThinkingLevelHigh, llm.ThinkingLevelXHigh,
+			}},
+		},
+		{
+			name:     "opencode-go model by last slash segment",
+			endpoint: "https://gateway.example/v1",
+			model:    "meta/muse-spark-1.3-contributor",
+			found:    true,
+			want: ReasoningCapabilities{Supported: true, Levels: []llm.ThinkingLevel{
+				llm.ThinkingLevelMinimal, llm.ThinkingLevelLow, llm.ThinkingLevelMedium,
+				llm.ThinkingLevelHigh, llm.ThinkingLevelXHigh,
+			}},
+		},
+		{
 			name:  "date suffix is stripped",
 			model: "claude-haiku-4-5-20251001",
 			found: true,
