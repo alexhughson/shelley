@@ -161,7 +161,7 @@ func modelReleaseDate(endpoint, modelName string) string {
 
 func integrationSourceLabel(host string, provider models.Provider) string {
 	switch provider {
-	case "", models.ProviderOpenAI, models.ProviderAnthropic, models.ProviderFireworks, models.ProviderGemini, models.ProviderXAI, models.ProviderBuiltIn:
+	case "", models.ProviderOpenAI, models.ProviderAnthropic, models.ProviderFireworks, models.ProviderGemini, models.ProviderXAI, models.ProviderOpenCodeGo, models.ProviderBuiltIn:
 		return host
 	default:
 		return host + " (" + string(provider) + ")"

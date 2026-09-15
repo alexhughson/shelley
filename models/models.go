@@ -25,12 +25,13 @@ import (
 type Provider string
 
 const (
-	ProviderOpenAI    Provider = "openai"
-	ProviderAnthropic Provider = "anthropic"
-	ProviderFireworks Provider = "fireworks"
-	ProviderGemini    Provider = "gemini"
-	ProviderXAI       Provider = "xai"
-	ProviderBuiltIn   Provider = "builtin"
+	ProviderOpenAI     Provider = "openai"
+	ProviderAnthropic  Provider = "anthropic"
+	ProviderFireworks  Provider = "fireworks"
+	ProviderGemini     Provider = "gemini"
+	ProviderXAI        Provider = "xai"
+	ProviderOpenCodeGo Provider = "opencode-go"
+	ProviderBuiltIn    Provider = "builtin"
 )
 
 // SourceCustomLabel is the label used for custom (DB-backed) models.

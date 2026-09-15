@@ -425,6 +425,34 @@ func TestLLMIntegrationCustomProviderSourceNamesProvider(t *testing.T) {
 	}
 }
 
+func TestLLMIntegrationOpenCodeGoProviderFromModelsJSON(t *testing.T) {
+	integ := &LLMIntegrationConfig{
+		Name: "llm", Host: "llm.int.exe.xyz", URL: "https://llm.int.exe.xyz",
+		Models: []IntegrationModel{
+			{ID: "muse-spark-1.3-contributor", Provider: "opencode-go", NativeID: "muse-spark-1.3-contributor", APIs: []string{"openai_responses"}},
+		},
+	}
+
+	got := Build(models.All(), []Source{LLMIntegration(integ, "")}, &http.Client{}, nil)
+	built := findBuilt(got, "muse-spark-1.3-contributor")
+	if built == nil {
+		t.Fatal("missing muse-spark-1.3-contributor")
+	}
+	if built.Provider != models.ProviderOpenCodeGo {
+		t.Fatalf("provider = %q, want %q", built.Provider, models.ProviderOpenCodeGo)
+	}
+	if built.Source != "llm.int.exe.xyz" {
+		t.Fatalf("source = %q, want host only", built.Source)
+	}
+	service, ok := built.Service.(*oai.ResponsesService)
+	if !ok {
+		t.Fatalf("service = %T, want *oai.ResponsesService", built.Service)
+	}
+	if service.ProviderName != "opencode-go" {
+		t.Fatalf("wire ProviderName = %q, want opencode-go", service.ProviderName)
+	}
+}
+
 func TestLLMIntegrationProviderMismatchUsesDynamicService(t *testing.T) {
 	integ := &LLMIntegrationConfig{
 		Name: "llm", Host: "llm.int.exe.xyz", URL: "https://llm.int.exe.xyz",

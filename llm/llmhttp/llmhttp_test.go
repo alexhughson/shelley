@@ -89,6 +89,10 @@ func TestTransportAddsHeaders(t *testing.T) {
 		t.Errorf("Shelley-Conversation-Id = %q, want %q", got, "test-conv-id")
 	}
 
+	if got := receivedHeaders.Get("X-OpenCode-Session"); got != "" {
+		t.Errorf("X-OpenCode-Session = %q, want empty for non-opencode-go", got)
+	}
+
 	// Verify x-session-affinity is NOT added for non-fireworks providers
 	if got := receivedHeaders.Get("x-session-affinity"); got != "" {
 		t.Errorf("x-session-affinity = %q, want empty for non-fireworks", got)
@@ -127,6 +131,36 @@ func TestTransportAddsSessionAffinityForFireworks(t *testing.T) {
 	// Verify Shelley-Conversation-Id header was also added
 	if got := receivedHeaders.Get("Shelley-Conversation-Id"); got != "test-conv-id" {
 		t.Errorf("Shelley-Conversation-Id = %q, want %q", got, "test-conv-id")
+	}
+}
+
+func TestTransportAddsOpenCodeSessionForOpenCodeGo(t *testing.T) {
+	var receivedHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	client := NewClient(nil)
+
+	ctx := t.Context()
+	ctx = WithConversationID(ctx, "test-conv-id")
+	ctx = WithProvider(ctx, "opencode-go")
+	req, _ := http.NewRequestWithContext(ctx, "GET", server.URL, nil)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := receivedHeaders.Get("X-OpenCode-Session"); got != "test-conv-id" {
+		t.Errorf("X-OpenCode-Session = %q, want %q", got, "test-conv-id")
+	}
+	if got := receivedHeaders.Get("x-session-affinity"); got != "" {
+		t.Errorf("x-session-affinity = %q, want empty for opencode-go", got)
 	}
 }
 
