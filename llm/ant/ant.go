@@ -71,16 +71,23 @@ func ClaudeModelName(userName string) string {
 
 func (s *Service) Provider() string { return "anthropic" }
 
+func (s *Service) reasoningCapabilities() (modelsdev.ReasoningCapabilities, bool) {
+	if s.ReasoningOverride != nil {
+		return *s.ReasoningOverride, true
+	}
+	return modelsdev.LookupReasoningCapabilities(s.URL, cmp.Or(s.Model, DefaultModel))
+}
+
 func (s *Service) SupportsReasoning() bool {
-	caps, found := modelsdev.LookupReasoningCapabilities(s.URL, cmp.Or(s.Model, DefaultModel))
+	caps, found := s.reasoningCapabilities()
 	return !found || caps.Supported
 }
 
-// SupportedReasoningLevels advertises exact effort levels from models.dev.
+// SupportedReasoningLevels advertises endpoint effort levels before models.dev.
 // Budget-token and unknown models return nil and retain the historical
 // standard-level fallback.
 func (s *Service) SupportedReasoningLevels() []llm.ThinkingLevel {
-	caps, found := modelsdev.LookupReasoningCapabilities(s.URL, cmp.Or(s.Model, DefaultModel))
+	caps, found := s.reasoningCapabilities()
 	if !found {
 		return nil
 	}
@@ -97,12 +104,16 @@ func (s *Service) SupportsServerSideWebSearch() bool {
 	return strings.HasPrefix(strings.ToLower(cmp.Or(s.Model, DefaultModel)), "claude")
 }
 
-// DefaultReasoningLevel reports the reasoning level applied to requests that
-// carry no per-conversation override. applyAnthropicThinking treats both
-// ThinkingLevelDefault and ThinkingLevelOff as "send no thinking", so those
-// surface as "off"; any other configured level surfaces by name.
+// DefaultReasoningLevel reports the configured level. Explicit endpoint
+// controls also apply the same capability checks and clamping as the request.
 func (s *Service) DefaultReasoningLevel() string {
+	if s.ReasoningOverride != nil && !s.ReasoningOverride.Supported {
+		return ""
+	}
 	eff := s.ThinkingLevel
+	if s.ReasoningOverride != nil && s.ReasoningOverride.Levels != nil {
+		eff = s.effectiveThinkingLevel(eff)
+	}
 	if eff == llm.ThinkingLevelDefault || eff == llm.ThinkingLevelOff {
 		return "off"
 	}
@@ -154,6 +165,8 @@ func (s *Service) MaxImageBytes() int {
 // Service provides Claude completions.
 // Fields should not be altered concurrently with calling any method on Service.
 type Service struct {
+	// ReasoningOverride is endpoint-advertised metadata; nil uses models.dev.
+	ReasoningOverride     *modelsdev.ReasoningCapabilities
 	HTTPC                 *http.Client      // defaults to http.DefaultClient if nil
 	URL                   string            // defaults to DefaultURL if empty
 	APIKey                string            // must be non-empty
@@ -835,7 +848,7 @@ func (s *Service) buildRequest(r *llm.Request, stripThinking bool) *request {
 		System:     mapped(r.System, fromLLMSystem),
 	}
 
-	applyAnthropicThinking(req, model, llm.EffectiveThinkingLevel(s.ThinkingLevel, r.ThinkingLevel), maxTokens, s.supportsThinkingBinding())
+	s.applyAnthropicThinking(req, llm.EffectiveThinkingLevel(s.ThinkingLevel, r.ThinkingLevel), maxTokens, s.supportsThinkingBinding())
 	if req.Thinking != nil && req.Thinking.Type == "adaptive" && r.ToolChoice != nil {
 		switch r.ToolChoice.Type {
 		case llm.ToolChoiceTypeAny, llm.ToolChoiceTypeTool:
@@ -848,20 +861,40 @@ func (s *Service) buildRequest(r *llm.Request, stripThinking bool) *request {
 
 const minAnthropicThinkingBudget = 1024
 
-// applyAnthropicThinking sets the Thinking / OutputConfig fields without
-// increasing the configured output allowance. Budget-style thinking shares
-// max_tokens with the final answer, so leave 1024 tokens for that answer.
-func applyAnthropicThinking(req *request, model string, level llm.ThinkingLevel, maxTokens int, supportsBinding bool) {
-	adaptive := useAdaptiveThinking(model)
-	if adaptive {
-		caps, found := modelsdev.LookupReasoningCapabilities("", model)
-		if found && len(caps.Levels) > 0 {
-			level = llm.ClampThinkingLevel(level, caps.Levels)
+func (s *Service) adaptiveThinking() bool {
+	// An explicit effort list describes effort controls, not a token budget.
+	return useAdaptiveThinking(cmp.Or(s.Model, DefaultModel)) || s.ReasoningOverride != nil && len(s.ReasoningOverride.Levels) > 0
+}
+
+func (s *Service) effectiveThinkingLevel(level llm.ThinkingLevel) llm.ThinkingLevel {
+	if s.ReasoningOverride != nil && !s.ReasoningOverride.Supported {
+		return llm.ThinkingLevelOff
+	}
+	if s.adaptiveThinking() {
+		// Preserve the built-in model lookup when endpoint controls are absent.
+		caps, _ := modelsdev.LookupReasoningCapabilities("", cmp.Or(s.Model, DefaultModel))
+		if s.ReasoningOverride != nil {
+			caps = *s.ReasoningOverride
+		}
+		levels := caps.Levels
+		if s.ReasoningOverride != nil && len(levels) == 1 && levels[0] == llm.ThinkingLevelOff {
+			return llm.ThinkingLevelOff
+		}
+		if len(levels) > 0 {
+			level = llm.ClampThinkingLevel(level, levels)
 		} else if level == llm.ThinkingLevelMinimal {
-			// Historical fallback for adaptive models without exact metadata.
 			level = llm.ThinkingLevelLow
 		}
 	}
+	return level
+}
+
+// applyAnthropicThinking sets the Thinking / OutputConfig fields without
+// increasing the configured output allowance. Budget-style thinking shares
+// max_tokens with the final answer, so leave 1024 tokens for that answer.
+func (s *Service) applyAnthropicThinking(req *request, level llm.ThinkingLevel, maxTokens int, supportsBinding bool) {
+	level = s.effectiveThinkingLevel(level)
+	adaptive := s.adaptiveThinking()
 	if level == llm.ThinkingLevelOff || level == llm.ThinkingLevelDefault {
 		return
 	}

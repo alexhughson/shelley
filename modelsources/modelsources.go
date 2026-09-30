@@ -344,7 +344,24 @@ func providerStrippedIntegrationID(id string) string {
 	return candidate
 }
 
-func buildIntegrationService(catalog []models.Model, model IntegrationModel, baseURL string, httpc *http.Client) (models.APIType, llm.Service, bool) {
+func buildIntegrationService(catalog []models.Model, model IntegrationModel, baseURL string, httpc *http.Client) (apiType models.APIType, service llm.Service, ok bool) {
+	// Apply after either construction path, including a matching catalog model.
+	// Endpoint-advertised capabilities are more specific than a generic catalog:
+	// proxies may expose a different effort set for the same native model ID.
+	defer func() {
+		override := model.reasoningOverride()
+		if override == nil {
+			return
+		}
+		switch svc := service.(type) {
+		case *ant.Service:
+			svc.ReasoningOverride = override
+		case *oai.Service:
+			svc.ReasoningOverride = override
+		case *oai.ResponsesService:
+			svc.ReasoningOverride = override
+		}
+	}()
 	modelName := model.apiModelName()
 	if modelName == "" {
 		return "", nil, false
@@ -352,7 +369,7 @@ func buildIntegrationService(catalog []models.Model, model IntegrationModel, bas
 	if catalogModel, ok := compatibleCatalogModel(catalog, model); ok {
 		return catalogModel.APIType, catalogModel.Build(baseURL, "implicit", httpc), true
 	}
-	apiType, ok := integrationAPIType(model)
+	apiType, ok = integrationAPIType(model)
 	if !ok {
 		return "", nil, false
 	}
@@ -392,7 +409,11 @@ func buildIntegrationService(catalog []models.Model, model IntegrationModel, bas
 
 func compatibleCatalogModel(catalog []models.Model, integrationModel IntegrationModel) (models.Model, bool) {
 	modelName := integrationModel.apiModelName()
+	upstreamAPI, hasUpstreamAPI := integrationUpstreamAPIType(integrationModel)
 	for _, catalogModel := range catalog {
+		if hasUpstreamAPI && catalogModel.APIType != upstreamAPI {
+			continue
+		}
 		if catalogModel.Provider == models.Provider(integrationModel.Provider) &&
 			catalogModel.APIModelName == modelName &&
 			integrationAdvertisesAPI(integrationModel, catalogModel.APIType) {
@@ -417,10 +438,23 @@ func integrationAdvertisesAPI(model IntegrationModel, apiType models.APIType) bo
 	return slices.Contains(model.APIs, api)
 }
 
-// integrationAPIType picks the wire protocol for an integration model.
-// Providers that serve multiple protocols (e.g. Fireworks) advertise both
-// OpenAI and Anthropic APIs; prefer the more common OpenAI protocol.
+// integrationUpstreamAPIType honors an explicit upstream protocol only when
+// Shelley supports it and the integration advertises that API. A proxy may
+// advertise every API globally while each native model only accepts one.
+func integrationUpstreamAPIType(model IntegrationModel) (models.APIType, bool) {
+	if model.Upstream == nil {
+		return "", false
+	}
+	apiType := models.APIType(model.Upstream.APIType)
+	return apiType, integrationAdvertisesAPI(model, apiType)
+}
+
+// integrationAPIType picks the endpoint's explicit upstream protocol first.
+// Without one, retain the established preference for OpenAI protocols.
 func integrationAPIType(model IntegrationModel) (models.APIType, bool) {
+	if apiType, ok := integrationUpstreamAPIType(model); ok {
+		return apiType, true
+	}
 	if slices.Contains(model.APIs, "openai_responses") {
 		return models.APITypeOpenAIResponses, true
 	}
@@ -450,10 +484,49 @@ type IntegrationModel struct {
 	APIs         []string                     `json:"apis,omitempty"`
 	Architecture IntegrationModelArchitecture `json:"architecture,omitempty"`
 	ExeDev       IntegrationModelExeDev       `json:"exe_dev"`
+	Upstream     *IntegrationModelUpstream    `json:"upstream,omitempty"`
 }
 
 type IntegrationModelExeDev struct {
 	Mode string `json:"mode"`
+}
+
+// IntegrationModelUpstream describes controls accepted by this endpoint, not
+// capabilities inferred from its hostname or the model's generic catalog entry.
+type IntegrationModelUpstream struct {
+	APIType           string   `json:"api_type,omitempty"`
+	SupportsReasoning *bool    `json:"supports_reasoning,omitempty"`
+	ReasoningLevels   []string `json:"reasoning_levels,omitempty"`
+}
+
+func (m IntegrationModel) reasoningOverride() *modelsdev.ReasoningCapabilities {
+	u := m.Upstream
+	if u == nil {
+		return nil
+	}
+	if u.SupportsReasoning != nil && !*u.SupportsReasoning {
+		return &modelsdev.ReasoningCapabilities{}
+	}
+	// Support alone does not specify controls. Keep the catalog's Build,
+	// defaults, and capability lookup untouched unless levels are explicit.
+	if u.ReasoningLevels == nil {
+		return nil
+	}
+	caps := &modelsdev.ReasoningCapabilities{}
+	for _, name := range u.ReasoningLevels {
+		level := llm.ParseThinkingLevel(name)
+		// Fail closed only for an explicit unsupported effort protocol.
+		if level == llm.ThinkingLevelDefault || level.Name() != name {
+			slog.Warn("Unsupported integration reasoning controls", "model", m.ID, "levels", u.ReasoningLevels)
+			return &modelsdev.ReasoningCapabilities{}
+		}
+		if !slices.Contains(caps.Levels, level) {
+			caps.Levels = append(caps.Levels, level)
+		}
+	}
+	slices.Sort(caps.Levels)
+	caps.Supported = len(caps.Levels) > 0
+	return caps
 }
 
 type IntegrationModelArchitecture struct {

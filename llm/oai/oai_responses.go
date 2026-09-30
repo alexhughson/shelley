@@ -21,12 +21,16 @@ import (
 	"shelley.exe.dev/llm"
 	"shelley.exe.dev/llm/imageutil"
 	"shelley.exe.dev/llm/llmhttp"
+	"shelley.exe.dev/models/modelsdev"
 )
 
 // ResponsesService provides chat completions using the OpenAI Responses API.
 // This API is required for models like gpt-5.3-codex.
 // Fields should not be altered concurrently with calling any method on ResponsesService.
 type ResponsesService struct {
+	// ReasoningOverride is endpoint-advertised metadata; nil uses models.dev.
+	ReasoningOverride *modelsdev.ReasoningCapabilities
+
 	HTTPC         *http.Client      // defaults to http.DefaultClient if nil
 	APIKey        string            // optional, if not set will try to load from env var
 	Model         Model             // defaults to DefaultModel if zero value
@@ -615,12 +619,64 @@ func (s *ResponsesService) toLLMUsageFromResponses(usage responsesUsage, headers
 
 func (s *ResponsesService) Provider() string { return s.ProviderName }
 
+func (s *ResponsesService) reasoningEffort(ir *llm.Request) string {
+	// Add reasoning. Precedence:
+	//   1. ir.ThinkingLevel (request-level override from the caller)
+	//   2. s.ReasoningEffort (custom verbatim string from per-model config)
+	//   3. s.ThinkingLevel (service-level default)
+	level := llm.EffectiveThinkingLevel(s.ThinkingLevel, ir.ThinkingLevel)
+	levels := s.SupportedReasoningLevels()
+	genericEffort := false
+	var effort string
+	switch {
+	case ir.ReasoningEffort != "":
+		effort = ir.ReasoningEffort
+	case s.ReasoningOverride != nil && !s.ReasoningOverride.Supported:
+		// Explicit provider-verbatim configuration is separate from generic controls.
+		effort = s.ReasoningEffort
+	case ir.ThinkingLevel == llm.ThinkingLevelOff:
+		if len(levels) > 0 {
+			effort = "none"
+			genericEffort = true
+		}
+	case ir.ThinkingLevel != llm.ThinkingLevelDefault:
+		effort = ir.ThinkingLevel.ThinkingEffort()
+		genericEffort = true
+	case s.ReasoningEffort != "":
+		effort = s.ReasoningEffort
+	case level != llm.ThinkingLevelOff:
+		effort = level.ThinkingEffort()
+		genericEffort = true
+	}
+	// Exact advertised effort lists use the shared rounding rule. Without an
+	// exact list, preserve the historical Responses clamps. Provider-verbatim
+	// values from the service or request are never clamped.
+	if genericEffort && effort != "" {
+		if s.ReasoningOverride != nil && len(levels) == 1 && levels[0] == llm.ThinkingLevelOff {
+			effort = "none"
+		} else if len(levels) > 0 {
+			effort = clampKnownReasoningEffort(effort, levels)
+		} else {
+			if effort == "minimal" && strings.Contains(cmp.Or(s.Model, DefaultModel).ModelName, "codex") {
+				effort = "low"
+			}
+			if effort == "max" {
+				effort = "xhigh"
+			}
+		}
+	}
+	return effort
+}
+
 // DefaultReasoningLevel reports the reasoning effort applied to un-overridden
 // requests, mirroring the request builder's precedence: verbatim
 // ReasoningEffort wins, else a configured service-level ThinkingLevel. When
 // neither is set, no reasoning field is emitted and the provider applies its
 // own default (which Shelley cannot name), so it returns "".
 func (s *ResponsesService) DefaultReasoningLevel() string {
+	if s.ReasoningOverride != nil && (!s.ReasoningOverride.Supported || s.ReasoningOverride.Levels != nil) {
+		return defaultReasoningLevel(s.reasoningEffort(&llm.Request{}))
+	}
 	if s.ReasoningEffort != "" {
 		return s.ReasoningEffort
 	}
@@ -632,18 +688,25 @@ func (s *ResponsesService) DefaultReasoningLevel() string {
 
 func (s *ResponsesService) SupportsServerSideWebSearch() bool { return true }
 
-// SupportsReasoning reports the models.dev capability when known. Unknown
-// models retain the historical default of supporting reasoning controls.
+func (s *ResponsesService) reasoningCapabilities() (modelsdev.ReasoningCapabilities, bool) {
+	if s.ReasoningOverride != nil {
+		return *s.ReasoningOverride, true
+	}
+	return modelReasoningCapabilities(s.ModelURL, cmp.Or(s.Model, DefaultModel))
+}
+
+// SupportsReasoning uses endpoint metadata before models.dev. Unknown models
+// retain the historical default of supporting reasoning controls.
 func (s *ResponsesService) SupportsReasoning() bool {
-	caps, found := modelReasoningCapabilities(s.ModelURL, cmp.Or(s.Model, DefaultModel))
+	caps, found := s.reasoningCapabilities()
 	return !found || caps.Supported
 }
 
-// SupportedReasoningLevels advertises exact effort levels from models.dev.
+// SupportedReasoningLevels advertises endpoint effort levels before models.dev.
 // Nil means the model has no exact effort metadata and callers use the
 // historical provider fallback.
 func (s *ResponsesService) SupportedReasoningLevels() []llm.ThinkingLevel {
-	caps, found := modelReasoningCapabilities(s.ModelURL, cmp.Or(s.Model, DefaultModel))
+	caps, found := s.reasoningCapabilities()
 	return advertisedReasoningLevels(caps, found)
 }
 
@@ -744,46 +807,7 @@ func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Respon
 		}
 	}
 
-	// Add reasoning. Precedence:
-	//   1. ir.ThinkingLevel (request-level override from the caller)
-	//   2. s.ReasoningEffort (custom verbatim string from per-model config)
-	//   3. s.ThinkingLevel (service-level default)
-	level := llm.EffectiveThinkingLevel(s.ThinkingLevel, ir.ThinkingLevel)
-	levels := s.SupportedReasoningLevels()
-	genericEffort := false
-	var effort string
-	switch {
-	case ir.ReasoningEffort != "":
-		effort = ir.ReasoningEffort
-	case ir.ThinkingLevel == llm.ThinkingLevelOff:
-		if len(levels) > 0 {
-			effort = "none"
-			genericEffort = true
-		}
-	case ir.ThinkingLevel != llm.ThinkingLevelDefault:
-		effort = ir.ThinkingLevel.ThinkingEffort()
-		genericEffort = true
-	case s.ReasoningEffort != "":
-		effort = s.ReasoningEffort
-	case level != llm.ThinkingLevelOff:
-		effort = level.ThinkingEffort()
-		genericEffort = true
-	}
-	// Exact models.dev effort lists use the shared rounding rule. Without an
-	// exact list, preserve the historical Responses clamps. Provider-verbatim
-	// values from the service or request are never clamped.
-	if genericEffort && effort != "" {
-		if len(levels) > 0 {
-			effort = clampKnownReasoningEffort(effort, levels)
-		} else {
-			if effort == "minimal" && strings.Contains(model.ModelName, "codex") {
-				effort = "low"
-			}
-			if effort == "max" {
-				effort = "xhigh"
-			}
-		}
-	}
+	effort := s.reasoningEffort(ir)
 	if effort != "" {
 		req.Reasoning = &responsesReasoning{Effort: effort}
 		if s.supportsReasoningSummaries() {
