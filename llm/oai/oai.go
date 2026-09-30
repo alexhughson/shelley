@@ -1357,59 +1357,6 @@ func toStopReason(reason string) llm.StopReason {
 
 func (s *Service) Provider() string { return s.ProviderName }
 
-func (s *Service) reasoningEffort(ir *llm.Request) string {
-	// Reasoning effort. Precedence:
-	//   1. ir.ThinkingLevel (request-level override)
-	//   2. s.ReasoningEffort (verbatim per-model config)
-	//   3. s.ThinkingLevel (service-level default)
-	level := llm.EffectiveThinkingLevel(s.ThinkingLevel, ir.ThinkingLevel)
-	levels := s.SupportedReasoningLevels()
-	var effort string
-	genericEffort := false
-	switch {
-	case ir.ReasoningEffort != "":
-		effort = ir.ReasoningEffort
-	case s.ReasoningOverride != nil && !s.ReasoningOverride.Supported:
-		// Explicit provider-verbatim configuration is separate from generic controls.
-		effort = s.ReasoningEffort
-	case ir.ThinkingLevel == llm.ThinkingLevelOff:
-		// Preserve the historical unknown-model behavior, but use the explicit
-		// models.dev level set when one is available.
-		if len(levels) > 0 {
-			effort = "none"
-			genericEffort = true
-		} else if s.ReasoningEffort == "none" {
-			effort = s.ReasoningEffort
-		}
-	case ir.ThinkingLevel != llm.ThinkingLevelDefault:
-		effort = ir.ThinkingLevel.ThinkingEffort()
-		genericEffort = true
-	case s.ReasoningEffort != "":
-		effort = s.ReasoningEffort
-	case level != llm.ThinkingLevelOff && level != llm.ThinkingLevelDefault:
-		effort = level.ThinkingEffort()
-		genericEffort = true
-	}
-	// Exact advertised effort lists use one rounding rule. Models without an
-	// exact list retain the historical conservative chat-completions clamps.
-	// Provider-verbatim values from the service or request are never clamped.
-	if genericEffort && effort != "" {
-		if s.ReasoningOverride != nil && len(levels) == 1 && levels[0] == llm.ThinkingLevelOff {
-			effort = "none"
-		} else if len(levels) > 0 {
-			effort = clampKnownReasoningEffort(effort, levels)
-		} else {
-			switch effort {
-			case "minimal":
-				effort = "low"
-			case "xhigh", "max":
-				effort = "high"
-			}
-		}
-	}
-	return effort
-}
-
 // DefaultReasoningLevel reports the reasoning effort applied to un-overridden
 // requests, mirroring the precedence used when building a chat-completions
 // request: verbatim per-model ReasoningEffort wins, else a configured
@@ -1417,8 +1364,8 @@ func (s *Service) reasoningEffort(ir *llm.Request) string {
 // emitted and the provider applies its own default (often not "off" for
 // reasoning models), which Shelley cannot name — so it returns "".
 func (s *Service) DefaultReasoningLevel() string {
-	if s.ReasoningOverride != nil && (!s.ReasoningOverride.Supported || s.ReasoningOverride.Levels != nil) {
-		return defaultReasoningLevel(s.reasoningEffort(&llm.Request{}))
+	if effort, ok := overrideReasoningEffort(s.ReasoningOverride, &llm.Request{}, s.ThinkingLevel, s.ReasoningEffort); ok {
+		return defaultReasoningLevel(effort)
 	}
 	if s.ReasoningEffort != "" {
 		return s.ReasoningEffort
@@ -1455,8 +1402,8 @@ func defaultReasoningLevel(effort string) string {
 	return effort
 }
 
-func modelReasoningCapabilities(endpoint string, model Model) (modelsdev.ReasoningCapabilities, bool) {
-	return modelsdev.LookupReasoningCapabilities(cmp.Or(endpoint, model.URL), model.ModelName)
+func modelReasoningCapabilities(override *modelsdev.ReasoningCapabilities, endpoint string, model Model) (modelsdev.ReasoningCapabilities, bool) {
+	return override.Lookup(cmp.Or(endpoint, model.URL), model.ModelName)
 }
 
 func advertisedReasoningLevels(caps modelsdev.ReasoningCapabilities, found bool) []llm.ThinkingLevel {
@@ -1484,17 +1431,15 @@ func clampKnownReasoningEffort(effort string, levels []llm.ThinkingLevel) string
 	return effortForThinkingLevel(llm.ClampThinkingLevel(level, levels))
 }
 
-func (s *Service) reasoningCapabilities() (modelsdev.ReasoningCapabilities, bool) {
-	if s.ReasoningOverride != nil {
-		return *s.ReasoningOverride, true
-	}
-	return modelReasoningCapabilities(s.ModelURL, cmp.Or(s.Model, DefaultModel))
+// SetReasoningOverride configures endpoint controls before the service is used.
+func (s *Service) SetReasoningOverride(caps *modelsdev.ReasoningCapabilities) {
+	s.ReasoningOverride = caps
 }
 
 // SupportsReasoning uses endpoint metadata before models.dev. Unknown models
 // retain the historical default of supporting reasoning controls.
 func (s *Service) SupportsReasoning() bool {
-	caps, found := s.reasoningCapabilities()
+	caps, found := modelReasoningCapabilities(s.ReasoningOverride, s.ModelURL, cmp.Or(s.Model, DefaultModel))
 	return !found || caps.Supported
 }
 
@@ -1502,7 +1447,7 @@ func (s *Service) SupportsReasoning() bool {
 // Nil means the model has no exact effort metadata and callers use the
 // historical provider fallback.
 func (s *Service) SupportedReasoningLevels() []llm.ThinkingLevel {
-	caps, found := s.reasoningCapabilities()
+	caps, found := modelReasoningCapabilities(s.ReasoningOverride, s.ModelURL, cmp.Or(s.Model, DefaultModel))
 	return advertisedReasoningLevels(caps, found)
 }
 
@@ -1591,7 +1536,52 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 		req.StreamOptions = &openai.StreamOptions{IncludeUsage: true}
 	}
 
-	req.ReasoningEffort = s.reasoningEffort(ir)
+	// Reasoning effort. Precedence:
+	//   1. ir.ThinkingLevel (request-level override)
+	//   2. s.ReasoningEffort (verbatim per-model config)
+	//   3. s.ThinkingLevel (service-level default)
+	level := llm.EffectiveThinkingLevel(s.ThinkingLevel, ir.ThinkingLevel)
+	levels := s.SupportedReasoningLevels()
+	genericEffort := false
+	switch {
+	case ir.ReasoningEffort != "":
+		req.ReasoningEffort = ir.ReasoningEffort
+	case ir.ThinkingLevel == llm.ThinkingLevelOff:
+		// Preserve the historical unknown-model behavior, but use the explicit
+		// models.dev level set when one is available.
+		if len(levels) > 0 {
+			req.ReasoningEffort = "none"
+			genericEffort = true
+		} else if s.ReasoningEffort == "none" {
+			req.ReasoningEffort = s.ReasoningEffort
+		}
+	case ir.ThinkingLevel != llm.ThinkingLevelDefault:
+		req.ReasoningEffort = ir.ThinkingLevel.ThinkingEffort()
+		genericEffort = true
+	case s.ReasoningEffort != "":
+		req.ReasoningEffort = s.ReasoningEffort
+	case level != llm.ThinkingLevelOff && level != llm.ThinkingLevelDefault:
+		req.ReasoningEffort = level.ThinkingEffort()
+		genericEffort = true
+	}
+	// Exact models.dev effort lists use one rounding rule. Models without an
+	// exact list retain the historical conservative chat-completions clamps.
+	// Provider-verbatim values from the service or request are never clamped.
+	if genericEffort && req.ReasoningEffort != "" {
+		if len(levels) > 0 {
+			req.ReasoningEffort = clampKnownReasoningEffort(req.ReasoningEffort, levels)
+		} else {
+			switch req.ReasoningEffort {
+			case "minimal":
+				req.ReasoningEffort = "low"
+			case "xhigh", "max":
+				req.ReasoningEffort = "high"
+			}
+		}
+	}
+	if effort, ok := overrideReasoningEffort(s.ReasoningOverride, ir, s.ThinkingLevel, s.ReasoningEffort); ok {
+		req.ReasoningEffort = effort
+	}
 	// Construct the full URL for logging and debugging
 	fullURL := baseURL + "/chat/completions"
 

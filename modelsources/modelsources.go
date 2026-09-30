@@ -344,24 +344,25 @@ func providerStrippedIntegrationID(id string) string {
 	return candidate
 }
 
-func buildIntegrationService(catalog []models.Model, model IntegrationModel, baseURL string, httpc *http.Client) (apiType models.APIType, service llm.Service, ok bool) {
-	// Apply after either construction path, including a matching catalog model.
-	// Endpoint-advertised capabilities are more specific than a generic catalog:
-	// proxies may expose a different effort set for the same native model ID.
-	defer func() {
-		override := model.reasoningOverride()
-		if override == nil {
-			return
+func buildIntegrationService(catalog []models.Model, model IntegrationModel, baseURL string, httpc *http.Client) (models.APIType, llm.Service, bool) {
+	api, service, ok := newIntegrationService(catalog, model, baseURL, httpc)
+	if !ok {
+		return "", nil, false
+	}
+	if caps := model.reasoningOverride(); caps != nil {
+		configurable, ok := service.(interface {
+			SetReasoningOverride(*modelsdev.ReasoningCapabilities)
+		})
+		if !ok {
+			slog.Warn("Integration service cannot configure reasoning", "model", model.ID)
+			return "", nil, false
 		}
-		switch svc := service.(type) {
-		case *ant.Service:
-			svc.ReasoningOverride = override
-		case *oai.Service:
-			svc.ReasoningOverride = override
-		case *oai.ResponsesService:
-			svc.ReasoningOverride = override
-		}
-	}()
+		configurable.SetReasoningOverride(caps)
+	}
+	return api, service, true
+}
+
+func newIntegrationService(catalog []models.Model, model IntegrationModel, baseURL string, httpc *http.Client) (models.APIType, llm.Service, bool) {
 	modelName := model.apiModelName()
 	if modelName == "" {
 		return "", nil, false
@@ -369,7 +370,7 @@ func buildIntegrationService(catalog []models.Model, model IntegrationModel, bas
 	if catalogModel, ok := compatibleCatalogModel(catalog, model); ok {
 		return catalogModel.APIType, catalogModel.Build(baseURL, "implicit", httpc), true
 	}
-	apiType, ok = integrationAPIType(model)
+	apiType, ok := integrationAPIType(model)
 	if !ok {
 		return "", nil, false
 	}

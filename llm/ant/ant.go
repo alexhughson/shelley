@@ -71,15 +71,13 @@ func ClaudeModelName(userName string) string {
 
 func (s *Service) Provider() string { return "anthropic" }
 
-func (s *Service) reasoningCapabilities() (modelsdev.ReasoningCapabilities, bool) {
-	if s.ReasoningOverride != nil {
-		return *s.ReasoningOverride, true
-	}
-	return modelsdev.LookupReasoningCapabilities(s.URL, cmp.Or(s.Model, DefaultModel))
+// SetReasoningOverride configures endpoint controls before the service is used.
+func (s *Service) SetReasoningOverride(caps *modelsdev.ReasoningCapabilities) {
+	s.ReasoningOverride = caps
 }
 
 func (s *Service) SupportsReasoning() bool {
-	caps, found := s.reasoningCapabilities()
+	caps, found := s.ReasoningOverride.Lookup(s.URL, cmp.Or(s.Model, DefaultModel))
 	return !found || caps.Supported
 }
 
@@ -87,7 +85,7 @@ func (s *Service) SupportsReasoning() bool {
 // Budget-token and unknown models return nil and retain the historical
 // standard-level fallback.
 func (s *Service) SupportedReasoningLevels() []llm.ThinkingLevel {
-	caps, found := s.reasoningCapabilities()
+	caps, found := s.ReasoningOverride.Lookup(s.URL, cmp.Or(s.Model, DefaultModel))
 	if !found {
 		return nil
 	}
@@ -867,23 +865,17 @@ func (s *Service) adaptiveThinking() bool {
 }
 
 func (s *Service) effectiveThinkingLevel(level llm.ThinkingLevel) llm.ThinkingLevel {
-	if s.ReasoningOverride != nil && !s.ReasoningOverride.Supported {
-		return llm.ThinkingLevelOff
+	if s.ReasoningOverride != nil {
+		return s.ReasoningOverride.ResolveLevel(level)
 	}
-	if s.adaptiveThinking() {
-		// Preserve the built-in model lookup when endpoint controls are absent.
-		caps, _ := modelsdev.LookupReasoningCapabilities("", cmp.Or(s.Model, DefaultModel))
-		if s.ReasoningOverride != nil {
-			caps = *s.ReasoningOverride
+	// Leave the legacy budget/adaptive behavior and native-model lookup intact.
+	if useAdaptiveThinking(cmp.Or(s.Model, DefaultModel)) {
+		caps, found := modelsdev.LookupReasoningCapabilities("", cmp.Or(s.Model, DefaultModel))
+		if found && len(caps.Levels) > 0 {
+			return llm.ClampThinkingLevel(level, caps.Levels)
 		}
-		levels := caps.Levels
-		if s.ReasoningOverride != nil && len(levels) == 1 && levels[0] == llm.ThinkingLevelOff {
-			return llm.ThinkingLevelOff
-		}
-		if len(levels) > 0 {
-			level = llm.ClampThinkingLevel(level, levels)
-		} else if level == llm.ThinkingLevelMinimal {
-			level = llm.ThinkingLevelLow
+		if level == llm.ThinkingLevelMinimal {
+			return llm.ThinkingLevelLow
 		}
 	}
 	return level

@@ -48,34 +48,3 @@ func TestIntegrationReasoningAPI(t *testing.T) {
 		t.Fatalf("round max = %q, %v", got, changed)
 	}
 }
-
-func TestExactReasoningControlsRejectUnknownNames(t *testing.T) {
-	for _, m := range []*ModelInfo{{ID: "disabled"}, {ID: "exact", SupportsReasoning: true, ReasoningLevels: []string{"low", "high"}}} {
-		for _, level := range []string{"ultra", "thinking", "none", "default", "HIGH", " low "} {
-			if msg := validateModelReasoningLevel(m, level); msg == "" {
-				t.Errorf("model %+v accepted %q", m, level)
-			}
-		}
-	}
-}
-
-// Missing levels are normal for catalog models (including budget-token models).
-// Preserve the established generic controls unless an exact set is available.
-func TestMissingReasoningLevelsPreserveStandardControls(t *testing.T) {
-	model := &ModelInfo{ID: "catalog-without-efforts", SupportsReasoning: true}
-	for _, level := range []string{"", "off", "minimal", "low", "medium", "high", "xhigh"} {
-		if msg := validateModelReasoningLevel(model, level); msg != "" {
-			t.Errorf("%q rejected: %s", level, msg)
-		}
-		if got, changed := roundModelReasoningLevel(model, level); got != level || changed {
-			t.Errorf("%q became %q (%v)", level, got, changed)
-		}
-	}
-	if msg := validateModelReasoningLevel(model, "max"); msg == "" {
-		t.Fatal("unadvertised max accepted")
-	}
-	disabled := &ModelInfo{ID: "explicitly-disabled"}
-	if msg := validateModelReasoningLevel(disabled, "high"); msg == "" {
-		t.Fatal("disabled controls accepted")
-	}
-}

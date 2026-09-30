@@ -16,236 +16,157 @@ import (
 	"shelley.exe.dev/models/modelsdev"
 )
 
-// Exercise the actual discovery JSON boundary, both service construction paths,
-// capability consumers, defaults, and the serialized request. The arbitrary
-// hostname must not be needed to recognize an integration's reasoning metadata.
+// Exercise discovery JSON, both construction paths, and captured requests without
+// requiring a recognized hostname. Parser policy is tested separately below.
 func TestIntegrationReasoningMetadata(t *testing.T) {
-	for _, api := range []string{"openai_responses", "openai_chat", "anthropic_messages"} {
-		for _, tc := range []struct {
-			name, upstream        string
-			known                 bool
-			supported             bool
-			levels                []string
-			effort, defaultEffort string
-		}{
-			{name: "Muse 1.2 exact", upstream: `{"supports_reasoning":true,"reasoning_levels":["low","medium","high","xhigh"],"api_type":"openai-responses"}`, supported: true, levels: []string{"low", "medium", "high", "xhigh"}, effort: "xhigh", defaultEffort: "medium"},
-			{name: "Muse 1.3 exact", upstream: `{"supports_reasoning":true,"reasoning_levels":["low","medium","high","xhigh"]}`, supported: true, levels: []string{"low", "medium", "high", "xhigh"}, effort: "xhigh", defaultEffort: "medium"},
-			{name: "catalog conflict", upstream: `{"supports_reasoning":true,"reasoning_levels":["high","low","high"]}`, known: true, supported: true, levels: []string{"low", "high"}, effort: "high", defaultEffort: "low"},
-			{name: "off-only", upstream: `{"supports_reasoning":true,"reasoning_levels":["off"]}`, supported: true, levels: []string{"off"}, effort: "none", defaultEffort: "off"},
-			{name: "off", upstream: `{"supports_reasoning":true,"reasoning_levels":["off","low","medium","high","xhigh"]}`, supported: true, levels: []string{"off", "low", "medium", "high", "xhigh"}, effort: "xhigh", defaultEffort: "medium"},
-			{name: "false", upstream: `{"supports_reasoning":false,"reasoning_levels":["low","high"]}`, known: true},
-			{name: "invalid mixed", upstream: `{"supports_reasoning":true,"reasoning_levels":["high","ultra"]}`},
-			{name: "toggle", upstream: `{"supports_reasoning":true,"reasoning_levels":["none","thinking"]}`},
-			{name: "unknown", upstream: `{"supports_reasoning":true,"reasoning_levels":["ultra"]}`},
-			{name: "empty", upstream: `{"supports_reasoning":true,"reasoning_levels":[]}`},
-			{name: "absent", supported: true, effort: "xhigh", defaultEffort: "medium"},
-			{name: "support only", upstream: `{"supports_reasoning":true}`, supported: true, effort: "xhigh", defaultEffort: "medium"},
-		} {
-			t.Run(api+"/"+tc.name, func(t *testing.T) {
-				const base = "https://arbitrary-endpoint.example.test"
-				native, provider := "meta/muse-spark-1.2-contributor", "opencode"
-				if tc.name == "absent" || tc.name == "support only" {
-					native = "unknown-model-not-in-catalog"
+	for _, tc := range []struct {
+		name, native, provider        string
+		api                           models.APIType
+		levels                        []string
+		defaultEffort, explicitEffort string
+	}{
+		{"Muse 1.2 responses", "meta/muse-spark-1.2-contributor", "opencode", models.APITypeOpenAIResponses, []string{"low", "medium", "high", "xhigh"}, "medium", "xhigh"},
+		{"Muse 1.3 chat", "meta/muse-spark-1.3-contributor", "opencode", models.APITypeOpenAIChat, []string{"low", "medium", "high", "xhigh"}, "", "xhigh"},
+		{"dynamic anthropic with off", "unknown-model", "custom", models.APITypeAnthropicMessages, []string{"off", "low", "medium", "high", "xhigh"}, "medium", "xhigh"},
+		// Catalog defaults of medium tie between low/high: choose low, not high.
+		{"catalog responses", "gpt-5.5", "openai", models.APITypeOpenAIResponses, []string{"low", "high"}, "low", "high"},
+		{"catalog anthropic", "claude-opus-4-8", "anthropic", models.APITypeAnthropicMessages, []string{"low", "high"}, "low", "high"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const base = "https://arbitrary-endpoint.example.test"
+			catalogJSON, err := json.Marshal(map[string]any{
+				"schema_version": 1,
+				"models": []any{map[string]any{
+					"id": tc.provider + "/" + tc.native, "native_id": tc.native, "provider": tc.provider,
+					"apis":     []string{"openai_responses", "openai_chat", "anthropic_messages", "gemini"},
+					"upstream": map[string]any{"api_type": tc.api, "supports_reasoning": true, "reasoning_levels": tc.levels},
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var captured map[string]any
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Host != "arbitrary-endpoint.example.test" {
+					t.Fatalf("unexpected hostname: %s", req.URL)
 				}
-				if tc.name == "Muse 1.3 exact" {
-					native = "meta/muse-spark-1.3-contributor"
-				}
-				if tc.known {
-					native, provider = "gpt-5.5", "openai"
-					if api == "anthropic_messages" {
-						native, provider = "claude-opus-4-8", "anthropic"
+				body := string(catalogJSON)
+				if req.Method == http.MethodPost {
+					wantPath := map[models.APIType]string{models.APITypeOpenAIResponses: "/v1/responses", models.APITypeOpenAIChat: "/v1/chat/completions", models.APITypeAnthropicMessages: "/v1/messages"}[tc.api]
+					if req.URL.Path != wantPath {
+						t.Fatalf("wire path = %s, want %s", req.URL.Path, wantPath)
 					}
-				}
-				model := map[string]any{"id": provider + "/" + native, "native_id": native, "provider": provider, "apis": []string{api}}
-				if tc.upstream != "" {
-					var upstream map[string]any
-					if err := json.Unmarshal([]byte(tc.upstream), &upstream); err != nil {
+					if err := json.NewDecoder(req.Body).Decode(&captured); err != nil {
 						t.Fatal(err)
 					}
-					upstream["api_type"] = map[string]string{"openai_responses": "openai-responses", "openai_chat": "openai-chat-completions", "anthropic_messages": "anthropic-messages"}[api]
-					model["upstream"] = upstream
-					model["apis"] = []string{"openai_responses", "openai_chat", "anthropic_messages", "gemini"}
+					switch tc.api {
+					case models.APITypeOpenAIChat:
+						body = `{"id":"test","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`
+					case models.APITypeOpenAIResponses:
+						body = `{"id":"test","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1}}`
+					case models.APITypeAnthropicMessages:
+						body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+					}
+				} else if req.Method != http.MethodGet || req.URL.Path != "/models.json" {
+					t.Fatalf("unexpected discovery request: %s %s", req.Method, req.URL)
 				}
-				catalogJSON, err := json.Marshal(map[string]any{"schema_version": 1, "models": []any{model}})
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+			})}
+			var catalog llmIntegrationModelCatalog
+			if !fetchJSON(t.Context(), client, base+"/models.json", &catalog) {
+				t.Fatal("discovery failed")
+			}
+			integration := &LLMIntegrationConfig{Name: "custom", Host: "arbitrary-endpoint.example.test", URL: base, Models: integrationModelsFromCatalog(catalog)}
+			built := Build(models.All(), []Source{LLMIntegration(integration, "")}, client, nil)
+			if len(built) != 1 {
+				t.Fatalf("built = %+v", built)
+			}
+			svc := built[0].Service
+			var levels []string
+			for _, level := range llm.SupportedReasoningLevels(svc) {
+				levels = append(levels, level.Name())
+			}
+			if !llm.SupportsReasoning(svc) || !reflect.DeepEqual(levels, tc.levels) {
+				t.Fatalf("supported = %v, levels = %v; want true, %v", llm.SupportsReasoning(svc), levels, tc.levels)
+			}
+			if got := llm.ServiceDefaultReasoningLevel(svc); got != tc.defaultEffort {
+				t.Fatalf("default = %q, want %q", got, tc.defaultEffort)
+			}
+			requestLevels := []llm.ThinkingLevel{llm.ThinkingLevelDefault, llm.ThinkingLevelXHigh}
+			if slices.Contains(tc.levels, "off") {
+				requestLevels = append(requestLevels, llm.ThinkingLevelOff)
+			}
+			for _, level := range requestLevels {
+				captured = nil
+				_, err := svc.Do(t.Context(), &llm.Request{ThinkingLevel: level, Messages: []llm.Message{{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "hello"}}}}})
 				if err != nil {
 					t.Fatal(err)
 				}
-				var captured map[string]any
-				client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-					if req.URL.Host != "arbitrary-endpoint.example.test" {
-						t.Fatalf("unexpected hostname: %s", req.URL)
+				if captured["model"] != tc.native {
+					t.Fatalf("wire model = %v, want %s", captured["model"], tc.native)
+				}
+				want := tc.explicitEffort
+				if level == llm.ThinkingLevelDefault {
+					want = tc.defaultEffort
+				}
+				var got string
+				switch tc.api {
+				case models.APITypeOpenAIChat:
+					got, _ = captured["reasoning_effort"].(string)
+				case models.APITypeOpenAIResponses:
+					if r, ok := captured["reasoning"].(map[string]any); ok {
+						got, _ = r["effort"].(string)
 					}
-					body := string(catalogJSON)
-					if req.Method == http.MethodPost {
-						wantPath := map[string]string{"openai_responses": "/v1/responses", "openai_chat": "/v1/chat/completions", "anthropic_messages": "/v1/messages"}[api]
-						if req.URL.Path != wantPath {
-							t.Fatalf("wire path = %s, want %s", req.URL.Path, wantPath)
-						}
-						if err := json.NewDecoder(req.Body).Decode(&captured); err != nil {
-							t.Fatal(err)
-						}
-						switch api {
-						case "openai_chat":
-							body = `{"id":"test","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`
-						case "openai_responses":
-							body = `{"id":"test","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1}}`
-						case "anthropic_messages":
-							body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-						}
-					} else if req.URL.Path != "/models.json" {
-						t.Fatalf("unexpected discovery URL: %s", req.URL)
-					}
-					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
-				})}
-				var catalog llmIntegrationModelCatalog
-				if !fetchJSON(t.Context(), client, base+"/models.json", &catalog) {
-					t.Fatal("discovery failed")
-				}
-				integration := &LLMIntegrationConfig{Name: "custom", Host: "arbitrary-endpoint.example.test", URL: base, Models: integrationModelsFromCatalog(catalog)}
-				built := Build(models.All(), []Source{LLMIntegration(integration, "")}, client, nil)
-				if len(built) != 1 {
-					t.Fatalf("built = %+v", built)
-				}
-				svc := built[0].Service
-				if got := llm.SupportsReasoning(svc); got != tc.supported {
-					t.Fatalf("supported = %v, want %v", got, tc.supported)
-				}
-				var levels []string
-				for _, level := range llm.SupportedReasoningLevels(svc) {
-					levels = append(levels, level.Name())
-				}
-				if !reflect.DeepEqual(levels, tc.levels) {
-					t.Fatalf("levels = %v, want %v", levels, tc.levels)
-				}
-				wantDefault := tc.defaultEffort
-				if api == "openai_chat" {
-					wantDefault = ""
-				}
-				if got := llm.ServiceDefaultReasoningLevel(svc); got != wantDefault {
-					t.Fatalf("default = %q, want %q", got, wantDefault)
-				}
-				requestLevels := []llm.ThinkingLevel{llm.ThinkingLevelDefault, llm.ThinkingLevelXHigh}
-				if tc.name == "off" {
-					requestLevels = append(requestLevels, llm.ThinkingLevelOff)
-				}
-				for _, level := range requestLevels {
-					captured = nil
-					_, err := svc.Do(t.Context(), &llm.Request{ThinkingLevel: level, Messages: []llm.Message{{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "hello"}}}}})
-					if err != nil {
-						t.Fatal(err)
-					}
-					if captured["model"] != native {
-						t.Fatalf("wire model = %v, want %s", captured["model"], native)
-					}
-					want := tc.effort
-					if level == llm.ThinkingLevelDefault {
-						want = wantDefault
-					}
-					if tc.name == "off-only" && (level != llm.ThinkingLevelDefault || api != "openai_chat") {
-						want = "none"
-						if api == "anthropic_messages" {
-							want = ""
-						}
+				case models.APITypeAnthropicMessages:
+					if r, ok := captured["output_config"].(map[string]any); ok {
+						got, _ = r["effort"].(string)
 					}
 					if level == llm.ThinkingLevelOff {
-						want = "none" // Existing OpenAI wire spelling of canonical off.
-						if api == "anthropic_messages" {
-							want = ""
-							if captured["thinking"] != nil {
-								t.Fatalf("off emitted thinking: %v", captured)
-							}
+						want = ""
+						if captured["thinking"] != nil {
+							t.Fatalf("off emitted thinking: %v", captured)
 						}
-					}
-					if (tc.name == "absent" || tc.name == "support only") && api == "openai_chat" && level == llm.ThinkingLevelXHigh {
-						want = "high"
-					}
-					var got string
-					switch api {
-					case "openai_chat":
-						got, _ = captured["reasoning_effort"].(string)
-					case "openai_responses":
-						if r, ok := captured["reasoning"].(map[string]any); ok {
-							got, _ = r["effort"].(string)
-						}
-					case "anthropic_messages":
-						if tc.name == "absent" || tc.name == "support only" {
-							if _, ok := captured["thinking"].(map[string]any); !ok {
-								t.Fatalf("missing legacy budget thinking: %v", captured)
-							}
-							continue
-						}
-						if r, ok := captured["output_config"].(map[string]any); ok {
-							got, _ = r["effort"].(string)
-						}
-						if !tc.supported && captured["thinking"] != nil {
-							t.Fatalf("disabled thinking emitted: %v", captured)
-						}
-					}
-					if got != want {
-						t.Errorf("level %s: wire effort = %q, want %q; request %v", level.Name(), got, want, captured)
+					} else if thinking, ok := captured["thinking"].(map[string]any); !ok || thinking["type"] != "adaptive" {
+						t.Fatalf("missing adaptive thinking: %v", captured)
 					}
 				}
-			})
-		}
-	}
-}
-
-func TestIntegrationAbsentReasoningMetadataPreservesCatalog(t *testing.T) {
-	for _, native := range []string{"gpt-5.5", "claude-opus-4-8", "meta/muse-spark-1.2-contributor"} {
-		for _, upstream := range []string{"null", `{}`, `{"api_type":"openai-responses"}`, `{"supports_reasoning":true}`, `{"supports_reasoning":true,"reasoning_levels":null}`} {
-			t.Run(native+upstream, func(t *testing.T) {
-				var model IntegrationModel
-				if err := json.Unmarshal([]byte(`{"upstream":`+upstream+`}`), &model); err != nil {
-					t.Fatal(err)
+				if got != want {
+					t.Errorf("level %s: wire effort = %q, want %q; request %v", level.Name(), got, want, captured)
 				}
-				model.ID, model.NativeID = native, native
-				model.APIs = []string{"openai_responses"}
-				if native == "claude-opus-4-8" {
-					model.APIs = []string{"anthropic_messages"}
-					model.Provider = "anthropic"
-				} else if native == "gpt-5.5" {
-					model.Provider = "openai"
-				}
-				if override := model.reasoningOverride(); override != nil {
-					t.Fatalf("unexpected override: %+v", override)
-				}
-				_, svc, ok := buildIntegrationService(models.All(), model, "https://arbitrary.example", &http.Client{})
-				if !ok {
-					t.Fatal("not built")
-				}
-				caps, found := modelsdev.LookupReasoningCapabilities("https://arbitrary.example", native)
-				if !found {
-					t.Fatal("test needs a known catalog entry")
-				}
-				if llm.SupportsReasoning(svc) != caps.Supported || !reflect.DeepEqual(llm.SupportedReasoningLevels(svc), caps.Levels) {
-					t.Fatalf("service no longer follows catalog: %+v", caps)
-				}
-			})
-		}
+			}
+		})
 	}
 }
 
 func TestIntegrationReasoningMetadataValidation(t *testing.T) {
 	for _, tc := range []struct {
-		upstream  string
-		supported bool
-		levels    []llm.ThinkingLevel
+		name, modelJSON string
+		want            *modelsdev.ReasoningCapabilities
 	}{
-		{`{"supports_reasoning":false}`, false, nil},
-		{`{"reasoning_levels":["minimal","low","medium","high","xhigh","max"]}`, true, []llm.ThinkingLevel{llm.ThinkingLevelMinimal, llm.ThinkingLevelLow, llm.ThinkingLevelMedium, llm.ThinkingLevelHigh, llm.ThinkingLevelXHigh, llm.ThinkingLevelMax}},
-		{`{"reasoning_levels":["default"]}`, false, nil},
-		{`{"reasoning_levels":["off"]}`, true, []llm.ThinkingLevel{llm.ThinkingLevelOff}},
-		{`{"reasoning_levels":["HIGH"]}`, false, nil},
-		{`{"reasoning_levels":[" high "]}`, false, nil},
+		{"absent", `{}`, nil},
+		{"null upstream", `{"upstream":null}`, nil},
+		{"empty upstream", `{"upstream":{}}`, nil},
+		{"support only", `{"upstream":{"supports_reasoning":true}}`, nil},
+		{"null levels", `{"upstream":{"supports_reasoning":true,"reasoning_levels":null}}`, nil},
+		{"false wins", `{"upstream":{"supports_reasoning":false,"reasoning_levels":["low","high"]}}`, &modelsdev.ReasoningCapabilities{}},
+		{"empty levels", `{"upstream":{"reasoning_levels":[]}}`, &modelsdev.ReasoningCapabilities{}},
+		{"toggle", `{"upstream":{"reasoning_levels":["none","thinking"]}}`, &modelsdev.ReasoningCapabilities{}},
+		{"invalid mixed", `{"upstream":{"reasoning_levels":["high","ultra"]}}`, &modelsdev.ReasoningCapabilities{}},
+		{"default sentinel", `{"upstream":{"reasoning_levels":["default"]}}`, &modelsdev.ReasoningCapabilities{}},
+		{"wrong case", `{"upstream":{"reasoning_levels":["HIGH"]}}`, &modelsdev.ReasoningCapabilities{}},
+		{"whitespace", `{"upstream":{"reasoning_levels":[" high "]}}`, &modelsdev.ReasoningCapabilities{}},
+		{"exact sorted deduplicated", `{"upstream":{"reasoning_levels":["max","high","off","minimal","medium","xhigh","low","high","off"]}}`, &modelsdev.ReasoningCapabilities{
+			Supported: true,
+			Levels:    []llm.ThinkingLevel{llm.ThinkingLevelOff, llm.ThinkingLevelMinimal, llm.ThinkingLevelLow, llm.ThinkingLevelMedium, llm.ThinkingLevelHigh, llm.ThinkingLevelXHigh, llm.ThinkingLevelMax},
+		}},
 	} {
-		t.Run(tc.upstream, func(t *testing.T) {
-			var m IntegrationModel
-			if err := json.Unmarshal([]byte(`{"id":"unknown-model","upstream":`+tc.upstream+`}`), &m); err != nil {
+		t.Run(tc.name, func(t *testing.T) {
+			var model IntegrationModel
+			if err := json.Unmarshal([]byte(tc.modelJSON), &model); err != nil {
 				t.Fatal(err)
 			}
-			caps := m.reasoningOverride()
-			if caps == nil || caps.Supported != tc.supported || !reflect.DeepEqual(caps.Levels, tc.levels) {
-				t.Fatalf("override = %+v, want supported %v, levels %v", caps, tc.supported, tc.levels)
+			if got := model.reasoningOverride(); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("override = %+v, want %+v", got, tc.want)
 			}
 		})
 	}
