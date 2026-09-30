@@ -61,6 +61,18 @@ export function roundThinkingLevel(
 export interface ReasoningModelCapabilities {
   supports_reasoning?: boolean;
   reasoning_levels?: Exclude<ThinkingLevel, "default">[];
+  default_reasoning_level?: string;
+}
+
+// A provider default must be in the available choices. Exact advertised lists
+// are authoritative; never append or round an unadvertised default.
+export function defaultThinkingLevelForModel(
+  model: ReasoningModelCapabilities | undefined,
+): ThinkingLevel {
+  return (
+    supportedThinkingLevels(model).find((level) => level === model?.default_reasoning_level) ??
+    "default"
+  );
 }
 
 export function normalizeThinkingLevelForModel(
@@ -69,16 +81,14 @@ export function normalizeThinkingLevelForModel(
 ): ThinkingLevel {
   if (level === "default") return level;
   if (!model || model.supports_reasoning === false) return "default";
-  if (model.reasoning_levels?.length) {
-    const rounded = roundThinkingLevel(level, model.reasoning_levels);
-    // Rounding can fail to land on a supported level (e.g. an off-only
-    // model never attracts non-off levels); reset rather than send a level
-    // the server would reject.
-    return model.reasoning_levels.includes(rounded) ? rounded : "default";
-  }
-  // Unknown models keep the historical standard set through xhigh. Max must
-  // be explicitly advertised.
-  return level === "max" ? "default" : level;
+  const supported = supportedThinkingLevels(model);
+  // Without exact metadata, retain standard levels but do not round max into
+  // a guessed effort. Max needs explicit support.
+  if (!model.reasoning_levels?.length) return supported.includes(level) ? level : "default";
+  const rounded = roundThinkingLevel(level, supported);
+  // Rounding can fail to land on a supported level (e.g. an off-only model
+  // never attracts non-off levels).
+  return supported.includes(rounded) ? rounded : "default";
 }
 
 export const THINKING_LEVEL_KEY = "shelley.thinkingLevel.v2";

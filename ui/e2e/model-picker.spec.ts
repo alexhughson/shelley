@@ -1,5 +1,6 @@
 import { test, expect } from "@playwright/test";
-import { testWorkingDirectory } from "./helpers";
+import type { Model } from "../src/types";
+import { reasoningMetadata, testWorkingDirectory } from "./helpers";
 
 // The unified model + effort picker (ChatStatusContent -> ModelPicker.vue) is
 // built on PrimeVue <Select>. It renders on the new-conversation screen. Here
@@ -107,11 +108,9 @@ test.describe("Model picker (PrimeVue)", () => {
     const panel = page.locator(".model-picker-panel");
     await expect(panel).toBeVisible();
 
-    // Models without explicit capability metadata use the standard levels
-    // through xhigh; rare max support must be advertised by the model.
+    // Missing exact metadata retains the standard levels through xhigh, never max.
     const pills = panel.locator(".model-picker-effort-pill");
-    expect(await pills.count()).toBeGreaterThanOrEqual(6);
-    await expect(pills.filter({ hasText: /^max$/ })).toHaveCount(0);
+    await expect(pills).toHaveText(["auto", "off", "minimal", "low", "medium", "high", "xhigh"]);
 
     // Pick "high" -> persists, popover stays open, trigger shows the suffix.
     await pills.filter({ hasText: /^high$/ }).click();
@@ -224,5 +223,93 @@ test.describe("Model picker (PrimeVue)", () => {
     await recentRow.click();
     await expect(panel).toBeHidden();
     await expect(picker.locator(".model-picker-value-effort")).toHaveText("· high");
+  });
+
+  for (const [name, metadata] of [
+    ["missing metadata", {}],
+    ["support only", { supports_reasoning: true }],
+    ["empty levels", { supports_reasoning: true, reasoning_levels: [] }],
+    ["known default without levels", { default_reasoning_level: "high" }],
+  ] satisfies [string, Partial<Model>][]) {
+    test(`${name} retains standard choices and a stored concrete effort`, async ({ page }) => {
+      await reasoningMetadata(page, metadata);
+      await page.addInitScript(() => localStorage.setItem("shelley.thinkingLevel.v2", "xhigh"));
+      await page.goto("/new");
+      const picker = page.locator(".model-picker.p-select");
+      await picker.click();
+      const pills = page.locator(".model-picker-panel .model-picker-effort-pill");
+      const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
+      await expect(pills).toHaveText(
+        metadata.default_reasoning_level ? levels : ["auto", ...levels],
+      );
+      await expect(pills.filter({ hasText: /^xhigh$/ })).toHaveAttribute("aria-checked", "true");
+      await expect(picker.locator(".model-picker-value-effort")).toHaveText("· xhigh");
+      expect(await page.evaluate(() => localStorage.getItem("shelley.thinkingLevel.v2"))).toBe(
+        "xhigh",
+      );
+      await page.keyboard.press("Escape");
+      await page.getByTestId("message-input").fill("/model ");
+      const suggestions = page.getByTestId("model-arg-menu").locator(".slash-command-name");
+      await expect(suggestions).toHaveText(["predictable", ...levels]);
+    });
+  }
+
+  for (const reasoning_levels of [undefined, []]) {
+    test(`known default is selected with ${reasoning_levels ? "empty" : "omitted"} levels`, async ({
+      page,
+    }) => {
+      await reasoningMetadata(page, { default_reasoning_level: "medium", reasoning_levels });
+      await page.goto("/new");
+      await page.locator(".model-picker.p-select").click();
+      const pills = page.locator(".model-picker-panel .model-picker-effort-pill");
+      await expect(pills).toHaveText(["off", "minimal", "low", "medium", "high", "xhigh"]);
+      await expect(pills.filter({ hasText: /^medium$/ })).toHaveAttribute("aria-checked", "true");
+    });
+  }
+
+  for (const [modelDefault, expected, selected] of [
+    ["high", ["auto", "low", "max"], "auto"],
+    ["max", ["low", "max"], "max"],
+  ] as const) {
+    test(`default ${modelDefault} is selectable only when advertised`, async ({ page }) => {
+      await reasoningMetadata(page, {
+        supports_reasoning: true,
+        reasoning_levels: ["low", "max"],
+        default_reasoning_level: modelDefault,
+      });
+      await page.goto("/new");
+      await page.locator(".model-picker.p-select").click();
+      const pills = page.locator(".model-picker-panel .model-picker-effort-pill");
+      await expect(pills).toHaveText([...expected]);
+      await expect(pills.filter({ hasText: new RegExp(`^${selected}$`) })).toHaveAttribute(
+        "aria-checked",
+        "true",
+      );
+      await page.keyboard.press("Escape");
+      await page.getByTestId("message-input").fill("/model ");
+      await expect(page.getByTestId("model-arg-menu").locator(".slash-command-name")).toHaveText([
+        "predictable",
+        "low",
+        "max",
+      ]);
+    });
+  }
+
+  test("unsupported reasoning has no effort pills even with contradictory metadata", async ({
+    page,
+  }) => {
+    await reasoningMetadata(page, {
+      supports_reasoning: false,
+      reasoning_levels: ["high"],
+      default_reasoning_level: "high",
+    });
+    await page.goto("/new");
+    await page.locator(".model-picker.p-select").click();
+    await expect(page.locator(".model-picker-panel .model-picker-effort-pill")).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    await page.getByTestId("message-input").fill("/model ");
+    await expect(page.getByTestId("model-arg-menu").locator(".slash-command-name")).toHaveText([
+      "predictable",
+    ]);
   });
 });

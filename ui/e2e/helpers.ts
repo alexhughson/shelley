@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { hermeticGitEnvironment } from "../scripts/git-test-env";
+import type { Model } from "../src/types";
 
 export function git(cwd: string, ...args: string[]): string {
   return execFileSync(
@@ -38,6 +39,22 @@ export function testWorkingDirectory(): string {
   const cwd = process.env.SHELLEY_TEST_CWD;
   if (!cwd) throw new Error("Playwright globalSetup did not set SHELLEY_TEST_CWD");
   return cwd;
+}
+
+// Capability fixtures must be explicit: predictable's reasoning metadata is
+// not a contract for the picker. Cover both boot data and catalog refreshes.
+export async function reasoningMetadata(page: Page, metadata: Partial<Model>) {
+  const models: Model[] = [{ id: "predictable", ready: true, ...metadata }];
+  await page.route("**/api/models", (route) => route.fulfill({ json: models }));
+  await page.addInitScript((models) => {
+    let init: typeof window.__SHELLEY_INIT__;
+    Object.defineProperty(window, "__SHELLEY_INIT__", {
+      get: () => init,
+      set: (value: typeof window.__SHELLEY_INIT__) => {
+        init = value && { ...value, models };
+      },
+    });
+  }, models);
 }
 
 export interface CreatedConversation {
