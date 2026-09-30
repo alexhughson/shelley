@@ -163,7 +163,7 @@ func (s *Service) MaxImageBytes() int {
 // Service provides Claude completions.
 // Fields should not be altered concurrently with calling any method on Service.
 type Service struct {
-	// ReasoningOverride is endpoint-advertised metadata; nil uses models.dev.
+	// ReasoningOverride is advertised for this model at this endpoint; nil uses models.dev.
 	ReasoningOverride     *modelsdev.ReasoningCapabilities
 	HTTPC                 *http.Client      // defaults to http.DefaultClient if nil
 	URL                   string            // defaults to DefaultURL if empty

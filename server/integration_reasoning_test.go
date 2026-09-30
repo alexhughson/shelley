@@ -6,18 +6,44 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"shelley.exe.dev/models"
 	"shelley.exe.dev/modelsources"
 )
 
-func TestIntegrationReasoningAPI(t *testing.T) {
-	var integration modelsources.IntegrationModel
-	if err := json.Unmarshal([]byte(`{"id":"opencode/meta/muse-spark-1.3-contributor","provider":"opencode","native_id":"meta/muse-spark-1.3-contributor","apis":["openai_responses"],"upstream":{"supports_reasoning":true,"reasoning_levels":["low","medium","high","xhigh"]}}`), &integration); err != nil {
-		t.Fatal(err)
+// The same model can have different controls at two endpoints, and two models
+// at one endpoint can have different controls. Build them together so that a
+// model-wide or endpoint-wide override would give the wrong choices.
+func TestThinkingControlsBelongToModelEndpointPair(t *testing.T) {
+	const muse = "meta/muse-spark-1.3-contributor"
+	type pair struct{ endpoint, model string }
+	want := map[pair]struct {
+		levels                   []string
+		defaultEffort, maxEffort string
+	}{
+		{"a.example", muse}:          {[]string{"low", "medium", "high", "xhigh"}, "medium", "xhigh"},
+		{"b.example", muse}:          {[]string{"low", "high"}, "low", "high"},
+		{"a.example", "other-model"}: {[]string{"low"}, "low", "low"},
 	}
-	built := modelsources.Build(models.All(), []modelsources.Source{modelsources.LLMIntegration(&modelsources.LLMIntegrationConfig{Name: "proxy", Host: "arbitrary.example", URL: "https://arbitrary.example", Models: []modelsources.IntegrationModel{integration}}, "")}, &http.Client{}, nil)
+	var sources []modelsources.Source
+	for _, endpoint := range []struct{ host, discovery string }{
+		{"a.example", `[
+   {"id":"opencode/meta/muse-spark-1.3-contributor","provider":"opencode","native_id":"meta/muse-spark-1.3-contributor","apis":["openai_responses"],"upstream":{"reasoning_levels":["low","medium","high","xhigh"]}},
+   {"id":"opencode/other-model","provider":"opencode","native_id":"other-model","apis":["openai_responses"],"upstream":{"reasoning_levels":["low"]}}
+  ]`},
+		{"b.example", `[
+   {"id":"opencode/meta/muse-spark-1.3-contributor","provider":"opencode","native_id":"meta/muse-spark-1.3-contributor","apis":["openai_responses"],"upstream":{"reasoning_levels":["low","high"]}}
+  ]`},
+	} {
+		integration := &modelsources.LLMIntegrationConfig{Name: endpoint.host, Host: endpoint.host, URL: "https://" + endpoint.host}
+		if err := json.Unmarshal([]byte(endpoint.discovery), &integration.Models); err != nil {
+			t.Fatal(err)
+		}
+		sources = append(sources, modelsources.LLMIntegration(integration, "-"+endpoint.host))
+	}
+	built := modelsources.Build(models.All(), sources, &http.Client{}, nil)
 	mgr, err := models.NewManager(&models.Config{Models: built})
 	if err != nil {
 		t.Fatal(err)
@@ -29,22 +55,27 @@ func TestIntegrationReasoningAPI(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("models = %+v", got)
+	if len(got) != 3 {
+		t.Fatalf("want three model/endpoint pairs, got %+v", got)
 	}
-	m := &got[0]
-	if !m.SupportsReasoning || !reflect.DeepEqual(m.ReasoningLevels, []string{"low", "medium", "high", "xhigh"}) || m.DefaultReasoningLevel != "medium" {
-		t.Fatalf("model = %+v", m)
-	}
-	if msg := validateModelReasoningLevel(m, "xhigh"); msg != "" {
-		t.Fatal(msg)
-	}
-	for _, level := range []string{"minimal", "max", "off", "ultra", "thinking", "none"} {
-		if msg := validateModelReasoningLevel(m, level); msg == "" {
-			t.Errorf("accepted unadvertised level %q", level)
+	for _, m := range got {
+		key := pair{strings.TrimPrefix(m.BaseURL, "https://"), m.APIModelName}
+		expected, ok := want[key]
+		if !ok {
+			t.Fatalf("unexpected or duplicate model/endpoint pair: %+v", key)
 		}
-	}
-	if got, changed := roundModelReasoningLevel(m, "max"); got != "xhigh" || !changed {
-		t.Fatalf("round max = %q, %v", got, changed)
+		if !m.SupportsReasoning || !reflect.DeepEqual(m.ReasoningLevels, expected.levels) || m.DefaultReasoningLevel != expected.defaultEffort {
+			t.Errorf("%+v: levels=%v default=%q; want levels=%v default=%q", key, m.ReasoningLevels, m.DefaultReasoningLevel, expected.levels, expected.defaultEffort)
+		}
+		if msg := validateModelReasoningLevel(&m, expected.maxEffort); msg != "" {
+			t.Errorf("%+v rejects advertised effort: %s", key, msg)
+		}
+		if msg := validateModelReasoningLevel(&m, "max"); msg == "" {
+			t.Errorf("%+v accepts unadvertised max", key)
+		}
+		if rounded, changed := roundModelReasoningLevel(&m, "max"); rounded != expected.maxEffort || !changed {
+			t.Errorf("%+v: switching from max gives %q, want %q", key, rounded, expected.maxEffort)
+		}
+		delete(want, key)
 	}
 }

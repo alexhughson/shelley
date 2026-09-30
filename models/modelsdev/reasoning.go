@@ -2,8 +2,8 @@ package modelsdev
 
 import "shelley.exe.dev/llm"
 
-// Lookup prefers explicit endpoint controls. A nil override leaves models.dev
-// lookup, including unknown models and catalogs without effort lists, unchanged.
+// Lookup uses the controls supplied for this service's (model, endpoint) pair.
+// A nil override leaves the models.dev lookup unchanged.
 func (override *ReasoningCapabilities) Lookup(endpoint, model string) (ReasoningCapabilities, bool) {
 	if override != nil {
 		return *override, true

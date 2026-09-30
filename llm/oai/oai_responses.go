@@ -28,7 +28,7 @@ import (
 // This API is required for models like gpt-5.3-codex.
 // Fields should not be altered concurrently with calling any method on ResponsesService.
 type ResponsesService struct {
-	// ReasoningOverride is endpoint-advertised metadata; nil uses models.dev.
+	// ReasoningOverride is advertised for this model at this endpoint; nil uses models.dev.
 	ReasoningOverride *modelsdev.ReasoningCapabilities
 
 	HTTPC         *http.Client      // defaults to http.DefaultClient if nil

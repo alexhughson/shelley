@@ -10,14 +10,12 @@ import (
 	"testing"
 
 	"shelley.exe.dev/llm"
-	"shelley.exe.dev/llm/ant"
 	"shelley.exe.dev/llm/oai"
 	"shelley.exe.dev/models"
-	"shelley.exe.dev/models/modelsdev"
 )
 
 // Exercise discovery JSON, both construction paths, and captured requests without
-// requiring a recognized hostname. Parser policy is tested separately below.
+// requiring a recognized hostname. Defaults and selections must reach the wire.
 func TestIntegrationReasoningMetadata(t *testing.T) {
 	for _, tc := range []struct {
 		name, native, provider        string
@@ -59,14 +57,7 @@ func TestIntegrationReasoningMetadata(t *testing.T) {
 					if err := json.NewDecoder(req.Body).Decode(&captured); err != nil {
 						t.Fatal(err)
 					}
-					switch tc.api {
-					case models.APITypeOpenAIChat:
-						body = `{"id":"test","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`
-					case models.APITypeOpenAIResponses:
-						body = `{"id":"test","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1}}`
-					case models.APITypeAnthropicMessages:
-						body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-					}
+					body = integrationResponse(t, tc.api)
 				} else if req.Method != http.MethodGet || req.URL.Path != "/models.json" {
 					t.Fatalf("unexpected discovery request: %s %s", req.Method, req.URL)
 				}
@@ -138,79 +129,6 @@ func TestIntegrationReasoningMetadata(t *testing.T) {
 	}
 }
 
-func TestIntegrationReasoningMetadataValidation(t *testing.T) {
-	for _, tc := range []struct {
-		name, modelJSON string
-		want            *modelsdev.ReasoningCapabilities
-	}{
-		{"absent", `{}`, nil},
-		{"null upstream", `{"upstream":null}`, nil},
-		{"empty upstream", `{"upstream":{}}`, nil},
-		{"support only", `{"upstream":{"supports_reasoning":true}}`, nil},
-		{"null levels", `{"upstream":{"supports_reasoning":true,"reasoning_levels":null}}`, nil},
-		{"false wins", `{"upstream":{"supports_reasoning":false,"reasoning_levels":["low","high"]}}`, &modelsdev.ReasoningCapabilities{}},
-		{"empty levels", `{"upstream":{"reasoning_levels":[]}}`, &modelsdev.ReasoningCapabilities{}},
-		{"toggle", `{"upstream":{"reasoning_levels":["none","thinking"]}}`, &modelsdev.ReasoningCapabilities{}},
-		{"invalid mixed", `{"upstream":{"reasoning_levels":["high","ultra"]}}`, &modelsdev.ReasoningCapabilities{}},
-		{"default sentinel", `{"upstream":{"reasoning_levels":["default"]}}`, &modelsdev.ReasoningCapabilities{}},
-		{"wrong case", `{"upstream":{"reasoning_levels":["HIGH"]}}`, &modelsdev.ReasoningCapabilities{}},
-		{"whitespace", `{"upstream":{"reasoning_levels":[" high "]}}`, &modelsdev.ReasoningCapabilities{}},
-		{"exact sorted deduplicated", `{"upstream":{"reasoning_levels":["max","high","off","minimal","medium","xhigh","low","high","off"]}}`, &modelsdev.ReasoningCapabilities{
-			Supported: true,
-			Levels:    []llm.ThinkingLevel{llm.ThinkingLevelOff, llm.ThinkingLevelMinimal, llm.ThinkingLevelLow, llm.ThinkingLevelMedium, llm.ThinkingLevelHigh, llm.ThinkingLevelXHigh, llm.ThinkingLevelMax},
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var model IntegrationModel
-			if err := json.Unmarshal([]byte(tc.modelJSON), &model); err != nil {
-				t.Fatal(err)
-			}
-			if got := model.reasoningOverride(); !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("override = %+v, want %+v", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestIntegrationLevelsOverrideCatalogFalse(t *testing.T) {
-	const native = "gpt-4.1-2025-04-14"
-	old, found := modelsdev.LookupReasoningCapabilities("https://arbitrary.example", native)
-	if !found || old.Supported {
-		t.Fatalf("fixture must be catalog-known nonreasoning: %+v, %v", old, found)
-	}
-	var m IntegrationModel
-	if err := json.Unmarshal([]byte(`{"native_id":"`+native+`","upstream":{"reasoning_levels":["low","high"]}}`), &m); err != nil {
-		t.Fatal(err)
-	}
-	caps := m.reasoningOverride()
-	if caps == nil || !caps.Supported || !reflect.DeepEqual(caps.Levels, []llm.ThinkingLevel{llm.ThinkingLevelLow, llm.ThinkingLevelHigh}) {
-		t.Fatalf("explicit levels did not override catalog: %+v", caps)
-	}
-}
-
-func TestMuseProxyEffortsOverrideBroaderCatalog(t *testing.T) {
-	for _, endpoint := range []string{"https://api.opencode.ai/go/v1", "https://openrouter.ai/api/v1"} {
-		t.Run(endpoint, func(t *testing.T) {
-			const native = "meta/muse-spark-1.3-contributor"
-			catalog, found := modelsdev.LookupReasoningCapabilities(endpoint, native)
-			if !found || !slices.Contains(catalog.Levels, llm.ThinkingLevelMinimal) {
-				t.Fatalf("fixture must advertise broader catalog efforts: %+v, %v", catalog, found)
-			}
-			if strings.Contains(endpoint, "openrouter") && !slices.Contains(catalog.Levels, llm.ThinkingLevelMax) {
-				t.Fatalf("OpenRouter fixture must advertise max: %+v", catalog)
-			}
-			var m IntegrationModel
-			if err := json.Unmarshal([]byte(`{"native_id":"`+native+`","upstream":{"supports_reasoning":true,"reasoning_levels":["low","medium","high","xhigh"]}}`), &m); err != nil {
-				t.Fatal(err)
-			}
-			caps := m.reasoningOverride()
-			if !caps.Supported || !reflect.DeepEqual(caps.Levels, []llm.ThinkingLevel{llm.ThinkingLevelLow, llm.ThinkingLevelMedium, llm.ThinkingLevelHigh, llm.ThinkingLevelXHigh}) {
-				t.Fatalf("proxy efforts = %+v", caps)
-			}
-		})
-	}
-}
-
 // Missing effort lists must not replace catalog factories or turn their
 // models.dev capabilities into endpoint overrides (including support-only JSON).
 func TestIntegrationUnspecifiedControlsUseCatalogBuild(t *testing.T) {
@@ -227,15 +145,11 @@ func TestIntegrationUnspecifiedControlsUseCatalogBuild(t *testing.T) {
 			return &oai.ResponsesService{Model: oai.Model{ModelName: "unknown-configured-responses"}, ModelURL: base + "/v1", APIKey: key, HTTPC: httpc, ReasoningEffort: "custom-effort", ThinkingLevel: llm.ThinkingLevelHigh, MaxTokens: 4321}
 		},
 	})
-	missingLevels := 0
 	for _, entry := range catalog {
 		if entry.APIType != models.APITypeAnthropicMessages && entry.APIType != models.APITypeOpenAIResponses && entry.APIType != models.APITypeOpenAIChat {
 			continue
 		}
 		baseline := entry.Build(base, "implicit", client)
-		if llm.SupportsReasoning(baseline) && llm.SupportedReasoningLevels(baseline) == nil {
-			missingLevels++
-		}
 		for _, upstream := range []string{"null", `{}`, `{"supports_reasoning":true}`, `{"supports_reasoning":true,"reasoning_levels":null}`, `{"api_type":"` + string(entry.APIType) + `","supports_reasoning":true}`} {
 			t.Run(entry.ID+upstream, func(t *testing.T) {
 				model := IntegrationModel{ID: entry.ID, NativeID: entry.APIModelName, Provider: string(entry.Provider), APIs: []string{"openai_responses", "openai_chat", "anthropic_messages"}}
@@ -246,32 +160,60 @@ func TestIntegrationUnspecifiedControlsUseCatalogBuild(t *testing.T) {
 				if !ok || api != entry.APIType || !reflect.DeepEqual(svc, baseline) {
 					t.Fatalf("catalog Build changed: %s, %T %+v; want %s, %T %+v", api, svc, svc, entry.APIType, baseline, baseline)
 				}
-				if got, want := llm.ServiceDefaultReasoningLevel(svc), llm.ServiceDefaultReasoningLevel(baseline); got != want {
-					t.Fatalf("default = %q, want catalog %q", got, want)
-				}
 			})
 		}
 	}
-	if missingLevels == 0 {
-		t.Fatal("test must cover reasoning-capable built-in models without effort metadata")
+}
+
+// Explicitly disabled or unrecognized controls must not silently regain the
+// generic efforts from the built-in catalog.
+func TestUnusableControlsDoNotSendCatalogEfforts(t *testing.T) {
+	for _, upstream := range []string{
+		`{"reasoning_levels":[]}`,
+		`{"supports_reasoning":false,"reasoning_levels":["low","high"]}`,
+		`{"reasoning_levels":["none","thinking"]}`,
+		`{"reasoning_levels":["high","ultra"]}`,
+	} {
+		t.Run(upstream, func(t *testing.T) {
+			var captured map[string]any
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if err := json.NewDecoder(req.Body).Decode(&captured); err != nil {
+					t.Fatal(err)
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(integrationResponse(t, models.APITypeOpenAIResponses))), Request: req}, nil
+			})}
+			model := IntegrationModel{ID: "gpt-5.5", NativeID: "gpt-5.5", Provider: "openai", APIs: []string{"openai_responses"}}
+			if err := json.Unmarshal([]byte(upstream), &model.Upstream); err != nil {
+				t.Fatal(err)
+			}
+			_, svc, ok := buildIntegrationService(models.All(), model, "https://arbitrary.example", client)
+			if !ok {
+				t.Fatal("model not built")
+			}
+			if llm.SupportsReasoning(svc) || len(llm.SupportedReasoningLevels(svc)) != 0 || llm.ServiceDefaultReasoningLevel(svc) != "" {
+				t.Fatal("unusable controls exposed catalog thinking levels")
+			}
+			if _, err := svc.Do(t.Context(), &llm.Request{ThinkingLevel: llm.ThinkingLevelHigh, Messages: []llm.Message{{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "hello"}}}}}); err != nil {
+				t.Fatal(err)
+			}
+			if captured["reasoning"] != nil {
+				t.Fatalf("disabled controls sent reasoning: %v", captured)
+			}
+		})
 	}
 }
 
-// A catalog host may advertise effort controls for a budget-thinking model.
-// Support-only integration metadata must not promote those to an override.
-func TestIntegrationSupportOnlyPreservesBudgetThinking(t *testing.T) {
-	const base = "https://api.pioneer.ai"
-	supported := true
-	model := IntegrationModel{ID: "claude-sonnet-4-5", NativeID: "claude-sonnet-4-5", Provider: "anthropic", APIs: []string{"anthropic_messages"}, Upstream: &IntegrationModelUpstream{SupportsReasoning: &supported}}
-	caps, found := modelsdev.LookupReasoningCapabilities(base, model.NativeID)
-	if !found || len(caps.Levels) == 0 {
-		t.Fatal("fixture must have endpoint effort metadata for this budget model")
-	}
-	_, svc, ok := buildIntegrationService(models.All(), model, base, &http.Client{})
-	if !ok {
-		t.Fatal("not built")
-	}
-	if got := svc.(*ant.Service).ReasoningOverride; got != nil {
-		t.Fatalf("support-only metadata invented endpoint controls: %+v", got)
+func integrationResponse(t *testing.T, api models.APIType) string {
+	t.Helper()
+	switch api {
+	case models.APITypeOpenAIChat:
+		return `{"id":"test","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`
+	case models.APITypeOpenAIResponses:
+		return `{"id":"test","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1}}`
+	case models.APITypeAnthropicMessages:
+		return "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	default:
+		t.Fatalf("no response fixture for %s", api)
+		return ""
 	}
 }

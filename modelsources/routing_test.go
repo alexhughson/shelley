@@ -2,11 +2,12 @@ package modelsources
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 
-	"shelley.exe.dev/llm/ant"
-	"shelley.exe.dev/llm/oai"
+	"shelley.exe.dev/llm"
 	"shelley.exe.dev/models"
 )
 
@@ -14,26 +15,26 @@ func TestIntegrationUpstreamAPIRouting(t *testing.T) {
 	for _, tc := range []struct {
 		name, native, provider, upstream string
 		apis                             []string
-		want                             models.APIType
-		catalogMatch                     bool
+		responseAPI                      models.APIType
+		wantPath                         string
 	}{
-		{name: "responses", native: "gpt-5.5", provider: "openai", upstream: "openai-responses", want: models.APITypeOpenAIResponses, catalogMatch: true},
-		{name: "chat overrides responses catalog", native: "gpt-5.5", provider: "openai", upstream: "openai-chat-completions", want: models.APITypeOpenAIChat},
-		{name: "messages overrides responses catalog", native: "gpt-5.5", provider: "openai", upstream: "anthropic-messages", want: models.APITypeAnthropicMessages},
-		{name: "messages catalog", native: "claude-opus-4-8", provider: "anthropic", upstream: "anthropic-messages", want: models.APITypeAnthropicMessages, catalogMatch: true},
-		{name: "responses overrides messages catalog", native: "claude-opus-4-8", provider: "anthropic", upstream: "openai-responses", want: models.APITypeOpenAIResponses},
-		{name: "absent preserves catalog preference", native: "claude-opus-4-8", provider: "anthropic", want: models.APITypeAnthropicMessages, catalogMatch: true},
-		{name: "invalid preserves catalog preference", native: "claude-opus-4-8", provider: "anthropic", upstream: "invented", want: models.APITypeAnthropicMessages, catalogMatch: true},
-		{name: "unadvertised ignored", native: "unknown", upstream: "anthropic-messages", apis: []string{"openai_chat"}, want: models.APITypeOpenAIChat},
-		{name: "unknown preferred chat", native: "unknown", upstream: "openai-chat-completions", want: models.APITypeOpenAIChat},
-		{name: "unknown no preference", native: "unknown", want: models.APITypeOpenAIResponses},
+		{name: "upstream chat overrides catalog responses", native: "gpt-5.5", provider: "openai", upstream: "openai-chat-completions", responseAPI: models.APITypeOpenAIChat, wantPath: "/v1/chat/completions"},
+		{name: "upstream responses overrides catalog messages", native: "claude-opus-4-8", provider: "anthropic", upstream: "openai-responses", responseAPI: models.APITypeOpenAIResponses, wantPath: "/v1/responses"},
+		{name: "upstream chat overrides default responses", native: "unknown", upstream: "openai-chat-completions", responseAPI: models.APITypeOpenAIChat, wantPath: "/v1/chat/completions"},
+		{name: "unspecified upstream keeps catalog messages", native: "claude-opus-4-8", provider: "anthropic", responseAPI: models.APITypeAnthropicMessages, wantPath: "/v1/messages"},
+		{name: "invalid upstream keeps catalog messages", native: "claude-opus-4-8", provider: "anthropic", upstream: "invented", responseAPI: models.APITypeAnthropicMessages, wantPath: "/v1/messages"},
+		{name: "unadvertised upstream keeps advertised chat", native: "unknown", upstream: "anthropic-messages", apis: []string{"openai_chat"}, responseAPI: models.APITypeOpenAIChat, wantPath: "/v1/chat/completions"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			apis := tc.apis
 			if apis == nil {
 				apis = []string{"openai_responses", "openai_chat", "anthropic_messages", "gemini"}
 			}
-			body, err := json.Marshal(map[string]any{"id": tc.provider + "/" + tc.native, "native_id": tc.native, "provider": tc.provider, "apis": apis, "upstream": map[string]string{"api_type": tc.upstream}})
+			discovered := map[string]any{"id": tc.provider + "/" + tc.native, "native_id": tc.native, "provider": tc.provider, "apis": apis}
+			if tc.upstream != "" {
+				discovered["upstream"] = map[string]string{"api_type": tc.upstream}
+			}
+			body, err := json.Marshal(discovered)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -41,30 +42,34 @@ func TestIntegrationUpstreamAPIRouting(t *testing.T) {
 			if err := json.Unmarshal(body, &m); err != nil {
 				t.Fatal(err)
 			}
-			catalogModel, matched := compatibleCatalogModel(models.All(), m)
-			if matched != tc.catalogMatch {
-				t.Fatalf("catalog match = %v, want %v", matched, tc.catalogMatch)
-			}
-			if matched && catalogModel.APIType != tc.want {
-				t.Fatalf("catalog API = %s, want %s", catalogModel.APIType, tc.want)
-			}
-			api, svc, ok := buildIntegrationService(models.All(), m, "https://arbitrary.example", &http.Client{})
-			if !ok || api != tc.want {
-				t.Fatalf("built API = %s, %v, want %s", api, ok, tc.want)
-			}
-			switch tc.want {
-			case models.APITypeOpenAIResponses:
-				if _, ok := svc.(*oai.ResponsesService); !ok {
-					t.Fatalf("wrong service %T", svc)
+			var paths []string
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodPost || req.URL.Host != "arbitrary.example" {
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL)
 				}
-			case models.APITypeOpenAIChat:
-				if _, ok := svc.(*oai.Service); !ok {
-					t.Fatalf("wrong service %T", svc)
+				paths = append(paths, req.URL.Path)
+				if req.URL.Path != tc.wantPath {
+					t.Fatalf("request path = %q, want %q", req.URL.Path, tc.wantPath)
 				}
-			case models.APITypeAnthropicMessages:
-				if _, ok := svc.(*ant.Service); !ok {
-					t.Fatalf("wrong service %T", svc)
-				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(integrationResponse(t, tc.responseAPI))),
+					Request:    req,
+				}, nil
+			})}
+			_, svc, ok := buildIntegrationService(models.All(), m, "https://arbitrary.example", client)
+			if !ok {
+				t.Fatal("integration service was not built")
+			}
+			_, err = svc.Do(t.Context(), &llm.Request{Messages: []llm.Message{
+				{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "hello"}}},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(paths) != 1 {
+				t.Fatalf("request paths = %v, want one request to %s", paths, tc.wantPath)
 			}
 		})
 	}

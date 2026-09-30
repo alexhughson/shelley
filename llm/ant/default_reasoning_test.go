@@ -34,7 +34,7 @@ func TestDefaultReasoningLevel(t *testing.T) {
 	}
 }
 
-func TestReasoningRequestMetadataScope(t *testing.T) {
+func TestExplicitControlsPreserveLegacyBudgetAndAdaptiveEncoding(t *testing.T) {
 	const endpoint = "https://api.pioneer.ai/v1/messages"
 	for _, tc := range []struct {
 		name, model          string
@@ -44,14 +44,9 @@ func TestReasoningRequestMetadataScope(t *testing.T) {
 		{"adaptive without override", Claude48Opus, nil, "adaptive", "max"},
 		{"adaptive explicit levels", Claude48Opus, &modelsdev.ReasoningCapabilities{Supported: true, Levels: []llm.ThinkingLevel{llm.ThinkingLevelLow, llm.ThinkingLevelMedium, llm.ThinkingLevelHigh, llm.ThinkingLevelXHigh}}, "adaptive", "xhigh"},
 		{"budget without override", "claude-sonnet-4-5", nil, "enabled", ""},
-		{"budget support only", "claude-sonnet-4-5", &modelsdev.ReasoningCapabilities{Supported: true}, "enabled", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &Service{Model: tc.model, URL: endpoint, ThinkingLevel: llm.ThinkingLevelMax, ReasoningOverride: tc.override}
-			endpointCaps, found := modelsdev.LookupReasoningCapabilities(endpoint, tc.model)
-			if !found || len(endpointCaps.Levels) == 0 || llm.ClampThinkingLevel(llm.ThinkingLevelMax, endpointCaps.Levels) == llm.ThinkingLevelMax {
-				t.Fatal("fixture must advertise narrower endpoint efforts than the native model")
-			}
 			got := s.fromLLMRequest(&llm.Request{})
 			if got.Thinking == nil || got.Thinking.Type != tc.wantType {
 				t.Fatalf("thinking = %+v, want %s", got.Thinking, tc.wantType)

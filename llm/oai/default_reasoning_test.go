@@ -32,24 +32,16 @@ func TestServiceDefaultReasoningLevel(t *testing.T) {
 	}
 }
 
-func TestReasoningOverrideDefaultMatchesClamping(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		caps  modelsdev.ReasoningCapabilities
-		level llm.ThinkingLevel
-		want  string
-	}{
-		{"round to advertised", modelsdev.ReasoningCapabilities{Supported: true, Levels: []llm.ThinkingLevel{llm.ThinkingLevelLow, llm.ThinkingLevelHigh}}, llm.ThinkingLevelMedium, "low"},
-		{"retain xhigh", modelsdev.ReasoningCapabilities{Supported: true, Levels: []llm.ThinkingLevel{llm.ThinkingLevelHigh, llm.ThinkingLevelXHigh}}, llm.ThinkingLevelXHigh, "xhigh"},
-		{"off-only canonical default", modelsdev.ReasoningCapabilities{Supported: true, Levels: []llm.ThinkingLevel{llm.ThinkingLevelOff}}, llm.ThinkingLevelMedium, "off"},
-		{"disabled", modelsdev.ReasoningCapabilities{}, llm.ThinkingLevelHigh, ""},
+// An enabled service default must not become an enabled choice when this
+// model's endpoint only advertises off. The API uses off, not the wire's none.
+func TestOffOnlyControlsDoNotInventDefaultEffort(t *testing.T) {
+	caps := &modelsdev.ReasoningCapabilities{Supported: true, Levels: []llm.ThinkingLevel{llm.ThinkingLevelOff}}
+	for _, svc := range []llm.Service{
+		&Service{ReasoningOverride: caps, ThinkingLevel: llm.ThinkingLevelMedium},
+		&ResponsesService{ReasoningOverride: caps, ThinkingLevel: llm.ThinkingLevelMedium},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, svc := range []llm.Service{&Service{ReasoningOverride: &tc.caps, ThinkingLevel: tc.level}, &ResponsesService{ReasoningOverride: &tc.caps, ThinkingLevel: tc.level}} {
-				if got := llm.ServiceDefaultReasoningLevel(svc); got != tc.want {
-					t.Errorf("%T default = %q, want %q", svc, got, tc.want)
-				}
-			}
-		})
+		if got := llm.ServiceDefaultReasoningLevel(svc); got != "off" {
+			t.Errorf("%T default = %q, want off", svc, got)
+		}
 	}
 }

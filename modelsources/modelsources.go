@@ -349,6 +349,7 @@ func buildIntegrationService(catalog []models.Model, model IntegrationModel, bas
 	if !ok {
 		return "", nil, false
 	}
+	// Each (model, integration URL) gets its own service and its own controls.
 	if caps := model.reasoningOverride(); caps != nil {
 		configurable, ok := service.(interface {
 			SetReasoningOverride(*modelsdev.ReasoningCapabilities)
@@ -492,8 +493,8 @@ type IntegrationModelExeDev struct {
 	Mode string `json:"mode"`
 }
 
-// IntegrationModelUpstream describes controls accepted by this endpoint, not
-// capabilities inferred from its hostname or the model's generic catalog entry.
+// IntegrationModelUpstream describes one model's controls at the integration's
+// endpoint. It applies neither to other models there nor to this model elsewhere.
 type IntegrationModelUpstream struct {
 	APIType           string   `json:"api_type,omitempty"`
 	SupportsReasoning *bool    `json:"supports_reasoning,omitempty"`
