@@ -1,6 +1,7 @@
 import type { ConversationWithState, Model } from "../../types";
 import {
   CONCRETE_THINKING_LEVELS,
+  defaultThinkingLevelForModel,
   normalizeThinkingLevelForModel,
   type ThinkingLevel,
 } from "./thinkingLevel";
@@ -61,10 +62,11 @@ function effectiveThinkingLevel(
   }
 
   if (model.supports_reasoning === false) return null;
-  if (!level && concreteLevels.has(model.default_reasoning_level || "")) {
-    level = model.default_reasoning_level as Exclude<ThinkingLevel, "default">;
+  if (!level) {
+    const modelDefault = defaultThinkingLevelForModel(model);
+    if (modelDefault === "default") return undefined;
+    level = modelDefault;
   }
-  if (!level) return undefined;
 
   const normalized = normalizeThinkingLevelForModel(level, model);
   return normalized === "default" ? undefined : normalized;

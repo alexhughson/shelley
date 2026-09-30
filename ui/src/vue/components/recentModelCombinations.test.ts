@@ -140,4 +140,33 @@ check(
   currentCapabilities,
 );
 
+for (const metadata of [{}, { supports_reasoning: true }, { reasoning_levels: [] }]) {
+  const result = recentModelCombinations(
+    [conversation("unknown-default", undefined, 0)],
+    [{ id: "unknown-default", ready: true, default_reasoning_level: "high", ...metadata }],
+    now,
+  );
+  check(
+    "retains provider defaults without exact levels",
+    result[0]?.thinkingLevel === "high",
+    result,
+  );
+}
+check(
+  "does not invent or round a default outside exact levels",
+  recentModelCombinations(
+    [conversation("limited", undefined, 0)],
+    [{ id: "limited", ready: true, reasoning_levels: ["low"], default_reasoning_level: "high" }],
+    now,
+  ).length === 0,
+);
+check(
+  "retains historical concrete choices without exact levels",
+  recentModelCombinations(
+    [conversation("unknown", "high", 0)],
+    [{ id: "unknown", ready: true, supports_reasoning: true }],
+    now,
+  )[0]?.thinkingLevel === "high",
+);
+
 console.log(`recentModelCombinations: ${passed} passed`);

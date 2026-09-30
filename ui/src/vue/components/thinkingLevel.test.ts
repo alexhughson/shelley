@@ -1,4 +1,6 @@
 import {
+  CONCRETE_THINKING_LEVELS,
+  defaultThinkingLevelForModel,
   normalizeThinkingLevelForModel,
   roundThinkingLevel,
   supportedThinkingLevels,
@@ -52,7 +54,15 @@ expectModelLevel("minimal", { supports_reasoning: true, reasoning_levels: ["off"
 expectModelLevel("high", { supports_reasoning: true, reasoning_levels: ["off"] }, "default");
 expectModelLevel("high", { supports_reasoning: false }, "default");
 expectModelLevel("max", { supports_reasoning: true }, "default");
-expectModelLevel("xhigh", { supports_reasoning: true }, "xhigh");
+for (const level of CONCRETE_THINKING_LEVELS) {
+  expectModelLevel(level, undefined, "default");
+  for (const model of [{}, { supports_reasoning: true }, { reasoning_levels: [] }]) {
+    expectModelLevel(level, model, level === "max" ? "default" : level);
+  }
+}
+expectModelLevel("default", { reasoning_levels: ["high"] }, "default");
+expectModelLevel("max", { reasoning_levels: ["low", "max"] }, "max");
+expectModelLevel("high", { supports_reasoning: false, reasoning_levels: ["high"] }, "default");
 
 function expectSupported(
   model: Parameters<typeof supportedThinkingLevels>[0],
@@ -73,8 +83,42 @@ expectSupported({ supports_reasoning: true, reasoning_levels: ["off", "high", "m
   "max",
 ]);
 expectSupported({ supports_reasoning: false }, []);
-expectSupported({ supports_reasoning: true }, ["off", "minimal", "low", "medium", "high", "xhigh"]);
-expectSupported(undefined, ["off", "minimal", "low", "medium", "high", "xhigh"]);
+for (const model of [undefined, {}, { supports_reasoning: true }, { reasoning_levels: [] }]) {
+  expectSupported(model, ["off", "minimal", "low", "medium", "high", "xhigh"]);
+}
+expectSupported({ reasoning_levels: ["high", "low"] }, ["high", "low"]);
+expectSupported({ supports_reasoning: false, reasoning_levels: ["high"] }, []);
+expectSupported({ reasoning_levels: ["low"], default_reasoning_level: "high" }, ["low"]);
+
+function expectDefault(
+  model: Parameters<typeof defaultThinkingLevelForModel>[0],
+  want: ReturnType<typeof defaultThinkingLevelForModel>,
+) {
+  const got = defaultThinkingLevelForModel(model);
+  if (got === want) {
+    passed++;
+  } else {
+    failed++;
+    console.error(
+      `FAIL: defaultThinkingLevelForModel(${JSON.stringify(model)}) = ${got}, want ${want}`,
+    );
+  }
+}
+
+expectDefault(undefined, "default");
+expectDefault({ supports_reasoning: true, default_reasoning_level: "high" }, "high");
+expectDefault({ reasoning_levels: [], default_reasoning_level: "high" }, "high");
+expectDefault({ default_reasoning_level: "high" }, "high");
+expectDefault({ default_reasoning_level: "max" }, "default");
+expectDefault({ reasoning_levels: ["low", "max"], default_reasoning_level: "high" }, "default");
+expectDefault({ reasoning_levels: ["high"], default_reasoning_level: "default" }, "default");
+expectDefault({ reasoning_levels: ["high"], default_reasoning_level: "dynamic" }, "default");
+expectDefault({ reasoning_levels: ["high"], default_reasoning_level: "high" }, "high");
+expectDefault({ reasoning_levels: ["off"], default_reasoning_level: "off" }, "off");
+expectDefault(
+  { supports_reasoning: false, reasoning_levels: ["high"], default_reasoning_level: "high" },
+  "default",
+);
 
 if (failed > 0) process.exit(1);
 console.log(`thinkingLevel: ${passed} passed`);

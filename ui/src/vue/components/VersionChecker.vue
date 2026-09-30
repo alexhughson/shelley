@@ -212,6 +212,7 @@ import { pickReadyModel, storedSelectedModel } from "./selectedModel";
 import { createVersionChangelogLoader, versionChangelogTags } from "./versionChangelog";
 import {
   DEFAULT_THINKING_LEVEL,
+  defaultThinkingLevelForModel,
   normalizeThinkingLevelForModel,
   storedThinkingLevel,
   type ThinkingLevel,
@@ -252,8 +253,7 @@ const rebaseModelLabel = computed(() => {
   let effort = normalizedRebaseLevel.value;
   if (effort === "default") {
     const m = rebaseModels.value.find((x) => x.id === rebaseModel.value);
-    const d = m?.default_reasoning_level;
-    if (d && d !== "default") effort = d as ThinkingLevel;
+    effort = defaultThinkingLevelForModel(m);
   }
   return effort && effort !== "default" ? `${name} · ${effort}` : name;
 });

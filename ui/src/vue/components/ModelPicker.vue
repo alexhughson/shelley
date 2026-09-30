@@ -188,7 +188,12 @@ import { computed, inject, onBeforeUnmount, ref } from "vue";
 import Select from "primevue/select";
 import { statusPickerDt } from "./statusPickerDt";
 import { prettyModelLabels } from "../../utils/modelNames";
-import { THINKING_LEVELS, type ThinkingLevel } from "./thinkingLevel";
+import {
+  defaultThinkingLevelForModel,
+  normalizeThinkingLevelForModel,
+  supportedThinkingLevels,
+  type ThinkingLevel,
+} from "./thinkingLevel";
 import { useI18n } from "../composables/i18n";
 import type { Model } from "../../types";
 import { ConversationsListKey } from "../composables/subagentLive";
@@ -394,39 +399,25 @@ const selectedLabel = computed(
 
 const reasoningSupported = computed(() => selectedModelObj.value?.supports_reasoning !== false);
 
-// The model's default as a real, selectable level (null when the provider's
-// default can't be named, e.g. a dynamic default Shelley doesn't know).
-const modelDefault = computed<ThinkingLevel | null>(() => {
-  const d = selectedModelObj.value?.default_reasoning_level;
-  if (!d || d === "default") return null;
-  return THINKING_LEVELS.some((l) => l.value === d) ? (d as ThinkingLevel) : null;
-});
+const modelDefault = computed(() => defaultThinkingLevelForModel(selectedModelObj.value));
 
 // What the pill row highlights. A stored "default" sentinel resolves to the
 // model's concrete default level when we know it, so the UI shows the real
 // level (e.g. medium) rather than a made-up "default" entry.
-const effectiveEffort = computed<ThinkingLevel>(() =>
-  props.thinkingLevel === "default" && modelDefault.value
-    ? modelDefault.value
-    : props.thinkingLevel,
-);
+const effectiveEffort = computed<ThinkingLevel>(() => {
+  const level = normalizeThinkingLevelForModel(props.thinkingLevel, selectedModelObj.value);
+  return level === "default" ? modelDefault.value : level;
+});
 
 const effortLevels = computed(() => {
-  const real = THINKING_LEVELS.filter((l) => l.value !== "default");
-  const advertised = selectedModelObj.value?.reasoning_levels as ThinkingLevel[] | undefined;
-  const list = advertised?.length
-    ? real.filter((l) => advertised.includes(l.value))
-    : real.filter((l) => l.value !== "max");
-  // Make sure the model's default is always selectable, even if it falls
-  // outside the advertised subset (defensive; normally it's included).
-  if (modelDefault.value && !list.some((l) => l.value === modelDefault.value)) {
-    const def = real.find((l) => l.value === modelDefault.value);
-    if (def) list.push(def);
-  }
+  const list = supportedThinkingLevels(selectedModelObj.value).map((value) => ({
+    value,
+    label: value,
+  }));
   // Only keep an "auto" sentinel when the concrete default is unknown, so
   // users can still defer to the model; otherwise the default is just one of
   // the real levels (pre-selected).
-  return modelDefault.value === null
+  return modelDefault.value === "default"
     ? [{ value: "default" as ThinkingLevel, label: t("effortAuto") }, ...list]
     : list;
 });

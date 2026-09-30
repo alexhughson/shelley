@@ -2836,7 +2836,8 @@ const queuedGhosts = computed(() => {
 // request.
 function buildConversationOptions(): ChatRequest["conversation_options"] | undefined {
   const hasOverrides = Object.keys(toolOverrides.value).length > 0;
-  const explicitThinking = thinkingLevel.value === "default" ? undefined : thinkingLevel.value;
+  const level = thinkingLevelForModel(selectedModel.value, thinkingLevel.value);
+  const explicitThinking = level === "default" ? undefined : level;
   const hasThinking = explicitThinking !== undefined;
   if (!hasOverrides && !hasThinking) return undefined;
   return {
@@ -2856,12 +2857,13 @@ async function sendFirstMessage(prompt: string) {
       throw new Error(`Invalid working directory: ${validation.error}`);
     }
   }
+  const level = thinkingLevelForModel(selectedModel.value, thinkingLevel.value);
   await props.onFirstMessage(
     prompt,
     selectedModel.value,
     selectedCwd.value || undefined,
     Object.keys(toolOverrides.value).length > 0 ? { ...toolOverrides.value } : undefined,
-    thinkingLevel.value === "default" ? undefined : thinkingLevel.value,
+    level === "default" ? undefined : level,
   );
 }
 
@@ -3829,7 +3831,8 @@ watch(
   ([, level]) => {
     if (!level || level === thinkingLevel.value) return;
     if (!THINKING_LEVELS.some((l) => l.value === level)) return;
-    setThinkingLevel(level as ThinkingLevel);
+    const model = props.currentConversation?.model || selectedModel.value;
+    setThinkingLevel(thinkingLevelForModel(model, level as ThinkingLevel));
   },
   { immediate: true },
 );
