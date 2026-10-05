@@ -368,7 +368,11 @@ func newIntegrationService(catalog []models.Model, model IntegrationModel, baseU
 	if modelName == "" {
 		return "", nil, false
 	}
-	if catalogModel, ok := compatibleCatalogModel(catalog, model); ok {
+	catalogModel, hasCatalog := compatibleCatalogModel(catalog, model)
+	override, hasOverride := integrationUpstreamAPIType(model)
+	// Catalog Build stays unless an explicit protocol override disagrees.
+	// ID matching ignores that override so published ids do not change.
+	if hasCatalog && (!hasOverride || catalogModel.APIType == override) {
 		return catalogModel.APIType, catalogModel.Build(baseURL, "implicit", httpc), true
 	}
 	apiType, ok := integrationAPIType(model)
@@ -409,13 +413,11 @@ func newIntegrationService(catalog []models.Model, model IntegrationModel, baseU
 	}
 }
 
+// compatibleCatalogModel matches provider and native name only.
+// upstream.api_type chooses the client later and must not rename the published id.
 func compatibleCatalogModel(catalog []models.Model, integrationModel IntegrationModel) (models.Model, bool) {
 	modelName := integrationModel.apiModelName()
-	upstreamAPI, hasUpstreamAPI := integrationUpstreamAPIType(integrationModel)
 	for _, catalogModel := range catalog {
-		if hasUpstreamAPI && catalogModel.APIType != upstreamAPI {
-			continue
-		}
 		if catalogModel.Provider == models.Provider(integrationModel.Provider) &&
 			catalogModel.APIModelName == modelName &&
 			integrationAdvertisesAPI(integrationModel, catalogModel.APIType) {

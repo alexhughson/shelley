@@ -74,3 +74,46 @@ func TestIntegrationUpstreamAPIRouting(t *testing.T) {
 		})
 	}
 }
+
+func TestIntegrationUpstreamAPIDoesNotRenameCatalogID(t *testing.T) {
+	integ := &LLMIntegrationConfig{
+		Name: "llm", Host: "llm.int.exe.xyz", URL: "https://arbitrary.example",
+		Models: []IntegrationModel{{
+			ID: "anthropic/claude-opus-4-8", Provider: "anthropic",
+			NativeID: "claude-opus-4-8",
+			APIs:     []string{"openai_responses", "openai_chat", "anthropic_messages"},
+			Upstream: &IntegrationModelUpstream{APIType: string(models.APITypeOpenAIResponses)},
+		}},
+	}
+	var paths []string
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost || req.URL.Host != "arbitrary.example" {
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL)
+		}
+		paths = append(paths, req.URL.Path)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(integrationResponse(t, models.APITypeOpenAIResponses))),
+			Request:    req,
+		}, nil
+	})}
+	built := Build(models.All(), []Source{LLMIntegration(integ, "")}, client, nil)
+	if len(built) != 1 {
+		t.Fatalf("built = %+v, want one", built)
+	}
+	if built[0].ID != "claude-opus-4.8" {
+		t.Fatalf("ID = %q, want catalog ID claude-opus-4.8", built[0].ID)
+	}
+	if built[0].APIType != models.APITypeOpenAIResponses {
+		t.Fatalf("APIType = %q, want %q", built[0].APIType, models.APITypeOpenAIResponses)
+	}
+	if _, err := built[0].Service.Do(t.Context(), &llm.Request{Messages: []llm.Message{
+		{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "hello"}}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != "/v1/responses" {
+		t.Fatalf("request paths = %v, want one /v1/responses", paths)
+	}
+}
