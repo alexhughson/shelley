@@ -2,13 +2,19 @@
 package exeenv
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
-	"os/exec"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+const metadataURL = "http://169.254.169.254/"
 
 // Environment describes the scheme and base domain used by exe.dev services.
 type Environment struct {
@@ -28,25 +34,62 @@ func New(scheme, boxHost string) (Environment, error) {
 	return Environment{scheme: scheme, boxHost: boxHost}, nil
 }
 
-// FromHostname resolves the exe.dev environment containing hostname.
-func FromHostname(hostname string) Environment {
-	if strings.Contains(strings.ToLower(hostname), "exe.cloud") {
-		return Environment{scheme: "http", boxHost: "exe.cloud"}
-	}
-	return Environment{scheme: "https", boxHost: "exe.xyz"}
+// Resolve VM metadata once; an unavailable or pre-upgrade endpoint uses prod.
+type resolver struct {
+	once   sync.Once
+	client *http.Client
+	env    Environment
+	err    error
 }
 
-var current = sync.OnceValues(func() (Environment, error) {
-	out, err := exec.Command("hostname", "-f").Output()
+var defaultResolver = &resolver{client: func() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil // the link-local metadata endpoint must never use an HTTP proxy
+	return &http.Client{Timeout: time.Second, Transport: transport}
+}()}
+
+func (r *resolver) current() (Environment, error) {
+	r.once.Do(func() { r.env, r.err = r.fetch() })
+	return r.env, r.err
+}
+
+func (r *resolver) fetch() (Environment, error) {
+	prod := Environment{scheme: "https", boxHost: "exe.xyz"}
+	resp, err := r.client.Get(metadataURL)
 	if err != nil {
-		return Environment{}, fmt.Errorf("resolve qualified hostname: %w", err)
+		return prod, nil
 	}
-	hostname := strings.TrimSpace(string(out))
-	if hostname == "" {
-		return Environment{}, fmt.Errorf("resolve qualified hostname: empty output")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return prod, nil
 	}
-	return FromHostname(hostname), nil
-})
+	var data struct {
+		ReflectionURL string `json:"reflection_url"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&data); err != nil {
+		return Environment{}, fmt.Errorf("decode VM metadata: %w", err)
+	}
+	if data.ReflectionURL == "" {
+		return prod, nil
+	}
+	return fromReflectionURL(data.ReflectionURL)
+}
+
+func fromReflectionURL(raw string) (Environment, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return Environment{}, fmt.Errorf("invalid reflection_url %q: %w", raw, err)
+	}
+	boxHost, ok := strings.CutPrefix(u.Host, "reflection.int.")
+	if !ok || boxHost == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery {
+		return Environment{}, fmt.Errorf("invalid reflection_url %q: expected an integration origin", raw)
+	}
+	env, err := New(u.Scheme, boxHost)
+	if err != nil {
+		return Environment{}, fmt.Errorf("invalid reflection_url %q: %w", raw, err)
+	}
+	return env, nil
+}
 
 var configured atomic.Pointer[Environment]
 
@@ -55,12 +98,21 @@ func Configure(env Environment) {
 	configured.Store(&env)
 }
 
-// Current resolves the environment from this machine's qualified hostname.
+// Current resolves the environment once from VM metadata. Off exe.dev it does
+// not query the link-local IP, which may be another cloud's metadata service.
+// On exe.dev, unavailable or old metadata falls back to prod for this process.
 func Current() (Environment, error) {
 	if env := configured.Load(); env != nil {
 		return *env, nil
 	}
-	return current()
+	return currentOnVM("/exe.dev", defaultResolver)
+}
+
+func currentOnVM(markerPath string, r *resolver) (Environment, error) {
+	if _, err := os.Stat(markerPath); err != nil {
+		return Environment{scheme: "https", boxHost: "exe.xyz"}, nil
+	}
+	return r.current()
 }
 
 // ReflectionURL returns the reflection integration's base URL.

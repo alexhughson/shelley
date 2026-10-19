@@ -108,16 +108,83 @@ func TestCombinedToolFoldedActions(t *testing.T) {
 	}
 }
 
-func TestCombinedToolUnknownAction(t *testing.T) {
+func TestCombinedToolInvalidCalls(t *testing.T) {
 	tools := NewBrowseTools(t.Context(), 0)
-	t.Cleanup(func() {
-		tools.Close()
-	})
-
+	t.Cleanup(func() { tools.Close() })
 	tool := tools.CombinedTool()
-	toolOut := tool.Run(t.Context(), []byte(`{"action": "bogus"}`))
-	if toolOut.Error == nil {
-		t.Error("Expected error for unknown action")
+
+	for _, tc := range []struct {
+		input string
+		want  []string
+	}{
+		{`{}`, []string{`"action" is required`, "Choose an action from the browser schema", `{"action":"eval","expression":"document.title"}`}},
+		{`{"action": " \t\n"}`, []string{`"action" is required`}},
+		{`{"url": "https://example.com"}`, []string{`"action" is required`, "Choose an action from the browser schema"}},
+		{`{"expression": "document.title"}`, []string{`"action" is required`, "Choose an action from the browser schema"}},
+		{`{"url": "", "expression": "document.title"}`, []string{`"action" is required`, "Choose an action from the browser schema"}},
+		{`{"selector": "#refresh", "width": 1280}`, []string{`"action" is required`, "Choose an action from the browser schema"}},
+		{`null`, []string{"arguments were null", "JSON object"}},
+		{`[]`, []string{"JSON array", "one browser call per action"}},
+		{`"{\"action\":\"eval\",\"expression\":\"1+1\"}"`, []string{"quoted JSON string", `Decoded arguments: {"action":"eval","expression":"1+1"}`, "field types matching the browser schema"}},
+		{`"{\"action\":42}"`, []string{"quoted JSON string", `Decoded arguments: {"action":42}`, `non-empty string "action"`}},
+		{`"{\"expression\":\"document.title\"}"`, []string{"quoted JSON string", `Decoded arguments: {"expression":"document.title"}`, `non-empty string "action"`}},
+		{`"{\"action\":\"eval\""`, []string{"not valid JSON", "JSON syntax error", `Received: {"action":"eval"`, "balanced braces"}},
+		{`"hello"`, []string{"not valid JSON", "Received: hello"}},
+		{`{"action":`, []string{"not a JSON object", `Received: {"action":`}},
+		{`{"action": 42}`, []string{`"action" must be a string, got 42`, `"action":"eval"`}},
+		{`{"action": null}`, []string{`"action" must be a string, got null`}},
+		{`{"action": "resize", "width": "wide"}`, []string{`field "width" must be an integer, got a JSON string`, "whole number"}},
+		{`{"action": "eval", "await": "yes"}`, []string{`field "await" must be a boolean`, "true or false"}},
+		{`{"action": "bogus"}`, []string{`unknown action "bogus"`, "All supported actions: navigate, eval"}},
+		{`{"action": "click"}`, []string{`unknown action "click"`, "All supported actions:"}},
+		{`{"action": "goto"}`, []string{`unknown action "goto"`, "All supported actions:"}},
+		{`{"action": "screnshot"}`, []string{`unknown action "screnshot"`, "All supported actions:"}},
+		{`{"action": "emulate_bogus"}`, []string{`unknown action "emulate_bogus"`, "All supported actions:"}},
+		{`{"action": "network_bogus"}`, []string{`unknown action "network_bogus"`, "All supported actions:"}},
+		{`{"action": "accessibility_bogus"}`, []string{`unknown action "accessibility_bogus"`, "All supported actions:"}},
+		{`{"action": "profile_bogus"}`, []string{`unknown action "profile_bogus"`, "All supported actions:"}},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			out := tool.Run(t.Context(), []byte(tc.input))
+			if out.Error == nil {
+				t.Fatal("expected an error")
+			}
+			msg := out.Error.Error()
+			if !strings.HasPrefix(msg, "invalid browser call: ") {
+				t.Errorf("error %q must start with invalid browser call", msg)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(msg, w) {
+					t.Errorf("error %q missing %q", msg, w)
+				}
+			}
+			for _, guess := range []string{"Did you mean", "belongs to", `Use "`, "Retry with exactly:"} {
+				if strings.Contains(msg, guess) {
+					t.Errorf("error %q must not guess a repair with %q", msg, guess)
+				}
+			}
+			if tools.browserCtx != nil {
+				t.Fatal("invalid call must not start a browser")
+			}
+		})
+	}
+}
+
+func TestUnknownActionListsSchemaActions(t *testing.T) {
+	tools := NewBrowseTools(t.Context(), 0)
+	t.Cleanup(func() { tools.Close() })
+	tool := tools.CombinedTool()
+	var schema struct {
+		Properties map[string]struct {
+			Enum []string `json:"enum"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(tool.InputSchema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	out := tool.Run(t.Context(), []byte(`{"action":"bogus"}`))
+	if out.Error == nil || !strings.Contains(out.Error.Error(), strings.Join(schema.Properties["action"].Enum, ", ")) {
+		t.Fatalf("error %v must list the schema's supported actions", out.Error)
 	}
 }
 
@@ -568,6 +635,13 @@ func TestBrowserIdleShutdownAndRestart(t *testing.T) {
 		t.Error("Expected different browser context after idle shutdown")
 	}
 
+	// The restarted browser must outlive the navigate below; with the 100ms
+	// timeout a slow runner shuts it down mid-navigation.
+	tools.mux.Lock()
+	tools.idleTimeout = time.Minute
+	tools.resetIdleTimerLocked()
+	tools.mux.Unlock()
+
 	// Verify the new browser actually works via combined tool
 	tool := tools.CombinedTool()
 	toolOut := tool.Run(ctx, []byte(`{"action": "navigate", "url": "about:blank"}`))
@@ -767,33 +841,6 @@ func TestReadImageToolNoServicePassesThrough(t *testing.T) {
 	toolOut := tool.Run(t.Context(), []byte(input))
 	if toolOut.Error != nil {
 		t.Fatalf("unexpected error without service in context: %v", toolOut.Error)
-	}
-}
-
-// TestIsPort80 tests the isPort80 function
-func TestIsPort80(t *testing.T) {
-	tests := []struct {
-		url      string
-		expected bool
-		name     string
-	}{
-		{"http://example.com:80", true, "http with explicit port 80"},
-		{"http://example.com", true, "http without explicit port"},
-		{"https://example.com:80", true, "https with explicit port 80"},
-		{"http://example.com:8080", false, "http with different port"},
-		{"https://example.com", false, "https without explicit port"},
-		{"https://example.com:443", false, "https with standard port"},
-		{"invalid-url", false, "invalid URL"},
-		{"ftp://example.com:80", true, "ftp with port 80"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := isPort80(tt.url)
-			if result != tt.expected {
-				t.Errorf("isPort80(%q) = %v, want %v", tt.url, result, tt.expected)
-			}
-		})
 	}
 }
 

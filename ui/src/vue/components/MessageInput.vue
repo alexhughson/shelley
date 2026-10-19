@@ -20,6 +20,7 @@
          (e: "draft-send-started"): void
          (e: "draft-cleared"): void
          (e: "recording-unsent", path: string, error: unknown): void
+         (e: "recording-unavailable"): void
        Because send/queue are awaited in React (onSend/onQueue return
        Promises), the parent passes async handlers via the `onSend`/`onQueue`
        *function props* below instead of pure emits — Vue emits can't be
@@ -37,6 +38,7 @@
     <div v-if="isDraggingOver" class="drag-overlay">
       <div class="drag-overlay-content">{{ t("dropFilesHere") }}</div>
     </div>
+    <slot name="call" />
     <!-- Teleport moves the same recorder; navigation must never remount it. -->
     <Teleport to="body" :disabled="!recordingFloating">
       <div
@@ -70,7 +72,12 @@
         />
       </div>
     </Teleport>
-    <form v-if="!recordingActive || recordingFloating" class="message-input-form" @submit="handleSubmit">
+    <form
+      v-if="!recordingActive || recordingFloating"
+      v-show="!composerHidden"
+      class="message-input-form"
+      @submit="handleSubmit"
+    >
       <input
         ref="fileInputRef"
         type="file"
@@ -322,43 +329,12 @@
             />
           </svg>
         </button>
-        <button
-          v-if="mediaRecordingAvailable"
-          type="button"
-          :disabled="!canRecordAudio"
-          class="message-voice-btn"
-          :aria-label="t('recordingTitle')"
-          :title="`${t('recordingTitle')} (${menuShortcutLabel('recordAudio')})`"
-          data-testid="voice-button"
-          @click="beginRecording('microphone')"
-        >
-          <svg
-            v-if="screenRecordingAvailable"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            viewBox="0 0 24 24"
-            width="20"
-            height="20"
-            data-testid="voice-video-icon"
-          >
-            <rect x="3" y="5" width="13" height="14" rx="2" />
-            <path stroke-linecap="round" stroke-linejoin="round" d="m16 10 5-3v10l-5-3z" />
-          </svg>
-          <svg
-            v-else
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.8"
-            viewBox="0 0 24 24"
-            width="20"
-            height="20"
-            data-testid="voice-microphone-icon"
-          >
-            <rect x="9" y="3" width="6" height="11" rx="3" />
-            <path stroke-linecap="round" d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M9 21h6" />
-          </svg>
-        </button>
+        <RecordButton
+          v-if="mediaRecordingAvailable && !voiceActive"
+          :can-record-audio="canRecordAudio"
+          :screen-available="screenRecordingAvailable"
+          @record="beginRecording"
+        />
         <div ref="queueMenuRef" class="message-send-wrapper">
           <!-- Slack-style split button: [Send | ▾] — always same width -->
           <div
@@ -372,17 +348,18 @@
               :aria-label="
                 autoQueue
                   ? 'Queue message'
-                  : preferCompactAndSend
+                  : compactSendArmed
                     ? 'Compact and send'
                     : t('sendMessage')
               "
               data-testid="send-button"
+              @click="handleSendClick"
             >
               <div v-if="isDisabled || submitting" class="flex items-center justify-center">
                 <div class="spinner spinner-small message-send-spinner-white"></div>
               </div>
               <svg
-                v-else-if="preferCompactAndSend"
+                v-else-if="compactSendArmed"
                 class="compact-send-icon"
                 fill="none"
                 stroke="currentColor"
@@ -479,6 +456,9 @@
                   <line x1="3" y1="21" x2="10" y2="14" />
                 </svg>
                 Compact and send
+                <span class="overflow-menu-shortcut"
+                  ><kbd>{{ compactSendShortcut }}</kbd></span
+                >
               </button>
             </div>
           </div>
@@ -519,10 +499,11 @@ import {
   type ComposerSubmissionIntent,
 } from "./composerDispatch";
 import { isImeComposing } from "../../utils/imeComposing";
+import RecordButton from "./RecordButton.vue";
 import RecordingPanel from "./RecordingPanel.vue";
 import type { RecordingDestination, RecordingMode, RecordingPreparation } from "./recordingDestination";
 import { focusMessageInputIfUnfocused } from "../../utils/focusMessageInput";
-import { menuShortcutLabel } from "../../utils/menuShortcuts";
+import { isMac } from "../../utils/menuShortcuts";
 import {
   CONCRETE_THINKING_LEVELS,
   supportedThinkingLevels,
@@ -549,16 +530,21 @@ const props = withDefaults(
   defineProps<{
     /** Async send handler (awaited). Mirrors React's onSend prop. */
     onSend: (message: string) => Promise<void> | void;
+    voiceActive?: boolean;
+    /** Leave the persistent call slot available when browsing an archive. */
+    composerHidden?: boolean;
     /** Bind the original destination; the recorder starts while it resolves. */
     onStartRecording: (text: string) => RecordingPreparation;
     /** Archived conversations hide the composer, but not an active recording. */
     recordingInlineAvailable?: boolean;
     /** Async queue handler (awaited). Mirrors React's onQueue prop. */
     onQueue?: (message: string) => Promise<void> | void;
-    /** Async compaction handler (awaited). When provided, the send-options
-     * menu offers "Compact and send": it compacts the conversation and then
-     * queues the composed message so it runs once compaction finishes. */
-    onCompact?: () => Promise<void> | void;
+    /** Async compact-and-queue handler (awaited). When provided, the
+     * send-options menu offers "Compact and send": it compacts the
+     * conversation and then queues the composed message so it runs once
+     * compaction finishes. One handler, so the parent can pin both halves to
+     * the same conversation even if the user navigates away mid-compaction. */
+    onCompactAndQueue?: (message: string) => Promise<void> | void;
     /** Show the split send button with queue chevron (e.g. when in a conversation) */
     showQueueOption?: boolean;
     /** Whether queuing is available right now (agent is working) */
@@ -596,6 +582,7 @@ const props = withDefaults(
   }>(),
   {
     recordingInlineAvailable: true,
+    voiceActive: false,
     showQueueOption: false,
     canQueue: false,
     autoQueue: false,
@@ -615,6 +602,7 @@ const emit = defineEmits<{
   (e: "draft-send-started"): void;
   (e: "draft-cleared"): void;
   (e: "recording-unsent", path: string, error: unknown): void;
+  (e: "recording-unavailable"): void;
 }>();
 
 const { t } = useI18n();
@@ -622,7 +610,7 @@ const { t } = useI18n();
 const hasQueueHandler = computed(() => props.onQueue !== undefined);
 // The "Compact and send" option is available whenever a compaction handler is
 // wired and we're not already mid-compaction (autoQueue signals distilling).
-const canCompact = computed(() => props.onCompact !== undefined && !props.autoQueue);
+const canCompact = computed(() => props.onCompactAndQueue !== undefined && !props.autoQueue);
 const sendSelectedLevel = ref<ContextUsageLevel>("");
 
 const message = ref(props.draftSeed?.value ?? "");
@@ -714,7 +702,7 @@ watch(isSmallScreen, (small) => {
 
 const placeholderText = computed(() => {
   if (hint.value.id !== "default" && hint.value.text) return hint.value.text;
-  return isSmallScreen.value ? t("messagePlaceholderShort") : t("messagePlaceholder");
+  return t("messagePlaceholder");
 });
 
 function handleResize() {
@@ -731,6 +719,12 @@ defineExpose({ canRecordAudio, canRecordScreen, beginRecording });
 
 function beginRecording(mode: RecordingMode) {
   if (!(mode === "screen" ? canRecordScreen.value : canRecordAudio.value)) return;
+  // Explain the missing transcription route instead of recording something
+  // the server cannot transcribe.
+  if (!window.__SHELLEY_INIT__?.transcription_available) {
+    emit("recording-unavailable");
+    return;
+  }
   // Acquire media in the initiating key/click handler, before draft I/O.
   // The panel owns the stream and presents acquisition failures.
   const microphone =
@@ -1059,13 +1053,33 @@ const canSubmit = computed(
 const isDraggingOver = computed(() => dragCounter.value > 0);
 const isShellMode = computed(() => message.value.trimStart().startsWith("!"));
 const isCommand = computed(() => /^[!/]/.test(message.value.trimStart()));
+// Compact-and-send never applies to commands.
+const canCompactAndSend = computed(() => canCompact.value && !isCommand.value);
 const preferCompactAndSend = computed(
   () =>
-    canCompact.value &&
-    hasQueueHandler.value &&
-    !isCommand.value &&
+    canCompactAndSend.value &&
     props.compactSendLevel !== "" &&
     sendSelectedLevel.value !== props.compactSendLevel,
+);
+
+// Mod+Enter (⌘ on mac, Ctrl elsewhere) and mod+click on Send both compact and
+// send. While the mod is held the send button previews that, so track it from
+// every key event's modifier state (not e.key: Meta keyup reports metaKey=false
+// already, and the mod may be released while another key has focus).
+const modHeld = ref(false);
+const compactSendShortcut = isMac ? "\u2318\u21a9" : "Ctrl+Enter";
+function isModEvent(e: KeyboardEvent | MouseEvent) {
+  return e.metaKey || e.ctrlKey;
+}
+function trackMod(e: KeyboardEvent) {
+  modHeld.value = isModEvent(e);
+}
+function clearMod() {
+  modHeld.value = false;
+}
+// What the send button will do right now: threshold-driven or mod-held.
+const compactSendArmed = computed(
+  () => preferCompactAndSend.value || (modHeld.value && canCompactAndSend.value),
 );
 
 // --- @ filename autocomplete --------------------------------------------
@@ -1321,6 +1335,14 @@ watch([composerSession, () => props.compactSendLevel], () => {
   sendSelectedLevel.value = "";
 });
 
+// Mod+click on the send button compacts and sends; the form submit event
+// carries no modifier state, so intercept the click.
+function handleSendClick(e: MouseEvent) {
+  if (!isModEvent(e) || !canCompactAndSend.value || !canSubmit.value) return;
+  e.preventDefault();
+  void handleCompactAndSend();
+}
+
 async function handleSubmit(e: Event) {
   e.preventDefault();
   if (hasContent.value && !props.disabled && !submitting.value && uploadsInProgress.value === 0) {
@@ -1407,7 +1429,7 @@ async function handleCompactAndSend() {
     await handleSendNow();
     return;
   }
-  if (hasContent.value && props.onCompact && props.onQueue) {
+  if (hasContent.value && props.onCompactAndQueue) {
     const messageToQueue = composeMessageWithAttachments(message.value).trim();
     const origin = composerOrigin();
     setMessage("");
@@ -1415,10 +1437,7 @@ async function handleCompactAndSend() {
     emit("draft-cleared");
     showQueueMenu.value = false;
     try {
-      // Start compaction first so the conversation enters the distilling
-      // state, then queue — enqueued messages drain after distillation ends.
-      await props.onCompact();
-      await props.onQueue(messageToQueue);
+      await props.onCompactAndQueue(messageToQueue);
     } catch {
       guardComposerClear(origin, composerOrigin, () => setMessage(messageToQueue));
     }
@@ -1570,9 +1589,14 @@ function handleKeyDown(e: KeyboardEvent) {
     return;
   }
   if (e.key === "Enter" && !e.shiftKey) {
+    if (isModEvent(e) && canCompactAndSend.value) {
+      e.preventDefault();
+      if (canSubmit.value) void handleCompactAndSend();
+      return;
+    }
     // On mobile, let Enter create newlines since there's a send button.
     const isMobile = "ontouchstart" in window;
-    if (isMobile && !(e.ctrlKey || e.metaKey)) return;
+    if (isMobile && !isModEvent(e)) return;
     e.preventDefault();
     void handleSubmit(e);
   }
@@ -1602,6 +1626,9 @@ function handleViewportResize() {
 
 onMounted(() => {
   window.addEventListener("resize", handleResize);
+  window.addEventListener("keydown", trackMod);
+  window.addEventListener("keyup", trackMod);
+  window.addEventListener("blur", clearMod);
   if (typeof window !== "undefined" && window.visualViewport) {
     window.visualViewport.addEventListener("resize", handleViewportResize);
   }
@@ -1614,6 +1641,9 @@ onUnmounted(() => {
   recordingSubmission.value?.preparation.release();
   recordingSubmission.value = null;
   window.removeEventListener("resize", handleResize);
+  window.removeEventListener("keydown", trackMod);
+  window.removeEventListener("keyup", trackMod);
+  window.removeEventListener("blur", clearMod);
   if (typeof window !== "undefined" && window.visualViewport) {
     window.visualViewport.removeEventListener("resize", handleViewportResize);
   }

@@ -30,6 +30,12 @@ func runTour(args []string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+	// Progress only feeds the build checklist, so it never fails a command.
+	record := func(hash, step string) {
+		if err := committour.RecordProgress(*dir, hash, step); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: record tour progress: %v\n", err)
+		}
+	}
 
 	switch args[0] {
 	case "chunks":
@@ -75,6 +81,7 @@ func runTour(args []string) {
 				}
 				fmt.Printf("  %3d  +%d -%d  %s\n", id, meta.Adds, meta.Dels, hunk)
 			}
+			record(hash, "survey")
 			return
 		}
 		if *text {
@@ -128,6 +135,7 @@ func runTour(args []string) {
 			fail(err)
 		}
 		fmt.Printf("%s\n", out)
+		record(hash, "scaffold")
 
 	case "verify", "attach":
 		if len(rest) != 2 {
@@ -163,6 +171,7 @@ func runTour(args []string) {
 			fail(err)
 		}
 		if args[0] == "verify" {
+			record(hash, "verify")
 			fmt.Printf("tour for %s verifies\n", rest[0])
 			return
 		}
@@ -177,6 +186,7 @@ func runTour(args []string) {
 		if err := committour.WriteNote(*dir, hash, data, tour.MediaBlobs()...); err != nil {
 			fail(err)
 		}
+		record(hash, "attach")
 		fmt.Printf("attached tour note to %s\n", rest[0])
 
 	case "show":

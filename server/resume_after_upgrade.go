@@ -21,9 +21,10 @@ const maxConcurrentResumes = 4
 const resumeWarningText = "Shelley restarted to install a new binary while this turn was in flight. The turn has been resumed; any tool call whose result was not saved before the restart may run again."
 
 // resumeInterruptedConversations re-fires the LLM request for each conversation
-// that db.ConsumeResumeAfterUpgrade reported as mid-turn when the process exited
-// to install an upgrade. Called once, after the server's listeners are up, so
-// resumed loops see a usable server (port, subagent runner, streams).
+// (top-level or delegated subagent) that db.ConsumeResumeAfterUpgrade reported
+// as mid-turn when the process exited to install an upgrade. Called once, after
+// the server's listeners are up, so resumed loops see a usable server (port,
+// subagent runner, streams).
 func (s *Server) resumeInterruptedConversations(ctx context.Context, resumes []db.UpgradeResume) {
 	if len(resumes) == 0 {
 		return

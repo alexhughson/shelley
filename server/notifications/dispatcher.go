@@ -32,15 +32,6 @@ func (d *Dispatcher) ReplaceChannels(channels []Channel) {
 	d.channels = channels
 }
 
-// Channels returns a snapshot of current registered channels.
-func (d *Dispatcher) Channels() []Channel {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	result := make([]Channel, len(d.channels))
-	copy(result, d.channels)
-	return result
-}
-
 // Dispatch sends an event to all registered backend channels.
 // It does not block on individual channel failures.
 func (d *Dispatcher) Dispatch(ctx context.Context, event Event) {

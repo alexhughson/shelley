@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
@@ -13,6 +14,24 @@ import (
 	"shelley.exe.dev/llm/oai"
 	"shelley.exe.dev/models"
 )
+
+func TestMain(m *testing.M) {
+	env, err := exeenv.New("https", "exe.xyz")
+	if err != nil {
+		panic(err)
+	}
+	exeenv.Configure(env) // tests use fake integration clients, never live VM metadata
+	os.Exit(m.Run())
+}
+
+func testProdExeEnv(t *testing.T) exeenv.Environment {
+	t.Helper()
+	env, err := exeenv.New("https", "exe.xyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
@@ -749,7 +768,7 @@ func TestDiscoverLLMIntegrationsFallsBackWhenReflectionRequestFails(t *testing.T
 				}, nil
 			})}
 
-			result := discoverLLMIntegrations(t.Context(), client, slog.New(slog.NewTextHandler(io.Discard, nil)), exeenv.FromHostname("box.exe.xyz"))
+			result := discoverLLMIntegrations(t.Context(), client, slog.New(slog.NewTextHandler(io.Discard, nil)), testProdExeEnv(t))
 			if result.Found != tt.wantFound {
 				t.Fatalf("Found = %v, want %v", result.Found, tt.wantFound)
 			}
@@ -788,7 +807,7 @@ func TestDiscoverLLMIntegrationsDoesNotFallbackAfterSuccessfulReflection(t *test
 		}, nil
 	})}
 
-	result := discoverLLMIntegrations(t.Context(), client, slog.New(slog.NewTextHandler(io.Discard, nil)), exeenv.FromHostname("box.exe.xyz"))
+	result := discoverLLMIntegrations(t.Context(), client, slog.New(slog.NewTextHandler(io.Discard, nil)), testProdExeEnv(t))
 	if result.Found {
 		t.Fatal("Found = true, want false")
 	}
@@ -813,7 +832,7 @@ func TestDiscoverLLMIntegrationsKeepsFoundWhenReflectedCatalogFails(t *testing.T
 		}, nil
 	})}
 
-	result := discoverLLMIntegrations(t.Context(), client, slog.New(slog.NewTextHandler(io.Discard, nil)), exeenv.FromHostname("box.exe.xyz"))
+	result := discoverLLMIntegrations(t.Context(), client, slog.New(slog.NewTextHandler(io.Discard, nil)), testProdExeEnv(t))
 	if !result.Found || len(result.Integrations) != 0 {
 		t.Fatalf("result = %+v, want found integration with unavailable catalog", result)
 	}
@@ -894,7 +913,7 @@ func TestDiscoverLLMIntegrationsReadsModelsJSONCatalog(t *testing.T) {
 		}, nil
 	})}
 
-	result := discoverLLMIntegrations(t.Context(), client, slog.New(slog.NewTextHandler(io.Discard, nil)), exeenv.FromHostname("box.exe.xyz"))
+	result := discoverLLMIntegrations(t.Context(), client, slog.New(slog.NewTextHandler(io.Discard, nil)), testProdExeEnv(t))
 	if !result.Found {
 		t.Fatal("Found = false, want true")
 	}
@@ -945,7 +964,7 @@ func TestDiscoverLLMIntegrationsUsesTeamHost(t *testing.T) {
 		}, nil
 	})}
 
-	result := discoverLLMIntegrations(t.Context(), client, slog.New(slog.NewTextHandler(io.Discard, nil)), exeenv.FromHostname("box.exe.xyz"))
+	result := discoverLLMIntegrations(t.Context(), client, slog.New(slog.NewTextHandler(io.Discard, nil)), testProdExeEnv(t))
 	if !result.Found {
 		t.Fatal("Found = false, want true")
 	}
@@ -1107,5 +1126,53 @@ func TestBuiltAPITypePopulated(t *testing.T) {
 		if b.APIType != tt.want {
 			t.Errorf("%s APIType = %q, want %q", tt.id, b.APIType, tt.want)
 		}
+	}
+}
+
+func TestTranscriptionModelsFromOpenAICredentials(t *testing.T) {
+	routes := func(sources ...Source) []models.TranscriptionModel {
+		return TranscriptionModels(sources)
+	}
+	want := func(endpoint, apiKey, source string) []models.TranscriptionModel {
+		return []models.TranscriptionModel{
+			{Model: "gpt-transcribe", Endpoint: endpoint, APIKey: apiKey, Source: source, FromCredentials: true},
+			{Model: "whisper-1", Endpoint: endpoint, APIKey: apiKey, Source: source, FromCredentials: true},
+		}
+	}
+	for _, tt := range []struct {
+		name string
+		got  []models.TranscriptionModel
+		want []models.TranscriptionModel
+	}{
+		{
+			name: "env key",
+			got:  routes(Env("a", "sk-openai", "g", "f"), Predictable()),
+			want: want("https://api.openai.com/v1/audio/transcriptions", "sk-openai", "$OPENAI_API_KEY"),
+		},
+		{
+			name: "gateway",
+			got:  routes(Gateway("https://gw.example.com", "", "", "")),
+			want: want("https://gw.example.com/openai/v1/audio/transcriptions", "implicit", "exe.dev gateway"),
+		},
+		{
+			name: "gateway with explicit key",
+			got:  routes(Gateway("https://gw.example.com", "", "sk-openai", "")),
+			want: want("https://gw.example.com/openai/v1/audio/transcriptions", "sk-openai", "$OPENAI_API_KEY"),
+		},
+		{
+			name: "no OpenAI credential",
+			got:  routes(Env("a", "", "g", "f"), Predictable()),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if len(tt.got) != len(tt.want) {
+				t.Fatalf("routes = %+v, want %+v", tt.got, tt.want)
+			}
+			for i := range tt.want {
+				if tt.got[i] != tt.want[i] {
+					t.Fatalf("route %d = %+v, want %+v", i, tt.got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }

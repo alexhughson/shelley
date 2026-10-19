@@ -224,6 +224,34 @@ test.describe('Conversation cache', () => {
     expect(stats['load.full_rest'] ?? 0).toBe(0);
   });
 
+  test('archiving while the tab is closed refreshes cached metadata', async ({ page, request }) => {
+    const conv = await createConversationViaAPIWithDetails(request, 'Hello');
+    await page.goto(`/c/${conv.slug}`);
+    await expect(page.getByTestId('message-input')).toBeVisible({ timeout: 30000 });
+    await waitForText(page, "Hello! I'm Shelley, your AI assistant.");
+    await waitForCachedHistory(page, conv.conversationId);
+
+    // Disconnect before archiving so the list stream cannot delete the cache.
+    // Its persisted metadata still says archived:false when we open it again.
+    await page.goto('about:blank');
+    expect((await request.post(`/api/conversation/${conv.conversationId}/archive`)).ok()).toBeTruthy();
+
+    const incremental: string[] = [];
+    const pattern = new RegExp(`/api/conversation/${conv.conversationId}$`);
+    page.on('request', (req) => {
+      const url = new URL(req.url());
+      if (pattern.test(url.pathname) && url.searchParams.has('last_sequence_id')) {
+        incremental.push(req.url());
+      }
+    });
+
+    await page.goto(`/c/${conv.slug}`);
+    await expect.poll(() => incremental.length, { timeout: 15000 }).toBeGreaterThan(0);
+    await waitForText(page, "Hello! I'm Shelley, your AI assistant.");
+    await expect(page.getByTestId('message-input')).toBeHidden();
+    await expect(page.locator('.status-bar-archived')).toBeVisible();
+  });
+
   test('page reload restores a non-bottom reading position', async ({ page, request }) => {
     const generated = await request.post('/debug/loremipsum?json=1', {
       form: { size: '15', model: 'predictable' }

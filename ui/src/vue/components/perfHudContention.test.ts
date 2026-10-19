@@ -1,6 +1,6 @@
 // Unit tests for the perf HUD's IndexedDB-contention alert model.
 // Run with: tsx src/vue/components/perfHudContention.test.ts
-import { summarizeIdbContention, describeStallOutcome } from "./perfHudContention";
+import { summarizeIdbContention, describeStallOutcome, describeStall } from "./perfHudContention";
 import type { MissedDeadline, PendingWait } from "../../services/deadline";
 
 let passed = 0;
@@ -22,7 +22,22 @@ const miss = (
   deadlineMs: 250,
   at: now - agoMs,
   outcome: "pending",
+  stalledMs: 0,
   ...extra,
+});
+const wait = (
+  id: number,
+  what: string,
+  deadlineMs: number,
+  chargedMs: number,
+  stalledMs = 0,
+): PendingWait => ({
+  id,
+  what,
+  deadlineMs,
+  chargedMs,
+  stalledMs,
+  elapsedMs: chargedMs + stalledMs,
 });
 
 // Nothing missed, nothing waiting: no alert.
@@ -51,9 +66,9 @@ const miss = (
 // Newest first, and a wait still in flight past its deadline is shown live.
 {
   const pending: PendingWait[] = [
-    { id: 101, what: "indexedDB.startup transaction", deadlineMs: 3000, elapsedMs: 2100 },
-    { id: 102, what: "indexedDB.open", deadlineMs: 5000, elapsedMs: 5 },
-    { id: 103, what: "navigator.locks shelley-cache-key", deadlineMs: 3000, elapsedMs: 2900 },
+    wait(101, "indexedDB.startup transaction", 3000, 2100),
+    wait(102, "indexedDB.open", 5000, 5),
+    wait(103, "navigator.locks shelley-cache-key", 3000, 2900),
   ];
   const s = summarizeIdbContention(
     [miss("indexedDB.open", 60_000), miss("indexedDB.read conversation_meta", 500)],
@@ -83,11 +98,22 @@ const miss = (
 // A long in-flight wait alerts even before anything has been given up on: a
 // tab stuck on the spinner has, by definition, missed nothing yet.
 {
-  const s = summarizeIdbContention(
-    [],
-    [{ id: 7, what: "indexedDB.startup transaction", deadlineMs: 3000, elapsedMs: 1500 }],
-  );
+  const s = summarizeIdbContention([], [wait(7, "indexedDB.startup transaction", 3000, 1500)]);
   check("a wait past half its deadline alerts on its own", s.alert && s.rows.length === 0, s);
+}
+
+// A wait that has only been waiting because the tab itself was blocked (or
+// throttled in the background) has not used its budget: no alert.
+{
+  const s = summarizeIdbContention([], [wait(8, "indexedDB.read conversation_meta", 250, 20, 900)]);
+  check("a stalled tab's in-flight wait does not alert", !s.alert, s);
+}
+
+// Stall wording: only worth a mention when it is big enough to matter.
+{
+  check("no stall, no note", describeStall(0) === "");
+  check("timer jitter is not a stall", describeStall(12) === "");
+  check("a real stall is named", describeStall(770) === "tab blocked 770ms", describeStall(770));
 }
 
 // Outcome wording the details table shows.

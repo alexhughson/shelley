@@ -257,6 +257,53 @@ function serverToolUse(id: string): LLMContent {
   );
 }
 
+// --- Tour request rows ---
+{
+  const gitinfo = (userData: Record<string, unknown>): Message => {
+    seq++;
+    return {
+      message_id: `g${seq}`,
+      conversation_id: "c1",
+      sequence_id: seq,
+      type: "gitinfo",
+      generation: 1,
+      user_data: JSON.stringify(userData),
+    } as unknown as Message;
+  };
+  const full = "abcdef0123456789abcdef0123456789abcdef01";
+  const other = "1111111111111111111111111111111111111111";
+  const strip = gitinfo({ commit: "abcdef0", worktree: "/repo", subject: "s" });
+  const request = (commit: string) => gitinfo({ commit, worktree: "/repo", tour_request: true });
+  const ids = (items: ReturnType<typeof coalesceMessages>) =>
+    items.map((i) => i.message?.message_id);
+
+  const same = request(full);
+  check(
+    "tour request for the strip's commit is hidden",
+    !ids(
+      coalesceMessages([agentMessage([text("x")]), strip, agentMessage([text("y")]), same]),
+    ).includes(same.message_id),
+  );
+
+  const afterGit = request(other);
+  check(
+    "settled tour request directly under a git row is hidden",
+    !ids(coalesceMessages([strip, afterGit])).includes(afterGit.message_id),
+  );
+  check(
+    "building tour request directly under a git row stays visible",
+    ids(coalesceMessages([strip, afterGit], undefined, new Set([other]))).includes(
+      afterGit.message_id,
+    ),
+  );
+
+  const apart = request(other);
+  check(
+    "tour request after other chat stays visible",
+    ids(coalesceMessages([strip, agentMessage([text("chat")]), apart])).includes(apart.message_id),
+  );
+}
+
 // --- Slug markers are dropped entirely ---
 {
   // A slug marker records the cost of the LLM call that named the conversation.
@@ -300,6 +347,36 @@ function serverToolUse(id: string): LLMContent {
     "no slug marker survives coalescing, so it cannot emit timestamp/day-separator chrome",
     !withNeighbors.some((i) => i.message?.type === "slug"),
     withNeighbors,
+  );
+}
+
+{
+  const originalText =
+    "Spoken request:\nCheck it\n\nVoice exchange (for context only):\nLIVE: Let me";
+  const original = {
+    ...agentMessage([text(originalText)]),
+    type: "user",
+  } as Message;
+  const marker = {
+    ...agentMessage([]),
+    type: "livetranscript",
+    llm_data: null,
+    user_data: JSON.stringify({
+      session_id: "call",
+      message: originalText,
+      fragments: [{ n: 3, user: false, text: " check.", start_ms: 1000, end_ms: 1400 }],
+    }),
+  } as Message;
+  const projected = coalesceMessages([original, marker]);
+  check("Live transcript patches do not create phantom rows", projected.length === 1, projected);
+  check(
+    "late Live metadata never changes the sent transcript",
+    JSON.parse(projected[0].message!.llm_data!).Content[0].Text === originalText,
+  );
+  check("sent message identity is unchanged", projected[0].message === original);
+  check(
+    "stored model input remains unchanged",
+    JSON.parse(original.llm_data!).Content[0].Text === originalText,
   );
 }
 

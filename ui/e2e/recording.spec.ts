@@ -1,7 +1,13 @@
 import { expect, test, type APIRequestContext, type Page, type Route } from "@playwright/test";
-import { createConversationViaAPIWithDetails, testWorkingDirectory } from "./helpers";
+import {
+  createConversationViaAPIWithDetails,
+  installTranscriptionAvailability,
+  startNewConversationFromHeader,
+  testWorkingDirectory,
+} from "./helpers";
 
-async function installMediaMocks(page: Page, screenCapture = true) {
+async function installMediaMocks(page: Page, screenCapture = true, transcription = true) {
+  await installTranscriptionAvailability(page, transcription);
   await page.addInitScript((screenCaptureAvailable) => {
     const mock = {
       displayRequests: 0,
@@ -1065,7 +1071,7 @@ test.describe("media recording composer", () => {
       expect(submissions).toHaveLength(0);
       await expect(input).toHaveValue("Leave this different composer alone.");
 
-      await page.locator("button.btn-new").click();
+      await startNewConversationFromHeader(page);
       await input.fill("A newer new-conversation composer.");
       await newerDraftStarted.promise;
       await page.getByTestId("recording-retry-button").click();
@@ -1954,7 +1960,7 @@ test.describe("media recording composer", () => {
       });
       await expect(page).toHaveURL(new RegExp(`/c/${viewed.slug}$`));
 
-      await page.locator("button.btn-new").click();
+      await startNewConversationFromHeader(page);
       await expect(page).toHaveURL(/\/new$/);
       await expect(page.getByTestId("message-input")).toHaveValue("");
     } finally {
@@ -2002,7 +2008,7 @@ test.describe("media recording composer", () => {
 
     try {
       await selectConversationFromDrawer(page, viewed.conversationId);
-      await page.locator("button.btn-new").click();
+      await startNewConversationFromHeader(page);
       await expect(page).toHaveURL(/\/new$/);
       const newerInput = page.getByTestId("message-input");
       await newerInput.fill(newerText);
@@ -2018,7 +2024,7 @@ test.describe("media recording composer", () => {
       await page.getByTestId("recording-cancel-button").click();
       await expect(page.getByTestId("message-input")).toHaveValue(recordedText);
 
-      await page.locator("button.btn-new").click();
+      await startNewConversationFromHeader(page);
       await expect(page).toHaveURL(/\/new$/);
       await expect(page.getByTestId("message-input")).toHaveValue(newerText);
     } finally {
@@ -2233,6 +2239,78 @@ test.describe("media recording composer", () => {
     expect(uploadedFilenames).toHaveLength(2);
     expect(uploadedFilenames[0]).toMatch(/^rec-\d{8}-\d{6}\.webm$/);
     expect(uploadedFilenames[1]).toBe("screen.webm.json");
+  });
+
+  test("hovering the record button offers Voice & Screen with a single screen request", async ({
+    page,
+  }) => {
+    await page.goto("/new");
+    const menu = page.getByTestId("record-menu");
+    await expect(menu).toHaveCount(0);
+    await page.getByTestId("voice-button").hover();
+    await expect(menu).toBeVisible();
+    await expect(menu.getByRole("button")).toHaveCount(2);
+    await expect(menu.getByRole("button").first()).toHaveAccessibleName("Voice");
+    await expect(menu.getByRole("button").last()).toHaveAccessibleName("Voice & Screen");
+
+    // Moving away closes it.
+    await page.getByTestId("attach-button").hover();
+    await expect(menu).toHaveCount(0);
+
+    await page.getByTestId("voice-button").hover();
+    await menu.getByRole("button", { name: "Voice & Screen" }).click();
+    await expect(page.getByTestId("recording-panel")).toHaveAttribute("data-mode", "screen");
+    await expect(page.getByTestId("recording-status")).toHaveText("Recording screen + microphone…");
+    expect(
+      await page.evaluate(() => ({
+        display: window.__recordingMock.displayRequests,
+        synchronous: window.__recordingMock.synchronousDisplayRequests,
+        microphone: window.__recordingMock.microphoneRequests,
+      })),
+    ).toEqual({ display: 1, synchronous: 1, microphone: 1 });
+  });
+
+  test("long-pressing the record button opens the menu without starting a recording", async ({
+    page,
+  }) => {
+    await page.clock.install();
+    await page.goto("/new");
+    const button = page.getByTestId("voice-button");
+    const menu = page.getByTestId("record-menu");
+    await button.dispatchEvent("pointerdown", { pointerType: "touch", button: 0, isPrimary: true });
+    await page.clock.runFor(200);
+    await expect(menu).toHaveCount(0);
+    await page.clock.runFor(400);
+    await expect(menu).toBeVisible();
+    // The click that ends a long press must not also start voice recording.
+    await button.dispatchEvent("pointerup", { pointerType: "touch", button: 0, isPrimary: true });
+    await button.dispatchEvent("click", { detail: 1 });
+    await expect(page.getByTestId("recording-panel")).toHaveCount(0);
+    await expect(menu).toBeVisible();
+
+    await menu.getByRole("button", { name: "Voice", exact: true }).click();
+    await expect(page.getByTestId("recording-panel")).toHaveAttribute("data-mode", "microphone");
+    expect(await page.evaluate(() => window.__recordingMock.displayRequests)).toBe(0);
+  });
+
+  test("keyboard focus reveals the record choices and Escape returns focus to the button", async ({
+    page,
+  }) => {
+    await page.goto("/new");
+    const button = page.getByTestId("voice-button");
+    const menu = page.getByTestId("record-menu");
+    await page.getByTestId("attach-button").focus();
+    await page.keyboard.press("Tab");
+    await expect(button).toBeFocused();
+    await expect(menu).toBeVisible();
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Tab");
+    await expect(menu.getByRole("button", { name: "Voice & Screen" })).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(menu).toHaveCount(0);
+    await expect(button).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(page.getByTestId("recording-panel")).toHaveAttribute("data-mode", "microphone");
   });
 
   test("uses the recorder lifetime when screen sharing ends during pre-roll", async ({ page }) => {
@@ -2502,13 +2580,28 @@ test.describe("media recording composer", () => {
 
 test("keeps audio recording available without screen capture", async ({ page }) => {
   await installMediaMocks(page, false);
+  await page.clock.install();
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/new");
   await expect(page.getByTestId("voice-microphone-icon")).toBeVisible();
   await expect(page.getByTestId("voice-video-icon")).toHaveCount(0);
+  await page.getByTestId("voice-button").hover();
+  await page.clock.runFor(1000);
+  await expect(page.getByTestId("record-menu")).toHaveCount(0);
   await openRecordingPalette(page);
   await expect(recordingPaletteItem(page, "Record audio")).toBeVisible();
   await expect(recordingPaletteItem(page, "Record audio and screen")).toHaveCount(0);
+});
+
+test("explains missing transcription instead of recording", async ({ page }) => {
+  await installMediaMocks(page, true, false);
+  await page.goto("/new");
+  await page.getByTestId("voice-button").click();
+  await expect(page.locator(".status-error")).toContainText("Set OPENAI_API_KEY");
+  await expect(page.getByTestId("recording-panel")).toHaveCount(0);
+  await recordingShortcut(page, "microphone");
+  await expect(page.getByTestId("recording-panel")).toHaveCount(0);
+  expect(await page.evaluate(() => window.__recordingMock.microphoneRequests)).toBe(0);
 });
 
 test("hides recording palette actions when media recording is unavailable", async ({ page }) => {

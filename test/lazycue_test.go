@@ -270,6 +270,85 @@ func TestNewPageDraftOpensWithoutSpinner(t *testing.T) {
 20. Eval: confirm the composer is usable and seeded with the draft text. Expression: "(function(){var el=document.querySelector('[data-testid=\"message-input\"]');return (!!el)&&(!el.disabled)&&el.value.indexOf('draft body text')>=0 ? 'true' : 'false';})()". Expect "true".`)
 }
 
+// --- Composer mirror across tabs ---
+//
+// The composer mirrors its text into a per-conversation localStorage entry
+// (ui/src/services/draftCache.ts), and ChatInterface re-reads that entry
+// whenever the conversation row's updated_at changes (a server echo). Two tabs
+// on one conversation share the entry. When tab B sent, the entry was cleared
+// only once the chat POST returned, but the new message's row echo often
+// reached tab A first: tab A re-read the still-populated entry and seeded the
+// just-sent text into its own empty composer, where it lingered until the next
+// echo. The fix flags the entry `pending` before the POST so another tab's
+// echo-driven reconcile ignores it.
+//
+// Tab B's chat POST is shimmed to reach the server but hold its RESPONSE until
+// released, so the echo deterministically wins the race.
+func TestNewPageCrossTabSendStaysOutOfOtherComposer(t *testing.T) {
+	lazyTest(t, `Reproduces the "text sent from another tab lingers in this tab's composer" bug. Perform these steps in order, exactly as described; do not add extra steps.
+1. Navigate to /new.
+2. Wait for the message input (data-testid "message-input") to be visible.
+3. Fill the message input with the value "echo: cross-tab seed" and click the send button (data-testid "send-button").
+4. Wait for the URL to contain "/c/".
+5. Eval, polling until it matches: the agent's reply has rendered. Expression: "(function(){var ms=document.querySelectorAll('.message-agent');for(var i=0;i<ms.length;i++){if(ms[i].innerText.indexOf('cross-tab seed')>=0)return 'replied';}return 'waiting';})()". Expect "replied".
+6. Open a second tab, "B", on the same page this tab is on (navigate in tab B with no URL).
+7. In tab B, wait for the message input (data-testid "message-input") to be visible.
+8. In tab B, eval: install a fetch shim that lets the chat POST reach the server but holds its response until released. Expression: "(function(){var o=window.fetch;window.fetch=function(u,opt){var s=(typeof u==='string')?u:u.url;if(/\/api\/conversation\/[^\/]+\/chat$/.test(s)&&opt&&opt.method==='POST'){return o(u,opt).then(function(r){return new Promise(function(res){window.__release=function(){res(r);};});});}return o(u,opt);};return 'held';})()". Expect "held".
+9. Sleep about 1.5 seconds, so the message sent next lands in a later second than the conversation's last update (its timestamp has one-second resolution, and the first tab only reconciles its composer when that timestamp changes).
+10. In tab B, fill the message input with the value "echo: cross-tab-sent" and click the send button (data-testid "send-button").
+11. In the first tab, eval, polling until it matches: the agent's reply to the message sent from tab B has rendered. Expression: "(function(){var ms=document.querySelectorAll('.message-agent');for(var i=0;i<ms.length;i++){if(ms[i].innerText.indexOf('cross-tab-sent')>=0)return 'replied';}return 'waiting';})()". Expect "replied".
+12. In the first tab, eval: its composer must still be empty; the text sent from tab B must not have appeared in it. Expression: "(function(){return '['+document.querySelector('[data-testid=message-input]').value+']';})()". Expect "[]".
+13. In tab B, eval: release the held response. Expression: "(function(){window.__release();return 'released';})()". Expect "released".
+14. In tab B, eval, polling until it matches: its composer cleared once its send completed. Expression: "(function(){return '['+document.querySelector('[data-testid=message-input]').value+']';})()". Expect "[]".
+15. In the first tab, eval: its composer is still empty. Expression: "(function(){return '['+document.querySelector('[data-testid=message-input]').value+']';})()". Expect "[]".`)
+}
+
+// Same race for a draft: this tab types the draft, tab B opens it and sends
+// it. The promotion echo must clear this tab's composer even though tab B's
+// POST has not returned yet (before the fix, the still-populated mirror kept
+// the text here).
+func TestNewPageCrossTabDraftPromotionClearsComposer(t *testing.T) {
+	lazyTest(t, `Checks that a draft sent from another tab clears this tab's composer. Perform these steps in order, exactly as described; do not add extra steps.
+1. Navigate to /new.
+2. Wait for the message input (data-testid "message-input") to be visible.
+3. Fill the message input with the value "echo: promoted". This lazily creates a draft.
+4. Wait for the URL to contain "/c/".
+5. Fill the message input with the value "echo: promoted elsewhere" (the draft keeps being typed after it was created).
+6. Sleep about 1.5 seconds so the draft text is saved to the server.
+7. Open a second tab, "B", on the same page this tab is on (navigate in tab B with no URL).
+8. In tab B, eval, polling until it matches: its composer shows the draft text. Expression: "(function(){var el=document.querySelector('[data-testid=message-input]');return (el&&!el.disabled)?'['+el.value+']':'loading';})()". Expect "[echo: promoted elsewhere]".
+9. In tab B, eval: install a fetch shim that lets the chat POST reach the server but holds its response until released. Expression: "(function(){var o=window.fetch;window.fetch=function(u,opt){var s=(typeof u==='string')?u:u.url;if(/\/api\/conversation\/[^\/]+\/chat$/.test(s)&&opt&&opt.method==='POST'){return o(u,opt).then(function(r){return new Promise(function(res){window.__release=function(){res(r);};});});}return o(u,opt);};return 'held';})()". Expect "held".
+10. In tab B, click the send button (data-testid "send-button").
+11. In the first tab, eval, polling until it matches: the agent's reply has rendered. Expression: "(function(){var ms=document.querySelectorAll('.message-agent');for(var i=0;i<ms.length;i++){if(ms[i].innerText.indexOf('promoted elsewhere')>=0)return 'replied';}return 'waiting';})()". Expect "replied".
+12. In the first tab, eval, polling until it matches: its composer has been cleared by the promotion. Expression: "(function(){return '['+document.querySelector('[data-testid=message-input]').value+']';})()". Expect "[]".
+13. In tab B, eval: release the held response. Expression: "(function(){window.__release();return 'released';})()". Expect "released".
+14. In tab B, eval, polling until it matches: its composer cleared once its send completed. Expression: "(function(){return '['+document.querySelector('[data-testid=message-input]').value+']';})()". Expect "[]".
+15. In the first tab, eval: its composer is still empty. Expression: "(function(){return '['+document.querySelector('[data-testid=message-input]').value+']';})()". Expect "[]".`)
+}
+
+// The mirror's core promise is that a reload never loses unsent text, and the
+// pending flag must not break it: a send whose connection died leaves a flagged
+// entry behind; a fresh entry into the conversation restores the text and
+// unflags it, so a later echo (a turn posted from elsewhere) treats it as an
+// ordinary draft rather than departing text and leaves it alone.
+func TestNewPageComposerSurvivesReloadMidSend(t *testing.T) {
+	lazyTest(t, `Checks that composer text whose send never completed survives a reload and a later server echo. Perform these steps in order, exactly as described; do not add extra steps.
+1. Navigate to /new.
+2. Wait for the message input (data-testid "message-input") to be visible.
+3. Fill the message input with the value "echo: reload seed" and click the send button (data-testid "send-button").
+4. Wait for the URL to contain "/c/".
+5. Eval, polling until it matches: the agent's reply has rendered. Expression: "(function(){var ms=document.querySelectorAll('.message-agent');for(var i=0;i<ms.length;i++){if(ms[i].innerText.indexOf('reload seed')>=0)return 'replied';}return 'waiting';})()". Expect "replied".
+6. Eval: install a fetch shim so the chat POST never reaches the server and never settles (a dead connection), remembering the conversation id it targeted. Expression: "(function(){var o=window.fetch;window.fetch=function(u,opt){var s=(typeof u==='string')?u:u.url;var m=s.match(/\/api\/conversation\/([^\/]+)\/chat$/);if(m&&opt&&opt.method==='POST'){sessionStorage.setItem('reloadMidSendId',m[1]);return new Promise(function(){});}return o(u,opt);};return 'hung';})()". Expect "hung".
+7. Fill the message input with the value "echo: never accepted" and click the send button (data-testid "send-button").
+8. Eval, polling until it matches: the send was attempted. Expression: "sessionStorage.getItem('reloadMidSendId')?'attempted':'waiting'". Expect "attempted".
+9. Eval: mark this page as the old one and reload it. Expression: "(function(){window.__preReload=1;location.reload();return 'reloading';})()". Expect "reloading".
+10. Eval, polling until it matches: the NEW page (which has no such mark) has restored the composer with the unsent text. Expression: "(function(){if(window.__preReload)return 'old page';var el=document.querySelector('[data-testid=message-input]');return el?'['+el.value+']':'loading';})()". Expect "[echo: never accepted]".
+11. Sleep about 1.5 seconds, so the turn posted next lands in a later second than the conversation's last update (its timestamp has one-second resolution, and the page only reconciles its composer when that timestamp changes).
+12. Eval: post a turn to this conversation from outside the page, as another tab would. Expression: "(function(){var id=sessionStorage.getItem('reloadMidSendId');fetch('/api/conversation/'+id+'/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:'echo: nudge'})});return 'posted';})()". Expect "posted".
+13. Eval, polling until it matches: the agent's reply to that turn has rendered. Expression: "(function(){var ms=document.querySelectorAll('.message-agent');for(var i=0;i<ms.length;i++){if(ms[i].innerText.indexOf('nudge')>=0)return 'replied';}return 'waiting';})()". Expect "replied".
+14. Eval: the restored text is still in the composer; the echo must not have cleared it. Expression: "(function(){return '['+document.querySelector('[data-testid=message-input]').value+']';})()". Expect "[echo: never accepted]".`)
+}
+
 // --- Conversation tests (ported from ui/e2e/conversation.spec.ts) ---
 //
 // These drive the predictable LLM service through the real UI. The predictable

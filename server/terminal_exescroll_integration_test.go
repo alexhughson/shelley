@@ -4,6 +4,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -52,10 +53,63 @@ func newExeScrollTestSessions(t *testing.T) *TerminalSessions {
 	return ts
 }
 
+func TestExeScrollCloseOnExitPolicyPersists(t *testing.T) {
+	for _, closeOnExit := range []bool{true, false} {
+		t.Run(strconv.FormatBool(closeOnExit), func(t *testing.T) {
+			ts := newExeScrollTestSessions(t)
+			sess, first, err := ts.Spawn("read -r _", t.TempDir(), "", closeOnExit, 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				first.Close()
+				_ = ts.Kill(sess.ID)
+			})
+			if sess.CloseOnExit != closeOnExit {
+				t.Fatalf("spawn policy = %t, want %t", sess.CloseOnExit, closeOnExit)
+			}
+			data, err := os.ReadFile(filepath.Join(ts.dir, sess.ID+".json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var onDisk struct {
+				CloseOnExit *bool `json:"close_on_exit"`
+			}
+			if err := json.Unmarshal(data, &onDisk); err != nil {
+				t.Fatal(err)
+			}
+			if onDisk.CloseOnExit == nil || *onDisk.CloseOnExit != closeOnExit {
+				t.Fatalf("persisted close_on_exit = %v, want explicit %t", onDisk.CloseOnExit, closeOnExit)
+			}
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reloaded := newSessionsAt(t, ts.dir)
+			restored := reloaded.Get(sess.ID)
+			if restored == nil || restored.CloseOnExit != closeOnExit {
+				t.Fatalf("restored session = %+v, want policy %t", restored, closeOnExit)
+			}
+			s := &Server{terminals: reloaded}
+			attached, second, err := s.attachOrSpawn(sess.ID, "exit 99", "", "", !closeOnExit, 80, 24, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer finishExeScrollTestSession(t, reloaded, attached, second)
+			if attached.CloseOnExit != closeOnExit {
+				t.Fatalf("reattach changed policy to %t, want %t", attached.CloseOnExit, closeOnExit)
+			}
+			if dto := newTerminalDTO(attached); dto.CloseOnExit != closeOnExit {
+				t.Fatalf("DTO policy = %t, want %t", dto.CloseOnExit, closeOnExit)
+			}
+		})
+	}
+}
+
 func TestExeScrollSessionReattachesWithScrollbackAndExitStatus(t *testing.T) {
 	ts := newExeScrollTestSessions(t)
 	command := `if [ -n "${SHELLEY_EXE_SCROLL_FD:-}" ]; then echo inherited-fd-leaked; fi; for i in $(seq 1 200); do printf 'scroll-line-%03d\n' "$i"; done; read -r answer; printf 'answer=%s\n' "$answer"`
-	sess, first, err := ts.Spawn(command, t.TempDir(), "conv-1", 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
+	sess, first, err := ts.Spawn(command, t.TempDir(), "conv-1", false, 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +164,7 @@ func TestExeScrollSessionReattachesWithScrollbackAndExitStatus(t *testing.T) {
 
 func TestExeScrollPreservesNonzeroExitStatus(t *testing.T) {
 	ts := newExeScrollTestSessions(t)
-	sess, client, err := ts.Spawn("exit 42", t.TempDir(), "", 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
+	sess, client, err := ts.Spawn("exit 42", t.TempDir(), "", false, 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +190,7 @@ func TestExeScrollSpawnFailureTerminatesSessionServer(t *testing.T) {
 		serverPID = pid
 		return pid, errors.New("forced PID handoff failure")
 	}
-	_, client, err := ts.Spawn("read -r _", t.TempDir(), "", 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
+	_, client, err := ts.Spawn("read -r _", t.TempDir(), "", false, 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
 	if err == nil {
 		if client != nil {
 			client.Close()
@@ -153,13 +207,13 @@ func TestExeScrollSessionsShareExecutableMapping(t *testing.T) {
 	// Keep login-shell startup independent of the machine's user profile.
 	t.Setenv("HOME", t.TempDir())
 	ts := newExeScrollTestSessions(t)
-	firstSession, firstClient, err := ts.Spawn("read -r _", t.TempDir(), "", 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
+	firstSession, firstClient, err := ts.Spawn("read -r _", t.TempDir(), "", false, 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer finishExeScrollTestSession(t, ts, firstSession, firstClient)
 
-	secondSession, secondClient, err := ts.Spawn("read -r _", t.TempDir(), "", 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
+	secondSession, secondClient, err := ts.Spawn("read -r _", t.TempDir(), "", false, 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +268,7 @@ func exeScrollExecutableMapping(t *testing.T, pid int) string {
 
 func TestKillExeScrollStopsSessionServer(t *testing.T) {
 	ts := newExeScrollTestSessions(t)
-	sess, client, err := ts.Spawn("read -r _", t.TempDir(), "", 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
+	sess, client, err := ts.Spawn("read -r _", t.TempDir(), "", false, 80, 24, []string{"SHELLEY_EXE_SCROLL_HELPER=1"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/josharian/sockpath"
 )
@@ -85,8 +84,8 @@ func TestBashToolExitCode(t *testing.T) {
 			t.Fatal("Run() error = nil, want non-nil")
 		}
 		display := bashDisplayData(t, out.Display)
-		if display.ExitCode != nil {
-			t.Errorf("ExitCode = %v, want unknown", *display.ExitCode)
+		if display.ExitCode == nil || *display.ExitCode != 128+15 {
+			t.Errorf("ExitCode = %v, want 143 (shell convention for SIGTERM)", display.ExitCode)
 		}
 	})
 }
@@ -98,25 +97,6 @@ func bashDisplayData(t *testing.T, value any) BashDisplayData {
 		t.Fatalf("Display = %T, want BashDisplayData", value)
 	}
 	return display
-}
-
-func TestBashSlowOk(t *testing.T) {
-	// Test that slow_ok flag is properly handled
-	t.Run("SlowOk Flag", func(t *testing.T) {
-		input := json.RawMessage(`{"command":"echo 'slow test'","slow_ok":true}`)
-
-		bashTool := (&BashTool{WorkingDir: NewMutableWorkingDir("/")}).Tool()
-		toolOut := bashTool.Run(t.Context(), input)
-		if toolOut.Error != nil {
-			t.Fatalf("Unexpected error: %v", toolOut.Error)
-		}
-		result := toolOut.LLMContent
-
-		expected := "slow test\n"
-		if len(result) == 0 || result[0].Text != expected {
-			t.Errorf("Expected %q, got %q", expected, result[0].Text)
-		}
-	})
 }
 
 func TestBashTool(t *testing.T) {
@@ -161,58 +141,6 @@ func TestBashTool(t *testing.T) {
 		expected := "foobar"
 		if len(result) == 0 || result[0].Text != expected {
 			t.Errorf("Expected %q, got %q", expected, result[0].Text)
-		}
-	})
-
-	// Test with slow_ok parameter
-	t.Run("With SlowOK", func(t *testing.T) {
-		inputObj := struct {
-			Command string `json:"command"`
-			SlowOK  bool   `json:"slow_ok"`
-		}{
-			Command: "sleep 0.1 && echo 'Completed'",
-			SlowOK:  true,
-		}
-		inputJSON, err := json.Marshal(inputObj)
-		if err != nil {
-			t.Fatalf("Failed to marshal input: %v", err)
-		}
-
-		toolOut := tool.Run(t.Context(), inputJSON)
-		if toolOut.Error != nil {
-			t.Fatalf("Unexpected error: %v", toolOut.Error)
-		}
-		result := toolOut.LLMContent
-
-		expected := "Completed\n"
-		if len(result) == 0 || result[0].Text != expected {
-			t.Errorf("Expected %q, got %q", expected, result[0].Text)
-		}
-	})
-
-	// Test command timeout with custom timeout config
-	t.Run("Command Timeout", func(t *testing.T) {
-		// Use a custom BashTool with very short timeout
-		customTimeouts := &Timeouts{
-			Fast: 100 * time.Millisecond,
-			Slow: 100 * time.Millisecond,
-		}
-		customBash := &BashTool{
-			WorkingDir: NewMutableWorkingDir("/"),
-			Timeouts:   customTimeouts,
-		}
-		tool := customBash.Tool()
-
-		input := json.RawMessage(`{"command":"sleep 0.5 && echo 'Should not see this'"}`)
-
-		toolOut := tool.Run(t.Context(), input)
-		if toolOut.Error == nil {
-			t.Errorf("Expected timeout error, got none")
-		} else if !strings.Contains(toolOut.Error.Error(), "timed out") {
-			t.Errorf("Expected timeout error, got: %v", toolOut.Error)
-		}
-		if display := bashDisplayData(t, toolOut.Display); display.ExitCode != nil {
-			t.Errorf("ExitCode = %v, want unknown after timeout", *display.ExitCode)
 		}
 	})
 
@@ -296,11 +224,11 @@ func TestExecuteBashInDirUsesSnapshot(t *testing.T) {
 	snapshot := bashTool.getWorkingDir()
 	bashTool.WorkingDir.Set(t.TempDir())
 
-	output, err := bashTool.executeBashInDir(t.Context(), bashInput{Command: "pwd"}, 5*time.Second, snapshot)
+	res, err := bashTool.executeBashInDir(t.Context(), bashInput{Command: "pwd"}, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.TrimSpace(output); got != original {
+	if got := strings.TrimSpace(res.out); got != original {
 		t.Fatalf("pwd = %q, want snapshotted directory %q", got, original)
 	}
 }
@@ -315,7 +243,8 @@ func TestExecuteBash(t *testing.T) {
 			Command: "echo 'Success'",
 		}
 
-		output, err := bashTool.executeBash(ctx, req, 5*time.Second)
+		res, err := bashTool.executeBash(ctx, req)
+		output := res.out
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -336,7 +265,8 @@ func TestExecuteBash(t *testing.T) {
 			Command: "echo $SHELLEY_CONVERSATION_ID",
 		}
 
-		output, err := bashWithConvID.executeBash(ctx, req, 5*time.Second)
+		res, err := bashWithConvID.executeBash(ctx, req)
+		output := res.out
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -363,7 +293,8 @@ func TestExecuteBash(t *testing.T) {
 		req := bashInput{
 			Command: `printf '%s|%s|%s|%s|%s|%s' "$SHELLEY_CONVERSATION_ID" "$SHELLEY_CONVERSATION_SLUG" "$SHELLEY_MODEL" "$SHELLEY_USER_EMAIL" "$SHELLEY_PORT" "$SHELLEY_URL"`,
 		}
-		output, err := bashWithEnv.executeBash(ctx, req, 5*time.Second)
+		res, err := bashWithEnv.executeBash(ctx, req)
+		output := res.out
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -379,7 +310,8 @@ func TestExecuteBash(t *testing.T) {
 			Command: "echo \"conv_id:$SHELLEY_CONVERSATION_ID:\"",
 		}
 
-		output, err := bashTool.executeBash(ctx, req, 5*time.Second)
+		res, err := bashTool.executeBash(ctx, req)
+		output := res.out
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -397,7 +329,8 @@ func TestExecuteBash(t *testing.T) {
 			Command: "shopt login_shell | grep -q on && echo login",
 		}
 
-		output, err := bashTool.executeBash(ctx, req, 5*time.Second)
+		res, err := bashTool.executeBash(ctx, req)
+		output := res.out
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -414,7 +347,8 @@ func TestExecuteBash(t *testing.T) {
 			Command: "echo 'Error message' >&2 && echo 'Success'",
 		}
 
-		output, err := bashTool.executeBash(ctx, req, 5*time.Second)
+		res, err := bashTool.executeBash(ctx, req)
+		output := res.out
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -431,92 +365,11 @@ func TestExecuteBash(t *testing.T) {
 			Command: "echo 'Error message' >&2 && exit 1",
 		}
 
-		_, err := bashTool.executeBash(ctx, req, 5*time.Second)
+		_, err := bashTool.executeBash(ctx, req)
 		if err == nil {
 			t.Errorf("Expected error for failed command, got none")
 		} else if !strings.Contains(err.Error(), "Error message") {
 			t.Errorf("Expected stderr in error message, got: %v", err)
-		}
-	})
-
-	for _, tc := range []struct {
-		name   string
-		slowOK bool
-		hint   string
-	}{
-		{"Command Timeout", false, "slow_ok: true"},
-		{"Slow Command Timeout", true, "tmux"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := bashInput{
-				Command: "echo 'Before timeout'; sleep 1 && echo 'Should not see this'",
-				SlowOK:  tc.slowOK,
-			}
-
-			start := time.Now()
-			_, err := bashTool.executeBash(ctx, req, 200*time.Millisecond)
-			elapsed := time.Since(start)
-
-			// Command should time out after ~200ms, not wait for the full second.
-			if elapsed >= 1*time.Second {
-				t.Errorf("Command did not respect timeout, took %v", elapsed)
-			}
-
-			if err == nil {
-				t.Errorf("Expected 200ms timeout error after %v, got none", elapsed)
-			} else if !strings.Contains(err.Error(), "timed out") {
-				t.Errorf("Expected 200ms timeout error after %v, got: %v", elapsed, err)
-			}
-			if err != nil {
-				for _, want := range []string{tc.hint, "Before timeout"} {
-					if !strings.Contains(err.Error(), want) {
-						t.Errorf("timeout error = %q, want %q", err, want)
-					}
-				}
-				if strings.Contains(err.Error(), "Should not see this") {
-					t.Errorf("command continued after timeout: %v", err)
-				}
-			}
-		})
-	}
-}
-
-func TestBashTimeout(t *testing.T) {
-	// Test default timeout values
-	t.Run("Default Timeout Values", func(t *testing.T) {
-		// Test foreground default timeout
-		foreground := bashInput{
-			Command: "echo 'test'",
-		}
-		fgTimeout := foreground.timeout(nil)
-		expectedFg := 30 * time.Second
-		if fgTimeout != expectedFg {
-			t.Errorf("Expected foreground default timeout to be %v, got %v", expectedFg, fgTimeout)
-		}
-
-		// Test slow_ok timeout
-		slowOk := bashInput{
-			Command: "echo 'test'",
-			SlowOK:  true,
-		}
-		slowTimeout := slowOk.timeout(nil)
-		expectedSlow := 15 * time.Minute
-		if slowTimeout != expectedSlow {
-			t.Errorf("Expected slow_ok timeout to be %v, got %v", expectedSlow, slowTimeout)
-		}
-
-		// Test custom timeout config
-		customTimeouts := &Timeouts{
-			Fast: 5 * time.Second,
-			Slow: 2 * time.Minute,
-		}
-		customFast := bashInput{
-			Command: "echo 'test'",
-		}
-		customTimeout := customFast.timeout(customTimeouts)
-		expectedCustom := 5 * time.Second
-		if customTimeout != expectedCustom {
-			t.Errorf("Expected custom timeout to be %v, got %v", expectedCustom, customTimeout)
 		}
 	})
 }

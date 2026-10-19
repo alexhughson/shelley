@@ -42,6 +42,12 @@ async function run(name: string, fn: () => Promise<void>): Promise<void> {
   }
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+function blockEventLoop(ms: number): void {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
+    // spin
+  }
+}
 
 async function makeMaterial(keyId: string): Promise<CacheKeyMaterial> {
   const buf = new ArrayBuffer(32);
@@ -245,6 +251,25 @@ async function main(): Promise<void> {
     await g.resolve(0, "kid-shared");
     const [a, b, c] = await all;
     assert(a === b && b === c && a !== null, "all callers see the same material");
+  });
+
+  await run("a stall does not spend a late joiner's share of the budget", async () => {
+    // Callers share one deadline per attempt, and deadlines charge only time
+    // the event loop was free. Deriving a joiner's budget from the wall clock
+    // instead left it nothing after a stall: it timed out at once and put the
+    // attempt into cooldown while the first caller was still, correctly,
+    // waiting on a healthy fetch.
+    const g = new GatedFetcher();
+    const holder = new CacheKeyHolder(g, TIMEOUT_MS);
+    const a = holder.ensure();
+    await sleep(0);
+    blockEventLoop(TIMEOUT_MS * 4);
+    const b = holder.ensure();
+    await sleep(0);
+    assert(g.calls === 1, `the joiner shares the attempt, calls=${g.calls}`);
+    await g.resolve(0, "kid-after-stall");
+    assert((await a)?.keyId === "kid-after-stall", "the first caller gets the key");
+    assert((await b)?.keyId === "kid-after-stall", "and so does the joiner, not an instant null");
   });
 
   await run("cold-start key fetches are serialized across tabs", async () => {

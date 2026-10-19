@@ -38,7 +38,7 @@ func TestGetLatestActionableMessageIgnoresSlugMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The slug call finishes after the turn already errored.
-	if _, err := database.CreateSlugMessage(ctx, conv.ConversationID, []llm.PurposedUsage{
+	if _, err := database.CreateUsageMessage(ctx, conv.ConversationID, []llm.PurposedUsage{
 		{Purpose: "slug", Usage: llm.Usage{InputTokens: 10, Model: "m"}},
 	}); err != nil {
 		t.Fatal(err)
@@ -88,7 +88,7 @@ func TestSlugMarkerDoesNotBreakWarningRun(t *testing.T) {
 			t.Fatal("warning suppressed too early")
 		}
 	}
-	if _, err := database.CreateSlugMessage(ctx, conv.ConversationID, []llm.PurposedUsage{
+	if _, err := database.CreateUsageMessage(ctx, conv.ConversationID, []llm.PurposedUsage{
 		{Purpose: "slug", Usage: llm.Usage{InputTokens: 10, Model: "m"}},
 	}); err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ func TestListMessagesTailCountsVisibleMessages(t *testing.T) {
 	}
 	// Marker physically last, as happens when slug generation finishes after
 	// the first turn.
-	if _, err := database.CreateSlugMessage(ctx, conv.ConversationID, []llm.PurposedUsage{
+	if _, err := database.CreateUsageMessage(ctx, conv.ConversationID, []llm.PurposedUsage{
 		{Purpose: "slug", Usage: llm.Usage{InputTokens: 10, Model: "m"}},
 	}); err != nil {
 		t.Fatal(err)
@@ -226,7 +226,7 @@ func TestForkGenerationIgnoresSlugMarker(t *testing.T) {
 	}
 	// ...and only THEN does the in-flight slug goroutine land, stamping its
 	// marker with generation 2.
-	marker, err := database.CreateSlugMessage(ctx, conv.ConversationID, []llm.PurposedUsage{
+	marker, err := database.CreateUsageMessage(ctx, conv.ConversationID, []llm.PurposedUsage{
 		{Purpose: "slug", Usage: llm.Usage{InputTokens: 10, Model: "m"}},
 	})
 	if err != nil {

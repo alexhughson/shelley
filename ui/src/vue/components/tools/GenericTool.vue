@@ -9,7 +9,10 @@
         <span class="tool-emoji" :class="{ running: isRunning }">⚙️</span>
         <span class="generic-tool-copy">
           <span class="tool-command">{{ toolName }}</span>
-          <GenericToolWarning v-if="isComplete" :tool-name="toolName" />
+          <GenericToolWarning
+            v-if="isComplete && warnMissingUi"
+            :tool-name="toolName"
+          />
         </span>
       </div>
       <button
@@ -51,15 +54,19 @@ import GenericToolWarning from "./GenericToolWarning.vue";
 import ToolChevron from "./ToolChevron.vue";
 import RunningToolTime from "./RunningToolTime.vue";
 
-const props = defineProps<{
-  toolName: string;
-  toolInput?: unknown;
-  isRunning?: boolean;
-  toolInvokedAt?: string | null;
-  toolResult?: LLMContent[];
-  hasError?: boolean;
-  executionTime?: string;
-}>();
+const props = withDefaults(
+  defineProps<{
+    toolName: string;
+    warnMissingUi?: boolean;
+    toolInput?: unknown;
+    isRunning?: boolean;
+    toolInvokedAt?: string | null;
+    toolResult?: LLMContent[];
+    hasError?: boolean;
+    executionTime?: string;
+  }>(),
+  { warnMissingUi: true },
+);
 
 const isExpanded = ref(false);
 

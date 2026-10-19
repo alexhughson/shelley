@@ -42,6 +42,8 @@ export interface ReviewContext {
 
 export interface ReviewCaptureState {
   pointer: string;
+  // The text under the pointer (a line, sentence, or short block).
+  pointerText: string;
   selection: string;
   // First region on screen; what touch users see, with no pointer.
   screen: string;
@@ -136,8 +138,98 @@ function elementLabel(element: Element): string {
   );
 }
 
-// Describe the element under the pointer (or clicked) from the DOM alone.
-export function describeNode(node: Node | null): ReviewTarget | null {
+export interface Caret {
+  node: Text;
+  offset: number;
+}
+
+// The character under a viewport point. The caret APIs snap to the nearest
+// text, so this checks the point is on the glyph itself.
+export function caretAt(x: number, y: number): Caret | null {
+  let node: Node | null = null;
+  let offset = 0;
+  if (document.caretPositionFromPoint) {
+    const position = document.caretPositionFromPoint(x, y);
+    node = position?.offsetNode ?? null;
+    offset = position?.offset ?? 0;
+  } else if (document.caretRangeFromPoint) {
+    const range = document.caretRangeFromPoint(x, y);
+    node = range?.startContainer ?? null;
+    offset = range?.startOffset ?? 0;
+  }
+  if (!(node instanceof Text)) return null;
+  const range = document.createRange();
+  // The caret sits between characters: the glyph is on either side of it.
+  for (const at of [offset, offset - 1]) {
+    if (at < 0 || at >= node.length) continue;
+    range.setStart(node, at);
+    range.setEnd(node, at + 1);
+    for (const rect of range.getClientRects()) {
+      if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom)
+        return { node, offset: at };
+    }
+  }
+  return null;
+}
+
+// ES2022's Intl.Segmenter, where the browser has it.
+type SentenceSegmenter = {
+  segment(text: string): {
+    containing(index: number): { segment: string; index: number } | undefined;
+  };
+};
+const Segmenter = (
+  Intl as unknown as {
+    Segmenter?: new (locale?: string, options?: { granularity: "sentence" }) => SentenceSegmenter;
+  }
+).Segmenter;
+let sentences: SentenceSegmenter | null = null;
+
+// text collapsed, or when too long, the stretch of it around index at.
+// Stretches start at fixed steps, so the text (and with it the pointer
+// event) changes every hundred characters, not with every one.
+function around(text: string, at: number): string {
+  const value = collapse(text, Infinity);
+  if (value.length <= POINTER_TEXT_LIMIT) return value;
+  const step = POINTER_TEXT_LIMIT / 2;
+  const center = collapse(text.slice(0, at), Infinity).length;
+  const start = Math.max(
+    0,
+    Math.min(Math.floor(center / step) * step - step / 2, value.length - POINTER_TEXT_LIMIT),
+  );
+  const end = start + POINTER_TEXT_LIMIT;
+  const head = start > 0 ? "…" : "";
+  const tail = end < value.length ? "…" : "";
+  return head + value.slice(start + head.length, end - tail.length) + tail;
+}
+
+// The text a pointer at caret means within block: its source line in
+// preformatted text, else the whole block when short, else the sentence
+// under the pointer. A long paragraph's opening says little about "this".
+// Overlong lines and sentences clip to the stretch around the pointer.
+export function pointedText(block: Element, caret: Caret | null): string {
+  const full = block.textContent ?? "";
+  const whole = collapse(full);
+  if (!caret || !block.contains(caret.node)) return whole;
+  let at = caret.offset;
+  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node && node !== caret.node; node = walker.nextNode())
+    at += (node as Text).length;
+  if (block.closest("pre")) {
+    const start = full.lastIndexOf("\n", at - 1) + 1;
+    const end = full.indexOf("\n", at);
+    return around(full.slice(start, end < 0 ? undefined : end), at - start) || whole;
+  }
+  if (whole.length < POINTER_TEXT_LIMIT) return whole;
+  if (!Segmenter) return around(full, at);
+  sentences ??= new Segmenter(undefined, { granularity: "sentence" });
+  const sentence = sentences.segment(full).containing(at);
+  return (sentence && around(sentence.segment, at - sentence.index)) || whole;
+}
+
+// Describe the element under the pointer (or clicked) from the DOM alone;
+// caret, when known, is the character under the pointer.
+export function describeNode(node: Node | null, caret: Caret | null = null): ReviewTarget | null {
   if (!node) return null;
   const labels = breadcrumb(node);
   const row = diffRow(node);
@@ -154,11 +246,14 @@ export function describeNode(node: Node | null): ReviewTarget | null {
   // block's text says nothing about where the pointer is.
   if (node.getRootNode() instanceof ShadowRoot)
     return labels.length ? { where: joinWhere(labels) } : null;
-  const block = composedClosest(node, BLOCK_SELECTOR);
   const control = composedClosest(node, "button,a,select,[role=option],[role=treeitem]");
   if (control) return { where: joinWhere(labels, `"${elementLabel(control)}"`) };
+  // Text outside any block element still says what the pointer is on.
+  const block =
+    composedClosest(node, BLOCK_SELECTOR) ??
+    (caret && composedContains(node, caret.node) ? caret.node.parentElement : null);
   if (!labels.length && !block) return null;
-  const text = collapse(block?.textContent);
+  const text = block ? pointedText(block, caret) : "";
   return text && text !== labels.at(-1)
     ? { where: joinWhere(labels), text }
     : { where: joinWhere(labels) };
@@ -353,7 +448,13 @@ export function startReviewCapture(options: {
   onState: (state: ReviewCaptureState) => void;
 }): ReviewCapture {
   const { root, context, t0, emit } = options;
-  const state: ReviewCaptureState = { pointer: "", selection: "", screen: "", view: "" };
+  const state: ReviewCaptureState = {
+    pointer: "",
+    pointerText: "",
+    selection: "",
+    screen: "",
+    view: "",
+  };
   let viewKey = "";
   let screenKey = "";
   let pointerKey = "";
@@ -417,11 +518,12 @@ export function startReviewCapture(options: {
       return;
     }
     const provided = context.pointAt?.(x, y, element);
-    const target = provided === undefined ? describeNode(element) : provided;
+    const target = provided === undefined ? describeNode(element, caretAt(x, y)) : provided;
     const key = targetKey(target);
     if (key === pointerKey) return;
     pointerKey = key;
     state.pointer = target?.where ?? "";
+    state.pointerText = target?.text ?? "";
     record(target ? { type: "pointer", ...target } : { type: "pointer_leave" });
     publish();
   }
@@ -482,6 +584,7 @@ export function startReviewCapture(options: {
     record({ type: "pointer_leave" });
     pointerKey = "";
     state.pointer = "";
+    state.pointerText = "";
     publish();
   }
   const onRootLeave = () => {
@@ -496,7 +599,10 @@ export function startReviewCapture(options: {
     pointerDown = null;
     if (!(element instanceof Element) || dragged || ignored(event)) return;
     const provided = context.pointAt?.(event.clientX, event.clientY, element);
-    const target = provided === undefined ? describeNode(element) : provided;
+    const target =
+      provided === undefined
+        ? describeNode(element, caretAt(event.clientX, event.clientY))
+        : provided;
     const key = targetKey(target);
     const ms = now();
     // The second click of a double click adds nothing.

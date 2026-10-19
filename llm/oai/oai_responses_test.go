@@ -1883,10 +1883,10 @@ func TestResponsesServicePatchProfile(t *testing.T) {
 			t.Fatalf("%s OpenAI Responses profile = %q", model.ModelName, got)
 		}
 	}
-	if got := (&ResponsesService{ProviderName: "openai"}).PatchProfile(); got != "flat" {
+	if got := (&ResponsesService{ProviderName: "openai"}).PatchProfile(); got != "nested" {
 		t.Fatalf("uncatalogued OpenAI Responses profile = %q", got)
 	}
-	if got := (&ResponsesService{ProviderName: "xai", Model: Model{SupportsApplyPatch: true}}).PatchProfile(); got != "flat" {
+	if got := (&ResponsesService{ProviderName: "xai", Model: Model{SupportsApplyPatch: true}}).PatchProfile(); got != "nested" {
 		t.Fatalf("non-OpenAI Responses profile = %q", got)
 	}
 }

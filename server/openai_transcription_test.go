@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"shelley.exe.dev/models"
+	"shelley.exe.dev/modelsources"
 )
 
 func testOpenAIRecordingTranscriber(client *http.Client, endpoint string) *openAIRecordingTranscriber {
@@ -104,6 +105,82 @@ func TestOpenAIRecordingTranscriberUsesModelAPIKey(t *testing.T) {
 	}
 }
 
+// An OpenAI credential (here via the gateway source with an explicit key)
+// yields transcription routes, just as it yields chat models.
+func TestOpenAIRecordingTranscriberUsesOpenAICredentialRoutes(t *testing.T) {
+	mediaPath := transcriptionTestFile(t, "keyed.webm")
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/openai/v1/audio/transcriptions" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-test" {
+			t.Errorf("authorization = %q", got)
+		}
+		_, _ = io.WriteString(w, `{"text":"keyed words"}`)
+	}))
+	defer api.Close()
+
+	manager, err := models.NewManager(&models.Config{
+		TranscriptionModels: modelsources.TranscriptionModels([]modelsources.Source{modelsources.Gateway(api.URL, "", "sk-test", "")}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcriber := newOpenAIRecordingTranscriber(manager, false)
+	if err := transcriber.Available(); err != nil {
+		t.Fatal(err)
+	}
+	result, err := transcriber.Transcribe(t.Context(), mediaPath, "context", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "keyed words" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestOpenAIRecordingTranscriberUnavailableWithoutRoutes(t *testing.T) {
+	manager, err := models.NewManager(&models.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = newOpenAIRecordingTranscriber(manager, false).Available()
+	if err == nil || !strings.Contains(err.Error(), `"gpt-transcribe" is not available`) || !strings.Contains(err.Error(), "OPENAI_API_KEY") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+// Screen and review recordings need whisper-1 too; accepting them with only
+// gpt-transcribe would queue an item that can only fail.
+func TestOpenAIRecordingTranscriberUnavailableWithoutTimestampsModel(t *testing.T) {
+	manager, err := models.NewManager(&models.Config{TranscriptionModels: []models.TranscriptionModel{{
+		Model:    models.TranscriptionTextModel,
+		Endpoint: "https://api.openai.com/v1/audio/transcriptions",
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = newOpenAIRecordingTranscriber(manager, false).Available()
+	if !errors.Is(err, errNoTranscriptionRoute) || !strings.Contains(err.Error(), `"whisper-1"`) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestOpenAIRecordingTranscriberIgnoresRoutesWhenPredictableOnly(t *testing.T) {
+	manager, err := models.NewManager(&models.Config{
+		TranscriptionModels: modelsources.TranscriptionModels([]modelsources.Source{modelsources.Env("", "sk-test", "", "")}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newOpenAIRecordingTranscriber(manager, false).Available(); err != nil {
+		t.Fatal(err)
+	}
+	if err := newOpenAIRecordingTranscriber(manager, true).Available(); !errors.Is(err, errNoTranscriptionRoute) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestOpenAIRecordingTranscriberWithTimestamps(t *testing.T) {
 	mediaPath := transcriptionTestFile(t, "screen.webm")
 	var gptRequests, whisperRequests atomic.Int32
@@ -121,7 +198,7 @@ func TestOpenAIRecordingTranscriberWithTimestamps(t *testing.T) {
 				t.Errorf("GPT timestamp granularities = %#v", got)
 			}
 			_, _ = io.WriteString(w, `{"text":" adjusted GPT words "}`)
-		case openAITimestampedTranscriptionModel:
+		case models.TranscriptionTimestampsModel:
 			whisperRequests.Add(1)
 			if got := r.FormValue("response_format"); got != "verbose_json" {
 				t.Errorf("Whisper response_format = %q", got)
@@ -144,7 +221,7 @@ func TestOpenAIRecordingTranscriberWithTimestamps(t *testing.T) {
 	}
 	if result.Text != "adjusted GPT words" ||
 		result.Model != "gpt-transcribe" ||
-		result.TimestampsModel != openAITimestampedTranscriptionModel {
+		result.TimestampsModel != models.TranscriptionTimestampsModel {
 		t.Fatalf("result = %#v", result)
 	}
 	if gptRequests.Load() != 1 || whisperRequests.Load() != 1 {
@@ -181,9 +258,10 @@ func TestOpenAIRecordingTranscriberReportsAPIError(t *testing.T) {
 }
 
 func TestSelectTranscriptionModelPrefersLLMIntegration(t *testing.T) {
-	selected, err := selectTranscriptionModel(openAITranscriptionModel, []models.TranscriptionModel{
-		{Model: openAITranscriptionModel, Endpoint: "https://custom.example/v1/audio/transcriptions"},
-		{Model: openAITranscriptionModel, Endpoint: "https://llm.int.exe.xyz/v1/audio/transcriptions"},
+	selected, err := selectTranscriptionModel(models.TranscriptionTextModel, []models.TranscriptionModel{
+		{Model: models.TranscriptionTextModel, Endpoint: "https://custom.example/v1/audio/transcriptions", Source: models.SourceCustomLabel},
+		{Model: models.TranscriptionTextModel, Endpoint: "https://ai.team.exe.xyz/v1/audio/transcriptions", Source: "ai.team.exe.xyz"},
+		{Model: models.TranscriptionTextModel, Endpoint: "https://llm.int.exe.xyz/v1/audio/transcriptions", Source: "llm.int.exe.xyz"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -193,8 +271,37 @@ func TestSelectTranscriptionModelPrefersLLMIntegration(t *testing.T) {
 	}
 }
 
+// Any integration, not just the one named llm, wins over a custom model.
+func TestSelectTranscriptionModelPrefersTeamIntegrationOverCustom(t *testing.T) {
+	selected, err := selectTranscriptionModel(models.TranscriptionTextModel, []models.TranscriptionModel{
+		{Model: models.TranscriptionTextModel, Endpoint: "https://custom.example/v1/audio/transcriptions", Source: models.SourceCustomLabel},
+		{Model: models.TranscriptionTextModel, Endpoint: "https://ai.team.exe.xyz/v1/audio/transcriptions", Source: "ai.team.exe.xyz"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.Endpoint != "https://ai.team.exe.xyz/v1/audio/transcriptions" {
+		t.Fatalf("endpoint = %q", selected.Endpoint)
+	}
+}
+
+// A custom model is the user's explicit choice; it wins over routes derived
+// from OPENAI_API_KEY or the gateway.
+func TestSelectTranscriptionModelPrefersCustomOverCredentialRoute(t *testing.T) {
+	selected, err := selectTranscriptionModel(models.TranscriptionTextModel, []models.TranscriptionModel{
+		{Model: models.TranscriptionTextModel, Endpoint: "https://api.openai.com/v1/audio/transcriptions", Source: "$OPENAI_API_KEY", FromCredentials: true},
+		{Model: models.TranscriptionTextModel, Endpoint: "https://proxy.example/v1/audio/transcriptions", Source: models.SourceCustomLabel},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.Endpoint != "https://proxy.example/v1/audio/transcriptions" {
+		t.Fatalf("endpoint = %q", selected.Endpoint)
+	}
+}
+
 func TestSelectTranscriptionModelRequiresExactKnownModel(t *testing.T) {
-	_, err := selectTranscriptionModel(openAITranscriptionModel, []models.TranscriptionModel{
+	_, err := selectTranscriptionModel(models.TranscriptionTextModel, []models.TranscriptionModel{
 		{Model: "some-other-model", Endpoint: "https://llm.int.exe.xyz/v1/audio/transcriptions"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "not available") {
@@ -271,7 +378,7 @@ func TestOpenAIRecordingTranscriberRequiresTimestampArrays(t *testing.T) {
 				if err := r.ParseMultipartForm(1 << 20); err != nil {
 					t.Fatal(err)
 				}
-				if r.FormValue("model") == openAITranscriptionModel {
+				if r.FormValue("model") == models.TranscriptionTextModel {
 					_, _ = io.WriteString(w, `{"text":"canonical GPT words"}`)
 					return
 				}
@@ -298,7 +405,7 @@ func TestOpenAIRecordingTranscriberAcceptsEmptyTimingArraysForSilence(t *testing
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Fatal(err)
 		}
-		if r.FormValue("model") == openAITranscriptionModel {
+		if r.FormValue("model") == models.TranscriptionTextModel {
 			_, _ = io.WriteString(w, `{"text":"canonical GPT words"}`)
 			return
 		}
@@ -318,7 +425,7 @@ func TestOpenAIRecordingTranscriberAttributesTimestampFailure(t *testing.T) {
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Fatal(err)
 		}
-		if r.FormValue("model") == openAITranscriptionModel {
+		if r.FormValue("model") == models.TranscriptionTextModel {
 			_, _ = io.WriteString(w, `{"text":"canonical GPT words"}`)
 			return
 		}
@@ -329,7 +436,7 @@ func TestOpenAIRecordingTranscriberAttributesTimestampFailure(t *testing.T) {
 	transcriber := testOpenAIRecordingTranscriber(api.Client(), api.URL)
 	_, err := transcriber.Transcribe(t.Context(), mediaPath, "context", true)
 	var modelError *transcriptionModelError
-	if !errors.As(err, &modelError) || modelError.Model != openAITimestampedTranscriptionModel {
+	if !errors.As(err, &modelError) || modelError.Model != models.TranscriptionTimestampsModel {
 		t.Fatalf("error = %#v", err)
 	}
 }
@@ -407,7 +514,7 @@ func TestOpenAIRecordingTranscriberPreparesOversizedScreenRecordingOnce(t *testi
 		if string(data) != "compressed screen audio" {
 			t.Errorf("%s upload = %q", model, data)
 		}
-		if model == openAITranscriptionModel {
+		if model == models.TranscriptionTextModel {
 			_, _ = io.WriteString(w, `{"text":"canonical screen words"}`)
 			return
 		}
@@ -440,8 +547,8 @@ func TestOpenAIRecordingTranscriberPreparesOversizedScreenRecordingOnce(t *testi
 		t.Fatalf("result = %#v", result)
 	}
 	mu.Lock()
-	gptFile := uploadedFiles[openAITranscriptionModel]
-	whisperFile := uploadedFiles[openAITimestampedTranscriptionModel]
+	gptFile := uploadedFiles[models.TranscriptionTextModel]
+	whisperFile := uploadedFiles[models.TranscriptionTimestampsModel]
 	mu.Unlock()
 	if filepath.Ext(gptFile) != ".m4a" || gptFile != whisperFile {
 		t.Fatalf("uploaded files: GPT=%q Whisper=%q", gptFile, whisperFile)

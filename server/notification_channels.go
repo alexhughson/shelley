@@ -174,17 +174,6 @@ func toNotificationChannelAPI(ch generated.NotificationChannel) NotificationChan
 	}
 }
 
-func (s *Server) handleNotificationChannels(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		s.handleListNotificationChannels(w, r)
-	case http.MethodPost:
-		s.handleCreateNotificationChannel(w, r)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
 func (s *Server) handleListNotificationChannels(w http.ResponseWriter, r *http.Request) {
 	channels, err := s.db.GetNotificationChannels(r.Context())
 	if err != nil {
@@ -269,41 +258,6 @@ func (s *Server) handleCreateNotificationChannel(w http.ResponseWriter, r *http.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(toNotificationChannelAPI(*ch))
-}
-
-func (s *Server) handleNotificationChannel(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/api/notification-channels/")
-	if path == "" {
-		http.Error(w, "Invalid channel ID", http.StatusBadRequest)
-		return
-	}
-
-	if strings.HasSuffix(path, "/test") {
-		channelID := strings.TrimSuffix(path, "/test")
-		if r.Method == http.MethodPost {
-			s.handleTestNotificationChannel(w, r, channelID)
-		} else {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-		return
-	}
-
-	if strings.Contains(path, "/") {
-		http.Error(w, "Invalid channel ID", http.StatusBadRequest)
-		return
-	}
-	channelID := path
-
-	switch r.Method {
-	case http.MethodGet:
-		s.handleGetNotificationChannel(w, r, channelID)
-	case http.MethodPut:
-		s.handleUpdateNotificationChannel(w, r, channelID)
-	case http.MethodDelete:
-		s.handleDeleteNotificationChannel(w, r, channelID)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
 }
 
 func (s *Server) handleGetNotificationChannel(w http.ResponseWriter, r *http.Request, channelID string) {
@@ -438,11 +392,6 @@ func (s *Server) handleTestNotificationChannel(w http.ResponseWriter, r *http.Re
 }
 
 func (s *Server) handleNotificationChannelTypes(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(s.getNotificationChannelTypes())
 }

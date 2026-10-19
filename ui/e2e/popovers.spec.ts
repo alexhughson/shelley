@@ -190,7 +190,9 @@ test.describe("Context usage popup", () => {
     await label.click();
     const popup = page.locator(".chat-context-popup");
     await expect(popup).toBeVisible();
-    await expect(popup).toContainText("LLM call number");
+    await expect(popup).toContainText("LLM call");
+    // The current context size heads the popup, labeled.
+    await expect(popup.locator(".usage-popup-title")).toHaveText(/^Current context: .+ tokens$/);
     await expect(label).toHaveAttribute("aria-expanded", "true");
     // The panel is teleported out of the button's subtree, so aria-controls is
     // the only thing tying the two together. It must resolve to the dialog.
@@ -229,6 +231,8 @@ test.describe("Context usage popup", () => {
     request,
   }) => {
     test.setTimeout(60000);
+    // Desktop width, where sub-agents widen the popup.
+    await page.setViewportSize({ width: 1280, height: 900 });
     await page.route("**/api/model-costs", async (route) => {
       const body = route.request().postDataJSON() as { models: { model: string }[] };
       const costs = Object.fromEntries(
@@ -289,7 +293,30 @@ test.describe("Context usage popup", () => {
     const total = page.getByTestId("token-cost-total");
     await expect(total).toBeVisible();
     await expect(total).toContainText("Total");
-    await expect(total).toHaveCSS("border-top-style", "solid");
+    await expect(total.locator("th")).toHaveCSS("border-top-style", "solid");
+    // The total heads the receipt, above the subtotals, which in turn sit above
+    // the per-model breakdown, rather than trailing it where a scrolling popup
+    // cuts them off.
+    const subtotalBox = (await page.getByTestId("conversation-cost-subtotal").boundingBox())!;
+    const totalRowBox = (await total.boundingBox())!;
+    const firstModelBox = (await page
+      .locator(".token-cost-model-breakdown")
+      .first()
+      .boundingBox())!;
+    expect(totalRowBox.y).toBeLessThan(subtotalBox.y);
+    expect(subtotalBox.y + subtotalBox.height).toBeLessThanOrEqual(firstModelBox.y + 1);
+    // The graphs cover the main conversation only, and say so.
+    await expect(
+      page.locator(".token-cost-graph-note", { hasText: "main conversation only" }),
+    ).toBeVisible();
+    // The graphs stretch across the popup, as wide as the receipt below them,
+    // and the context size lines up with their left edge.
+    const titleBox = (await page.locator(".usage-popup-title").boundingBox())!;
+    const graphBox = (await page.locator(".token-cost-graph-svg").boundingBox())!;
+    const tableBox = (await page.locator(".token-cost-table").boundingBox())!;
+    expect(graphBox.width).toBeGreaterThan(500);
+    expect(Math.abs(graphBox.width - tableBox.width)).toBeLessThan(1);
+    expect(Math.abs(titleBox.x - graphBox.x)).toBeLessThan(1);
     const subagentCostBox = await subagentRow.locator(".token-cost-legend-cost").boundingBox();
     const totalCostBox = await total.locator(".token-cost-legend-cost").boundingBox();
     expect(subagentCostBox).not.toBeNull();
@@ -327,6 +354,265 @@ test.describe("Context usage popup", () => {
     await page.locator(".context-usage-label").click();
     await expect(total).toBeVisible();
     await expect.poll(() => subagentRequests).toBeGreaterThan(requestsBeforeReopen);
+  });
+
+  test("graphs stack, and each can be switched off", async ({ page, request }) => {
+    test.setTimeout(60000);
+    // Wide enough for the checkboxes to share a line with the context size.
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.route("**/api/model-costs", async (route) => {
+      const body = route.request().postDataJSON() as { models: { model: string }[] };
+      const costs = Object.fromEntries(
+        body.models.map(({ model }) => [
+          model,
+          { input: 10, output: 10, cache_read: 10, cache_write: 10 },
+        ]),
+      );
+      await route.fulfill({ json: { costs } });
+    });
+    const slug = await createConversationViaAPI(request, "echo delta cost");
+    await page.goto(`/c/${slug}`);
+    await page.locator(".context-usage-label").click();
+
+    const popup = page.locator(".chat-context-popup");
+    const graph = popup.locator(".token-cost-graph");
+    const svg = graph.locator(".token-cost-graph-svg");
+    await expect(svg).toBeVisible({ timeout: 30000 });
+    // One toggle per graph, all on: they stack rather than replace each other.
+    const switchGroup = popup.getByRole("group", { name: "Graphs", exact: true });
+    await expect(switchGroup.locator("label")).toHaveText(["context", "cumulative", "incremental"]);
+    const toggles = switchGroup.getByRole("checkbox");
+    for (const toggle of await toggles.all()) await expect(toggle).toBeChecked();
+    // They share a line with the context size, and are not pills like calls/time.
+    const titleLine = (await popup.locator(".usage-popup-title").boundingBox())!;
+    const switchLine = (await switchGroup.boundingBox())!;
+    expect(
+      Math.abs(titleLine.y + titleLine.height / 2 - (switchLine.y + switchLine.height / 2)),
+    ).toBeLessThan(6);
+    expect(switchLine.x).toBeGreaterThan(titleLine.x + titleLine.width);
+    await expect(popup.getByRole("button", { name: "calls" })).toBeVisible();
+    await expect(switchGroup.getByRole("button")).toHaveCount(0);
+    await expect(svg).toContainText("LLM call");
+    await expect(svg).not.toContainText("LLM call number");
+    // Each pane is labeled down its side, rotated.
+    const labels = svg.locator(".token-cost-pane-title");
+    await expect(labels).toHaveCount(3);
+    expect(
+      await labels.evaluateAll((els) => els.map((el) => el.getAttribute("aria-label"))),
+    ).toEqual(["Context tokens", "Cumulative cost", "Incremental cost"]);
+    const rotated = await labels
+      .first()
+      .locator("text")
+      .first()
+      .evaluate((el) => el.getAttribute("transform"));
+    expect(rotated).toContain("rotate(-90)");
+
+    // Context and cumulative cost get equal room; incremental a third of it.
+    const height = async (pane: string) =>
+      (await svg.locator(`g[data-pane="${pane}"] .token-cost-axis`).first().boundingBox())!.height;
+    const [context, cumulative, incremental] = [
+      await height("context"),
+      await height("cumulative"),
+      await height("incremental"),
+    ];
+    expect(Math.abs(context - cumulative)).toBeLessThan(1);
+    expect(Math.abs(cumulative / 3 - incremental)).toBeLessThan(1);
+
+    // The cumulative total is an area; the strip below it has a bar per call.
+    const cumulativeFills = await svg
+      .locator('g[data-pane="cumulative"] path[fill]')
+      .evaluateAll((els) => els.map((el) => el.getAttribute("d") || ""));
+    expect(cumulativeFills.some((d) => /^M[\d.]+,[\d.]+L/.test(d))).toBe(true);
+    const incrementalFills = await svg
+      .locator('g[data-pane="incremental"] path[fill]')
+      .evaluateAll((els) => els.map((el) => el.getAttribute("d") || ""));
+    expect(incrementalFills.some((d) => /^M[\d.]+,[\d.]+V[\d.]+H[\d.]+V[\d.]+Z/.test(d))).toBe(
+      true,
+    );
+
+    // One readout follows the pointer, whichever pane it is over. The popup is
+    // anchored above the status bar, so anything that changes its height (a
+    // pane switched off, the sub-agent lookup landing) moves the graph: point
+    // at it afresh on every attempt rather than at where it was measured.
+    const readout = graph.locator(".token-cost-readout-live");
+    await expect(readout).toHaveText("Hover a call to see what drove its cost.");
+    // The readout is as tall as it can get before any hover, so a hover
+    // doesn't move the graph out from under the pointer.
+    const readoutBox = graph.locator(".token-cost-hover-readout");
+    const unhovered = (await readoutBox.boundingBox())!.height;
+    const graphTop = (await svg.boundingBox())!.y;
+    const hoverGraph = async (y: (height: number) => number, text: RegExp) => {
+      await expect(async () => {
+        const { width, height } = (await svg.boundingBox())!;
+        await svg.hover({ position: { x: width / 2, y: y(height) } });
+        await expect(readout.locator(".token-cost-hover-text")).toHaveText(text, {
+          timeout: 1000,
+        });
+      }).toPass({ timeout: 15000 });
+    };
+    await hoverGraph(
+      (height) => height / 2,
+      /^call 1, \$[\d.]+, cumulative \$[\d.]+, context [\d.]+k?( \(.+\))?$/,
+    );
+    // Under it, what the call paid for, colored like its bar, and why.
+    const parts = readout.locator(".token-cost-call-part");
+    await expect(parts.first()).toHaveText(/^(Input|Output) [\d.]+k? \$[\d.]+$/);
+    const chip = await parts
+      .first()
+      .locator(".token-cost-chip")
+      .evaluate((el) => getComputedStyle(el).backgroundColor);
+    const barColors = await svg
+      .locator('g[data-pane="incremental"] path[fill]')
+      .evaluateAll((els) => els.map((el) => getComputedStyle(el).fill));
+    expect(barColors).toContain(chip);
+    await expect(readout.locator(".token-cost-call-why")).toHaveText(
+      "predictable-v1 reports no prompt caching.",
+    );
+    expect(Math.abs((await readoutBox.boundingBox())!.height - unhovered)).toBeLessThan(0.5);
+    expect(Math.abs((await svg.boundingBox())!.y - graphTop)).toBeLessThan(0.5);
+
+    // Switching a graph off removes its pane and its part of the readout.
+    await popup.getByRole("checkbox", { name: "Context length" }).click();
+    await expect(svg.locator("g[data-pane]")).toHaveCount(2);
+    await expect(svg.locator('g[data-pane="context"]')).toHaveCount(0);
+    await expect(graph.locator(".context-legend")).toHaveCount(0);
+    await popup.getByRole("checkbox", { name: "Incremental cost" }).click();
+    await expect(svg.locator("g[data-pane]")).toHaveCount(1);
+    await hoverGraph(() => 40, /^call 1, cumulative \$[\d.]+( \(.+\))?$/);
+
+    // With the cost graph off and context back on, only context is left.
+    await popup.getByRole("checkbox", { name: "Context length" }).click();
+    await popup.getByRole("checkbox", { name: "Cumulative cost" }).click();
+    await expect(svg.locator("g[data-pane]")).toHaveCount(1);
+    await expect(svg.locator('g[data-pane="context"]')).toHaveCount(1);
+    await expect(graph.locator(".context-legend")).toBeVisible();
+
+    // Nothing on: no graph, but the checkboxes remain to bring one back.
+    await popup.getByRole("checkbox", { name: "Context length" }).click();
+    await expect(svg).toHaveCount(0);
+    await expect(toggles).toHaveCount(3);
+  });
+
+  test("cache misses are marked above their calls", async ({ page, request }) => {
+    test.setTimeout(60000);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.route("**/api/model-costs", async (route) => {
+      const body = route.request().postDataJSON() as { models: { model: string }[] };
+      const costs = Object.fromEntries(
+        body.models.map(({ model }) => [
+          model,
+          { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
+        ]),
+      );
+      await route.fulfill({ json: { costs } });
+    });
+    // A first call writes the prompt to the cache, a second reads it back,
+    // and a third finds only a little of it still cached.
+    const { conversationId, slug } = await createConversationViaAPIWithDetails(
+      request,
+      "cache: 0 10000",
+    );
+    for (const [k, message] of ["cache: 10000 500", "cache: 500 10500"].entries()) {
+      const chat = await request.post(`/api/conversation/${conversationId}/chat`, {
+        data: { message, model: "predictable" },
+      });
+      expect(chat.ok()).toBeTruthy();
+      await expect(async () => {
+        const body = await (await request.get(`/api/conversation/${conversationId}`)).json();
+        const turns = body.messages.filter(
+          (m: { type: string; end_of_turn?: boolean }) => m.type === "agent" && m.end_of_turn,
+        );
+        expect(turns).toHaveLength(k + 2);
+      }).toPass({ timeout: 30000 });
+    }
+    await page.goto(`/c/${slug}`);
+    await page.locator(".context-usage-label").click();
+    const graph = page.locator(".chat-context-popup .token-cost-graph");
+    const svg = graph.locator(".token-cost-graph-svg");
+    await expect(svg).toBeVisible({ timeout: 30000 });
+
+    // One mark, over the third call's bar, and the hint says what it means.
+    const mark = svg.locator(".token-cost-miss-mark");
+    await expect(mark).toHaveCount(1);
+    expect((await mark.getAttribute("d"))!.match(/M/g)).toHaveLength(1);
+    const readout = graph.locator(".token-cost-readout-live");
+    await expect(readout).toContainText("▼ marks a cache miss.");
+    const markBox = (await mark.boundingBox())!;
+    const strip = (await svg
+      .locator('g[data-pane="incremental"] .token-cost-axis')
+      .first()
+      .boundingBox())!;
+    expect(markBox.y + markBox.height).toBeLessThanOrEqual(strip.y + 0.5);
+    const bars = await svg
+      .locator('g[data-pane="incremental"] path[fill]')
+      .evaluateAll((els) =>
+        els.flatMap((el) =>
+          [...(el.getAttribute("d") || "").matchAll(/M([\d.]+),[\d.]+V[\d.]+H([\d.]+)/g)].map(
+            (m) => [Number(m[1]), Number(m[2])],
+          ),
+        ),
+      );
+    const lefts = [...new Set(bars.map(([left]) => left))].sort((a, b) => a - b);
+    expect(lefts).toHaveLength(3);
+    const third = bars.find(([left]) => left === lefts[2])!;
+    const markMid = Number((await mark.getAttribute("d"))!.match(/^M([\d.]+)/)![1]) + 3;
+    expect(markMid).toBeGreaterThan(third[0]);
+    expect(markMid).toBeLessThan(third[1]);
+
+    // Hovering it says so; hovering the hit before it doesn't.
+    const hover = async (x: number, header: RegExp) => {
+      await expect(async () => {
+        const box = (await svg.boundingBox())!;
+        const viewBoxW = Number((await svg.getAttribute("viewBox"))!.split(" ")[2]);
+        await svg.hover({
+          position: { x: (x / viewBoxW) * box.width, y: box.height / 2 },
+        });
+        await expect(readout.locator(".token-cost-hover-text")).toHaveText(header, {
+          timeout: 1000,
+        });
+      }).toPass({ timeout: 15000 });
+    };
+    await hover(markMid, /^call 3,/);
+    await expect(readout.locator(".token-cost-call-why")).toHaveText(
+      /^▼ Cache miss(, [\dhms ]+ after the previous call)?: 500 of 11k prompt tokens were still cached\.$/,
+    );
+    const second = bars.find(([left]) => left === lefts[1])!;
+    await hover((second[0] + second[1]) / 2, /^call 2,/);
+    await expect(readout.locator(".token-cost-call-why")).toHaveCount(0);
+  });
+
+  test("remembers which graphs are on across page loads", async ({ page, request }) => {
+    test.setTimeout(60000);
+    const slug = await createConversationViaAPI(request, "echo remember graphs");
+    await page.goto(`/c/${slug}`);
+    await page.locator(".context-usage-label").click();
+    const popup = page.locator(".chat-context-popup");
+    const svg = popup.locator(".token-cost-graph-svg");
+    await expect(svg).toBeVisible({ timeout: 30000 });
+    await expect(svg.locator("g[data-pane]")).toHaveCount(3);
+
+    await popup.getByRole("checkbox", { name: "Cumulative cost" }).click();
+    await expect(svg.locator("g[data-pane]")).toHaveCount(2);
+
+    await page.reload();
+    await page.locator(".context-usage-label").click();
+    await expect(svg).toBeVisible({ timeout: 30000 });
+    await expect(svg.locator("g[data-pane]")).toHaveCount(2);
+    await expect(svg.locator('g[data-pane="cumulative"]')).toHaveCount(0);
+    await expect(popup.getByRole("checkbox", { name: "Context length" })).toBeChecked();
+    await expect(popup.getByRole("checkbox", { name: "Cumulative cost" })).not.toBeChecked();
+    await expect(popup.getByRole("checkbox", { name: "Incremental cost" })).toBeChecked();
+
+    // Switching everything off is remembered too, rather than reverting to all.
+    await popup.getByRole("checkbox", { name: "Context length" }).click();
+    await popup.getByRole("checkbox", { name: "Incremental cost" }).click();
+    await expect(svg).toHaveCount(0);
+    await page.reload();
+    await page.locator(".context-usage-label").click();
+    await expect(popup.getByRole("checkbox", { name: "Context length" })).not.toBeChecked({
+      timeout: 30000,
+    });
+    await expect(svg).toHaveCount(0);
   });
 
   // The token count is the only way into this popup, and it is styled to read as
@@ -649,8 +935,10 @@ test.describe("Status readout controls", () => {
     await page.goto(`/c/${slug}`);
 
     const cwdSegment = page.locator(".status-readout-cwd:visible").first();
+    const cwdPath = cwdSegment.locator(".status-readout-cwd-path");
     await expect(cwdSegment).toBeVisible({ timeout: 30000 });
-    await expect(cwdSegment).toHaveText(testWorkingDirectory());
+    await expect(cwdPath).toBeVisible();
+    await expect(cwdPath).toHaveText(testWorkingDirectory());
 
     // The readout opens the same picker the composer's cwd chip does.
     await cwdSegment.click();
@@ -670,7 +958,7 @@ test.describe("Status readout controls", () => {
     const expectedLabel = e2eDir.startsWith(homeDir + "/")
       ? "~" + e2eDir.slice(homeDir.length)
       : e2eDir;
-    await expect(cwdSegment).toHaveText(expectedLabel, { timeout: 15000 });
+    await expect(cwdPath).toHaveText(expectedLabel, { timeout: 15000 });
 
     // And the conversation really moved, for the next turn's tools...
     await expect(async () => {
@@ -713,7 +1001,7 @@ test.describe("Status readout controls", () => {
     // Token count -> cost popup, and NOT the picker.
     await tokens.click();
     await expect(costPopup).toBeVisible();
-    await expect(costPopup).toContainText("LLM call number");
+    await expect(costPopup).toContainText("LLM call");
     await expect(pickerPanel).toHaveCount(0);
     await page.keyboard.press("Escape");
     await expect(costPopup).toBeHidden();
@@ -764,7 +1052,7 @@ test.describe("Status readout controls", () => {
   // conversation that already exists, conversation_options are locked server-side
   // (the send path stops resending them once promoted), so a purely local change
   // is a silent no-op that survives until the page is reloaded and then vanishes.
-  // Both have to go through /model.
+  // Both have to go through the server (POST /settings).
   test("reasoning pill persists server-side", async ({ page, request }) => {
     test.setTimeout(60000);
     await page.setViewportSize({ width: 1280, height: 800 });
@@ -804,18 +1092,52 @@ test.describe("Status readout controls", () => {
       "true",
     );
 
-    // Re-clicking the pill that is already selected must not fire another
-    // /model: the pills are radios and re-emit on such a click, and each command
+    // Re-clicking the pill that is already selected must not change settings
+    // again: the pills are radios and re-emit on such a click, and each command
     // rebuilds the agent loop and appends a marker to the log.
     const markersBefore = await page.locator('[data-testid="message-modelchange"]').count();
     const sent: string[] = [];
     page.on("request", (r) => {
-      if (r.url().includes("/chat")) sent.push(r.postData() || "");
+      if (r.url().includes("/settings")) sent.push(r.postData() || "");
     });
     await chosenPill.click();
     await page.waitForTimeout(1000);
     expect(sent, "re-selecting the current level should send nothing").toEqual([]);
     expect(await page.locator('[data-testid="message-modelchange"]').count()).toBe(markersBefore);
+  });
+
+  // The same guard when the picker is already open as a turn starts (a
+  // background job exiting starts one unprompted): the status bar keeps the
+  // picker mounted across the turn, so it has to close itself.
+  test("an open model picker closes when a turn starts", async ({ page, request }) => {
+    test.setTimeout(60000);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    const { conversationId, slug } = await createConversationViaAPIWithDetails(
+      request,
+      "echo open picker",
+      { cwd: testWorkingDirectory() },
+    );
+    await page.goto(`/c/${slug}`);
+    await expect(page.getByTestId("message-input")).toBeVisible({ timeout: 30000 });
+
+    await page.locator(".model-picker-inline .p-select-label").click();
+    const panel = page.locator(".model-picker-panel");
+    await expect(panel).toBeVisible();
+    const sent: string[] = [];
+    page.on("request", (r) => {
+      if (r.url().includes("/settings")) sent.push(r.postData() || "");
+    });
+    expect(
+      (
+        await request.post(`/api/conversation/${conversationId}/chat`, {
+          data: { message: "bash: sleep 8", model: "predictable" },
+        })
+      ).ok(),
+    ).toBe(true);
+    await expect(page.getByTestId("agent-thinking")).toBeVisible({ timeout: 20000 });
+    await expect(panel).toHaveCount(0);
+    expect(sent).toEqual([]);
+    await request.post(`/api/conversation/${conversationId}/cancel`);
   });
 
   // Switching model rebuilds the conversation's loop, and ApplyModelSettings
@@ -882,194 +1204,5 @@ test.describe("Status readout controls", () => {
       .locator(".status-readout-cwd-path")
       .evaluate((el) => getComputedStyle(el).textDecorationLine);
     expect(underline, "a disabled segment must not look clickable").toBe("none");
-  });
-});
-
-// The Advanced Settings popover (the gear beside the model picker on a new
-// conversation) opens upward from a trigger that sits in the bottom status bar,
-// and it is tall: one row per tool. Nothing about `bottom: 100%` knows how much
-// room is actually above the gear, so on a short window — a laptop with a
-// half-height browser, a phone in landscape — the list ran off the top of the
-// screen and the first tools were unreachable (measured top = -7 at 900x380).
-// The horizontal edges have the same problem from the other direction: the gear
-// sits mid-bar, so a fixed left/right anchor overflows one side or the other.
-test.describe("Advanced settings popover", () => {
-  // Widths and heights that bracket the interesting cases: a roomy desktop, the
-  // narrow desktop widths where the horizontal clamp does the work, short
-  // windows where the vertical clamp does, and the mobile breakpoint (<= 640px)
-  // where CSS pins the popover with position: fixed instead. The short ones are
-  // the regression: before the vertical clamp, 1280x360 put the top of the list
-  // 13px above the top of the screen and 900x380 put it 7px above.
-  for (const [width, height] of [
-    [1280, 800],
-    [900, 800],
-    [700, 700],
-    [1280, 360],
-    [900, 380],
-    // Shorter than the popover's minimum height, where it gives up on sitting
-    // above the gear and overlaps the status bar rather than going off-screen.
-    [900, 180],
-    [640, 700],
-    [390, 844],
-  ] as const) {
-    test(`stays on screen at ${width}x${height}`, async ({ page }) => {
-      await page.setViewportSize({ width, height });
-      // The gear only exists on a new/draft conversation. "/new" asks for that
-      // view explicitly; "/" auto-selects the most recent conversation, which
-      // in a shared-database suite run is whatever another spec just created.
-      await page.goto("/new");
-      const trigger = page.locator(".advanced-settings-trigger");
-      await expect(trigger).toBeVisible({ timeout: 30000 });
-      await trigger.click();
-
-      const popover = page.locator(".advanced-settings-popover");
-      await expect(popover).toBeVisible();
-
-      const margin = 8;
-      await expect
-        .poll(async () => {
-          const box = await popover.boundingBox();
-          if (!box) return -Infinity;
-          return Math.min(
-            box.x - margin,
-            width - margin - box.x - box.width,
-            box.y - margin,
-            height - margin - box.y - box.height,
-          );
-        }, "popover runs outside the viewport")
-        .toBeGreaterThanOrEqual(0);
-
-      const box = (await popover.boundingBox())!;
-      expect(box, "popover has no box").not.toBeNull();
-      // Not merely on-screen: inset by the margin the positioning code works
-      // to. A popover flush against an edge is the shape of an off-by-a-few in
-      // the clamp — `>= 0` waved through a version that sat 4px high because
-      // it forgot the popover's own margin-bottom.
-      expect(box.x, "popover runs off the left edge").toBeGreaterThanOrEqual(margin);
-      expect(box.x + box.width, "popover runs off the right edge").toBeLessThanOrEqual(
-        width - margin,
-      );
-      expect(box.y, "popover runs off the top edge").toBeGreaterThanOrEqual(margin);
-      expect(box.y + box.height, "popover runs off the bottom edge").toBeLessThanOrEqual(height);
-
-      // Whatever doesn't fit has to be reachable, which is the point of
-      // capping the height rather than letting the list overflow. Two distinct
-      // failures to guard, hence two checks: content that scrolls nowhere
-      // because it isn't clipped-and-scrollable at all, and content that a
-      // pointer can't scroll even though script can (setting scrollTop works
-      // under overflow: hidden, so the reachability check below passes there).
-      // Playwright's toBeVisible() covers neither: a row scrolled out of an
-      // ancestor's overflow still counts as visible to it.
-      const overflow = await popover.evaluate(async (el) => {
-        el.scrollTop = el.scrollHeight;
-        await new Promise((r) => requestAnimationFrame(r));
-        const last = el.querySelector(".tool-override-row:last-child")!.getBoundingClientRect();
-        const box = el.getBoundingClientRect();
-        return {
-          overflows: el.scrollHeight > el.clientHeight,
-          overflowY: getComputedStyle(el).overflowY,
-          lastRowInside: last.bottom <= box.bottom + 1 && last.top >= box.top - 1,
-        };
-      });
-      expect(overflow.lastRowInside, "the end of the tool list cannot be scrolled into view").toBe(
-        true,
-      );
-      if (overflow.overflows) {
-        expect(
-          ["auto", "scroll"],
-          "the tool list overflows but the user cannot scroll it",
-        ).toContain(overflow.overflowY);
-      }
-    });
-  }
-
-  // Exercise fractional anchor positions and fractional panel widths separately:
-  // rounding the offset or measuring offsetWidth can each cross the margin.
-  for (const [panelWidth, anchorFraction] of [
-    [560, 0.125],
-    [560.375, 0.875],
-  ]) {
-    test(`keeps the viewport inset with a ${panelWidth}px panel and ${anchorFraction}px anchor`, async ({
-      page,
-    }) => {
-      const width = 900;
-      const margin = 8;
-      await page.setViewportSize({ width, height: 800 });
-      await page.goto("/new");
-      await page.addStyleTag({
-        content: `.advanced-settings-popover { width: ${panelWidth}px; min-width: ${panelWidth}px; max-width: ${panelWidth}px; }`,
-      });
-
-      const trigger = page.locator(".advanced-settings-trigger");
-      await expect(trigger).toBeVisible({ timeout: 30000 });
-      const fraction = await page.locator(".advanced-settings-wrapper").evaluate((el, target) => {
-        const left = el.getBoundingClientRect().left;
-        const shift = (target - (left - Math.floor(left)) + 1) % 1;
-        (el as HTMLElement).style.left = `${shift}px`;
-        const shiftedLeft = el.getBoundingClientRect().left;
-        return shiftedLeft - Math.floor(shiftedLeft);
-      }, anchorFraction);
-      expect(fraction).toBeCloseTo(anchorFraction, 3);
-
-      await trigger.click();
-      const popover = page.locator(".advanced-settings-popover");
-      await expect(popover).toBeVisible();
-      await expect
-        .poll(async () => {
-          const box = await popover.boundingBox();
-          return box ? width - margin - box.x - box.width : -Infinity;
-        }, "fractional geometry put the popover past the right margin")
-        .toBeGreaterThanOrEqual(0);
-    });
-  }
-
-  // Resizing while it is open has to re-run the same clamp, and it has to do so
-  // against the post-resize layout. The status bar sits at the bottom of a flex
-  // column, so the gear's position is only settled after the resize relayouts;
-  // measuring on the resize event itself read the old position and left the
-  // popover 25px off the top here.
-  test("re-clamps when the window shrinks while open", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 800 });
-    await page.goto("/new");
-    const trigger = page.locator(".advanced-settings-trigger");
-    await expect(trigger).toBeVisible({ timeout: 30000 });
-    await trigger.click();
-    const popover = page.locator(".advanced-settings-popover");
-    await expect(popover).toBeVisible();
-
-    await page.setViewportSize({ width: 900, height: 320 });
-    await expect(async () => {
-      const box = (await popover.boundingBox())!;
-      expect(box.x).toBeGreaterThanOrEqual(0);
-      expect(box.x + box.width).toBeLessThanOrEqual(900);
-      expect(box.y).toBeGreaterThanOrEqual(0);
-      expect(box.y + box.height).toBeLessThanOrEqual(320);
-    }).toPass({ timeout: 5000 });
-  });
-
-  // Crossing the 640px breakpoint hands positioning back to CSS, which pins the
-  // popover with position: fixed. The JS has to leave nothing behind when it
-  // does: on a short desktop window it writes an inline `bottom`, and that
-  // would fight the fixed placement if it outlived the handoff.
-  test("hands off cleanly to the mobile breakpoint", async ({ page }) => {
-    await page.setViewportSize({ width: 900, height: 180 });
-    await page.goto("/new");
-    const trigger = page.locator(".advanced-settings-trigger");
-    await expect(trigger).toBeVisible({ timeout: 30000 });
-    await trigger.click();
-    const popover = page.locator(".advanced-settings-popover");
-    await expect(popover).toBeVisible();
-    // The regime that writes `bottom`: too short to sit above the gear.
-    expect(await popover.evaluate((el) => (el as HTMLElement).style.bottom)).not.toBe("");
-
-    await page.setViewportSize({ width: 390, height: 844 });
-    await expect(async () => {
-      const styled = await popover.evaluate((el) => ({
-        inline: el.getAttribute("style") || "",
-        position: getComputedStyle(el).position,
-      }));
-      expect(styled.inline, "inline placement outlived the handoff to CSS").toBe("");
-      expect(styled.position).toBe("fixed");
-    }).toPass({ timeout: 5000 });
   });
 });

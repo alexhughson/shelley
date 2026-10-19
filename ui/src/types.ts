@@ -134,13 +134,67 @@ export interface ChatRequest {
   message: string;
   model?: string;
   cwd?: string;
-  conversation_options?: {
-    tool_overrides?: Record<string, "on" | "off">;
+  /** Settings start from the profile (the default one if absent); those
+   *  present override it. The model goes in `model` above. */
+  conversation_options?: Omit<SettingsChange, "model"> & {
     disable_all_tools?: boolean;
-    thinking_level?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
     disable_notifications?: boolean;
   };
   queue?: boolean;
+}
+
+/** A conversation's adjustable settings; see Settings in server/settings.go. */
+export interface Settings {
+  /** "" in a profile means the server's default model. */
+  model: string;
+  /** "" means the model's default. */
+  thinking_level: string;
+  tool_overrides: Record<string, "on" | "off">;
+  /** 0 means the default. */
+  compact_nudge_tokens: number;
+  /** Quiet minutes after a successful turn; 0 disables idle compaction. */
+  idle_compaction_minutes: number;
+  /** What the idle nudge asks the agent to keep; "" adds nothing. */
+  idle_compaction_prompt: string;
+  /** Minutes to keep the prompt cache warm after a successful turn; 0 disables it. */
+  cache_keep_warm_minutes: number;
+  /** A Go text/template; "" means the built-in one. */
+  system_prompt: string;
+}
+
+/** A named Settings. Exactly one is the default. */
+export interface Profile extends Settings {
+  name: string;
+  default: boolean;
+  /** Built-in profiles can be restored to the current shipped defaults. */
+  builtin: boolean;
+  /** Saved by the user rather than following shipped defaults. */
+  user_edited: boolean;
+  /** How voice calls speak for this profile; "" for no persona. Not a
+   *  setting: conversations don't copy it, and calls read it as saved. */
+  voice_prompt: string;
+}
+
+/** GET /api/conversation/<id>/settings: the settings and the profile they
+ *  came from, a label. */
+export interface ConversationSettings extends Settings {
+  profile: string;
+}
+
+/** The body of POST /api/conversation/<id>/settings: absent fields keep their
+ *  values; profile first replaces them all with the profile's. */
+export type SettingsChange = Partial<ConversationSettings>;
+
+export interface SystemPromptInfo {
+  template: string;
+  variables: { name: string; description: string }[];
+}
+/** Why a system prompt template can't be rendered; column is 0-based. */
+// Lines and columns (in characters) count from 1; left out when unknown.
+export interface TemplateProblem {
+  line?: number;
+  column?: number;
+  message: string;
 }
 // Notification event types
 export type NotificationEventType = "agent_done" | "agent_error";
@@ -205,6 +259,9 @@ export interface InitData {
   // is_exe_dev picks exe.dev-specific setup advice when model_setup_hint is
   // absent because the catalog emptied after page load.
   is_exe_dev?: boolean;
+  // transcription_available says whether recordings can be transcribed
+  // (a gpt-transcribe route exists, e.g. from OPENAI_API_KEY).
+  transcription_available?: boolean;
   user_email?: string;
   banner?: string; // If set, shown as a top-of-page banner (e.g. to mark demo instances)
 }
@@ -225,6 +282,7 @@ export interface GitDiffInfo {
   filesCount: number;
   additions: number;
   deletions: number;
+  statsLoaded?: boolean;
   // True when this commit has a guided tour git note.
   hasTour?: boolean;
   // Decorating refs (branches, tags, HEAD), like git log --decorate.
@@ -374,6 +432,24 @@ export function cwdChange(message: Message): { from: string; to: string } | null
       typeof message.user_data === "string" ? JSON.parse(message.user_data) : message.user_data;
     if (!userData?.cwd_change) return null;
     return { from: userData.from || "", to: userData.to || "" };
+  } catch {
+    return null;
+  }
+}
+
+// A context-size nudge (see recordContextNudge): the size line and the
+// compact_in_place index sent with it; null if the message isn't one. Like cwd
+// changes, the agent reads it but the user didn't type it, so it renders as a
+// status line.
+export function contextNudge(message: Message): { size: string; index: string } | null {
+  if (!message.user_data || !message.llm_data) return null;
+  try {
+    const userData =
+      typeof message.user_data === "string" ? JSON.parse(message.user_data) : message.user_data;
+    if (!userData?.context_nudge) return null;
+    const llmData =
+      typeof message.llm_data === "string" ? JSON.parse(message.llm_data) : message.llm_data;
+    return { size: llmData?.Content?.[0]?.Text ?? "", index: llmData?.Content?.[1]?.Text ?? "" };
   } catch {
     return null;
   }

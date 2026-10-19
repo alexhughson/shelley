@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
@@ -81,7 +82,7 @@ func TestBtwServiceFrozenPrefixIsStableAndRequestIsImmutable(t *testing.T) {
 	capture := &btwCapturingService{Service: predictable.NewService()}
 	decorate := func(pointer db.BtwParentPointer) llm.Service {
 		t.Helper()
-		service, err := newBtwService(ctx, database, parent.ConversationID, pointer, 2, capture)
+		service, err := newBtwService(ctx, slog.Default(), database, parent.ConversationID, pointer, 2, capture)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -349,7 +350,7 @@ func TestBtwFrozenReferencePreservesMessageProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	capture := &btwCapturingService{Service: predictable.NewService()}
-	service, err := newBtwService(ctx, database, parent.ConversationID,
+	service, err := newBtwService(ctx, slog.Default(), database, parent.ConversationID,
 		db.BtwParentPointer{Generation: parent.CurrentGeneration, SequenceID: row.SequenceID}, 10, capture)
 	if err != nil {
 		t.Fatal(err)

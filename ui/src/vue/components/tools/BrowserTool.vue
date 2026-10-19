@@ -2,7 +2,19 @@
      browser sub-tool component based on the `action` field of toolInput,
      mirroring the React switch statement. -->
 <template>
-  <BrowserNavigateTool v-if="action === 'navigate'" v-bind="props" />
+  <GenericTool
+    v-if="!action.trim()"
+    :tool-name="invalidCallName + retryNote"
+    :warn-missing-ui="false"
+    v-bind="props"
+  />
+  <GenericTool
+    v-else-if="wrongFieldType"
+    :tool-name="`Invalid browser call: wrong field type for ${action}${retryNote}`"
+    :warn-missing-ui="false"
+    v-bind="props"
+  />
+  <BrowserNavigateTool v-else-if="action === 'navigate'" v-bind="props" />
   <BrowserEvalTool v-else-if="action === 'eval'" v-bind="props" />
   <BrowserResizeTool v-else-if="action === 'resize'" v-bind="props" />
   <ScreenshotTool v-else-if="action === 'screenshot'" v-bind="props" />
@@ -48,7 +60,13 @@
     v-bind="props"
     :tool-input="withSubAction('profile')"
   />
-  <GenericTool v-else :tool-name="`browser (${action || 'unknown'})`" v-bind="props" />
+  <GenericTool
+    v-else-if="rejectedAsUnknown"
+    :tool-name="`Invalid browser call: unsupported action ${JSON.stringify(action)}${retryNote}`"
+    :warn-missing-ui="false"
+    v-bind="props"
+  />
+  <GenericTool v-else :tool-name="`browser (${action})`" v-bind="props" />
 </template>
 
 <script setup lang="ts">
@@ -89,7 +107,42 @@ function getAction(toolInput: unknown): string {
 }
 
 const action = computed(() => getAction(props.toolInput));
-const family = computed(() => action.value.split("_", 1)[0]);
+const familyActions: Record<string, readonly string[]> = {
+  emulate: ["help", "device", "custom", "reset", "dark_mode", "media"],
+  network: ["help", "enable", "disable", "get_log", "clear", "cookies", "clear_cache"],
+  accessibility: ["help", "tree", "query", "node"],
+  profile: ["help", "metrics", "cpu_start", "cpu_stop", "trace_start", "trace_stop", "coverage_start", "coverage_stop"],
+};
+const family = computed(() => {
+  const name = action.value.split("_", 1)[0];
+  return familyActions[name]?.includes(action.value.slice(name.length + 1)) ? name : "";
+});
+const invalidCallName = computed(() => {
+  const input = props.toolInput;
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return "Invalid browser call: input must be a JSON object";
+  }
+  if ("action" in input && typeof input.action !== "string") {
+    return "Invalid browser call: action must be a string";
+  }
+  return "Invalid browser call: missing action";
+});
+const resultText = computed(() => props.toolResult?.find((r) => r.Type === 2)?.Text ?? "");
+// Only the backend knows its full action list; a successful call with an
+// action this file does not know is a missing UI, not an invalid call.
+const rejectedAsUnknown = computed(
+  () =>
+    !!props.hasError &&
+    /^(invalid browser call: unknown action|unknown (browser )?action:)/.test(resultText.value),
+);
+const wrongFieldType = computed(
+  () => !!props.hasError && resultText.value.startsWith("invalid browser call: field "),
+);
+const retryNote = computed(() =>
+  props.hasError && resultText.value.startsWith("invalid browser call:")
+    ? " · model asked to retry"
+    : "",
+);
 
 // The specialized sub-components were written for the old standalone tools,
 // where `action` was just the bare sub-action (e.g. "device" not

@@ -85,7 +85,7 @@ func TestMessageOtherUsageRoundTrip(t *testing.T) {
 	}
 }
 
-func TestCreateSlugMessage(t *testing.T) {
+func TestCreateUsageMessage(t *testing.T) {
 	database := setupTestDB(t)
 	defer database.Close()
 
@@ -103,7 +103,7 @@ func TestCreateSlugMessage(t *testing.T) {
 	}
 
 	entries := []llm.PurposedUsage{{Purpose: "slug", Usage: llm.Usage{InputTokens: 10, OutputTokens: 2, CostUSD: 0.001, Model: "m"}}}
-	msg, err := database.CreateSlugMessage(ctx, conv.ConversationID, entries)
+	msg, err := database.CreateUsageMessage(ctx, conv.ConversationID, entries)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestCreateSlugMessage(t *testing.T) {
 	}
 
 	// Nothing to record: no marker, so we don't litter empty rows.
-	empty, err := database.CreateSlugMessage(ctx, conv.ConversationID, nil)
+	empty, err := database.CreateUsageMessage(ctx, conv.ConversationID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestForkDoesNotCopySlugMarker(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.CreateSlugMessage(ctx, conv.ConversationID, []llm.PurposedUsage{
+	if _, err := database.CreateUsageMessage(ctx, conv.ConversationID, []llm.PurposedUsage{
 		{Purpose: "slug", Usage: llm.Usage{InputTokens: 10, CostUSD: 0.001, Model: "m"}},
 	}); err != nil {
 		t.Fatal(err)

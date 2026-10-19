@@ -66,7 +66,7 @@
 
 <script setup lang="ts">
 import { computed } from "vue";
-import { conversationMessageSource } from "../../utils/messageSource";
+import { messageSource } from "../../utils/messageSource";
 import ConversationMessageAuthor from "./ConversationMessageAuthor.vue";
 import { useI18n } from "../composables/i18n";
 
@@ -85,6 +85,6 @@ defineEmits<{
 }>();
 
 const { t } = useI18n();
-const source = computed(() => conversationMessageSource(props.userData));
+const source = computed(() => messageSource(props.userData));
 const filename = computed(() => props.path.split("/").pop() || props.path);
 </script>

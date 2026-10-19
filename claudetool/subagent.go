@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"shelley.exe.dev/llm"
 )
@@ -13,14 +12,15 @@ import (
 // SubagentRunner is the interface for running a subagent conversation.
 // This is implemented by the server package to avoid import cycles.
 type SubagentRunner interface {
-	// RunSubagent runs a subagent conversation and returns the last response.
-	// If wait is false, it starts processing in background and returns immediately.
-	// timeout is the maximum time to wait for a response.
-	// modelID is the model to use for the subagent.
+	// RunSubagent sends prompt to the subagent conversation and returns an
+	// acknowledgement immediately. The subagent reports back with
+	// message_parent.
+	// modelID is the requested model; empty keeps an existing subagent's
+	// model, or gives a new subagent the parent's.
 	// reasoning is the user-facing reasoning/thinking level for the subagent
 	// (one of "off", "minimal", "low", "medium", "high", "xhigh", "max");
 	// an empty string means "use the service/conversation default".
-	RunSubagent(ctx context.Context, conversationID, prompt string, wait bool, timeout time.Duration, modelID, reasoning string) (string, error)
+	RunSubagent(ctx context.Context, conversationID, prompt, modelID, reasoning string) (string, error)
 }
 
 // subagentReasoningLevels are the user-facing reasoning/thinking levels a
@@ -37,10 +37,22 @@ func isValidReasoningLevel(s string) bool {
 	return false
 }
 
-// AvailableModel describes a model available for subagent use.
+// AvailableModel describes a model that subagent and llm_one_shot can use.
 type AvailableModel struct {
-	ID          string // The model identifier to pass as the "model" parameter
-	DisplayName string // Human-readable name (may equal ID)
+	Name string // Value the agent passes as the "model" parameter
+	ID   string // Model ID to run; may name a specific route (e.g. "gpt-6-sol@sub")
+}
+
+// resolveModel maps the agent-facing model name to the model ID to run.
+func resolveModel(available []AvailableModel, name string) (string, error) {
+	var names []string
+	for _, m := range available {
+		if m.Name == name {
+			return m.ID, nil
+		}
+		names = append(names, m.Name)
+	}
+	return "", fmt.Errorf("unknown model %q; available: %s", name, strings.Join(names, ", "))
 }
 
 // SubagentDB is the database interface for subagent operations.
@@ -48,7 +60,7 @@ type AvailableModel struct {
 type SubagentDB interface {
 	// GetOrCreateSubagentConversation retrieves or creates a subagent conversation.
 	// Returns the conversation ID and the actual slug used (may differ from requested
-	// slug if a numeric suffix was added for uniqueness).
+	// slug if a suffix was added for uniqueness).
 	GetOrCreateSubagentConversation(ctx context.Context, slug, parentID, cwd string) (conversationID, actualSlug string, err error)
 }
 
@@ -58,14 +70,16 @@ type SubagentTool struct {
 	ParentConversationID string
 	WorkingDir           *MutableWorkingDir
 	Runner               SubagentRunner
-	ModelID              string           // Parent conversation's model ID (default for subagents)
 	AvailableModels      []AvailableModel // Models the agent can choose from
 	// ParentReasoning is the parent conversation's user-facing reasoning level
 	// (one of "off", "minimal", "low", "medium", "high", "xhigh", "max",
 	// or "" for the service default). Subagents inherit this when the "reasoning"
 	// parameter is not specified.
 	ParentReasoning string
-	slugLocks       sync.Map // map[string]*sync.Mutex
+	// DBPath is the Shelley database, named in the description's query
+	// for listing subagents.
+	DBPath    string
+	slugLocks sync.Map // map[string]*sync.Mutex
 }
 
 func (s *SubagentTool) lockSlug(slug string) func() {
@@ -77,21 +91,24 @@ func (s *SubagentTool) lockSlug(slug string) func() {
 
 const subagentName = "subagent"
 
-const (
-	// subagentDefaultTimeout is how long a wait=true call blocks before
-	// returning a progress summary while the subagent keeps running.
-	subagentDefaultTimeout = 15 * time.Minute
-	// subagentMaxTimeout caps an explicit timeout_seconds.
-	subagentMaxTimeout = 60 * time.Minute
-)
+// subagentListQuery lists the conversation's delegated subagents with their
+// working state and latest reply. Workers and /btw readers have a kind; a
+// distilled conversation's source is a user-initiated child.
+const subagentListQuery = `SELECT slug, agent_working, (SELECT json_extract(c.value, '$.Text') FROM messages m, json_each(m.llm_data, '$.Content') c WHERE m.conversation_id = s.conversation_id AND m.type = 'agent' AND json_extract(c.value, '$.Type') = 2 ORDER BY m.sequence_id DESC, c.key DESC LIMIT 1) AS last_reply FROM conversations s WHERE parent_conversation_id = '$SHELLEY_CONVERSATION_ID' AND NOT user_initiated AND json_extract(conversation_options, '$.kind') IS NULL`
 
-const subagentDescription = `Delegate tasks to independent conversations, including parallel or
+func (s *SubagentTool) description() string {
+	return `Delegate tasks to independent conversations, including parallel or
 output-heavy work whose details should not fill your context.
 
 Use a new slug to start a subagent; reuse its slug to continue that conversation.
+A busy subagent receives the message during its current turn.
 
-The tool returns the subagent's response or a running status, according to wait
-and timeout_seconds.
+The tool returns immediately; the subagent works in the background and reports
+back with messages. Its messages will wake you, so end your turn rather than
+checking on subagents.
+
+To list your subagents, whether each is working, and its latest reply:
+sqlite3 -json "` + s.DBPath + `" "` + subagentListQuery + `"
 
 Subagents do not inherit your conversation. When writing prompts for subagents,
 convey intent, nuance, and operational details — not just prescriptive instructions.
@@ -101,6 +118,7 @@ Give subagents enough context and autonomy to make good decisions and adapt as t
 
 Keep short context inline; put substantial context in reusable files, splitting
 out shared material. Have subagents read primary sources directly.`
+}
 
 // subagentInputSchema builds the JSON schema, including model enum when models are available.
 func (s *SubagentTool) subagentInputSchema() string {
@@ -109,12 +127,12 @@ func (s *SubagentTool) subagentInputSchema() string {
 		// Build the enum array
 		var enumItems []string
 		for _, m := range s.AvailableModels {
-			enumItems = append(enumItems, fmt.Sprintf("%q", m.ID))
+			enumItems = append(enumItems, fmt.Sprintf("%q", m.Name))
 		}
 		modelProp = fmt.Sprintf(`,
     "model": {
       "type": "string",
-      "description": "Optional. LLM model for the subagent. Omit to use the parent conversation's model; set only when the user asks for a specific model.",
+      "description": "Optional. LLM model for the subagent. Omit to keep an existing subagent's model, or to give a new subagent the parent conversation's model; set only when the user asks for a specific model.",
       "enum": [%s]
     }`, strings.Join(enumItems, ", "))
 	}
@@ -141,34 +159,24 @@ func (s *SubagentTool) subagentInputSchema() string {
     },
     "prompt": {
       "type": "string",
-      "description": "The message to send to the subagent. If it is still working, the message is queued until its current turn finishes; it does not interrupt."
-    },
-    "timeout_seconds": {
-      "type": "integer",
-      "description": "How long to wait for a synchronous response, in seconds (default: 900, max: 3600). Only applies when wait=true; ignored otherwise. If the subagent hasn't finished by this deadline, the tool returns a progress summary and the subagent keeps running in the background; its eventual completion will then be delivered asynchronously."
-    },
-    "wait": {
-      "type": "boolean",
-      "description": "Whether to wait for completion (default: true). If false, returns immediately; when the subagent eventually finishes, its response is delivered asynchronously. If wait=true and the subagent completes before timeout, no later asynchronous duplicate is delivered."
+      "description": "The message to send to the subagent. If it is still working, it receives the message during its current turn without being interrupted."
     }%s%s
   }
 }`, modelProp, reasoningProp)
 }
 
 type subagentInput struct {
-	Slug           string `json:"slug"`
-	Prompt         string `json:"prompt"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
-	Wait           *bool  `json:"wait,omitempty"`
-	Model          string `json:"model,omitempty"`
-	Reasoning      string `json:"reasoning,omitempty"`
+	Slug      string `json:"slug"`
+	Prompt    string `json:"prompt"`
+	Model     string `json:"model,omitempty"`
+	Reasoning string `json:"reasoning,omitempty"`
 }
 
 // Tool returns an llm.Tool for the subagent functionality.
 func (s *SubagentTool) Tool() *llm.Tool {
 	return &llm.Tool{
 		Name:        subagentName,
-		Description: subagentDescription,
+		Description: s.description(),
 		InputSchema: llm.MustSchema(s.subagentInputSchema()),
 		Run:         llm.RunJSON(s.run),
 	}
@@ -191,42 +199,14 @@ func (s *SubagentTool) run(ctx context.Context, req subagentInput) llm.ToolOut {
 	unlockSlug := s.lockSlug(req.Slug)
 	defer unlockSlug()
 
-	// Set defaults. The default wait is generous (15 min) because subagents
-	// commonly run review/analysis tasks that take several minutes; a short
-	// timeout pushed the parent to "hurry" a still-working subagent, which
-	// historically interrupted its turn. Hitting the timeout is not an error
-	// — it returns a progress summary and the subagent keeps running, with its
-	// eventual result delivered asynchronously.
-	timeout := subagentDefaultTimeout
-	if req.TimeoutSeconds > 0 {
-		timeout = min(time.Duration(req.TimeoutSeconds)*time.Second, subagentMaxTimeout)
-	}
-
-	wait := true
-	if req.Wait != nil {
-		wait = *req.Wait
-	}
-
-	// Determine which model to use: explicit choice > parent's model
-	modelID := s.ModelID
+	// An omitted model is resolved by the runner: an existing subagent keeps
+	// its own model, and a new one inherits the parent's.
+	var modelID string
 	if req.Model != "" {
-		if len(s.AvailableModels) > 0 {
-			found := false
-			for _, m := range s.AvailableModels {
-				if m.ID == req.Model {
-					found = true
-					break
-				}
-			}
-			if !found {
-				var ids []string
-				for _, m := range s.AvailableModels {
-					ids = append(ids, m.ID)
-				}
-				return llm.ErrorfToolOut("unknown model %q; available: %s", req.Model, strings.Join(ids, ", "))
-			}
+		var err error
+		if modelID, err = resolveModel(s.AvailableModels, req.Model); err != nil {
+			return llm.ErrorToolOut(err)
 		}
-		modelID = req.Model
 	}
 
 	// Determine reasoning level: explicit choice > parent's reasoning level.
@@ -244,8 +224,7 @@ func (s *SubagentTool) run(ctx context.Context, req subagentInput) llm.ToolOut {
 		return llm.ErrorfToolOut("failed to get/create subagent conversation: %w", err)
 	}
 
-	// Use the runner to execute the subagent
-	response, err := s.Runner.RunSubagent(ctx, conversationID, req.Prompt, wait, timeout, modelID, reasoning)
+	ack, err := s.Runner.RunSubagent(ctx, conversationID, req.Prompt, modelID, reasoning)
 	if err != nil {
 		return llm.ErrorfToolOut("subagent error: %w", err)
 	}
@@ -257,7 +236,7 @@ func (s *SubagentTool) run(ctx context.Context, req subagentInput) llm.ToolOut {
 	}
 
 	return llm.ToolOut{
-		LLMContent: llm.TextContent(fmt.Sprintf("Subagent '%s' response:%s\n%s", actualSlug, slugNote, response)),
+		LLMContent: llm.TextContent(fmt.Sprintf("Subagent '%s':%s %s", actualSlug, slugNote, ack)),
 		Display: SubagentDisplayData{
 			Slug:           actualSlug,
 			ConversationID: conversationID,

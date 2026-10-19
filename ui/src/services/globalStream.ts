@@ -74,8 +74,11 @@ export interface GlobalStreamOptions {
    * received new messages while we were disconnected.
    */
   onReconnect?: () => void;
-  /** Server-wide disk space status: a snapshot after every (re)connect, then transitions. */
-  onDiskSpaceStatus?: (status: DiskSpaceStatus) => void;
+  /**
+   * Server-wide disk space status: a snapshot after every (re)connect, then
+   * transitions. snapshot is true for the first status on each connection.
+   */
+  onDiskSpaceStatus?: (status: DiskSpaceStatus, snapshot: boolean) => void;
 }
 
 export interface GlobalStreamHandle {
@@ -123,6 +126,8 @@ export function connectGlobalStream({
   // accepting: only the former earns a backoff reset. See
   // STABLE_CONNECTION_MS.
   let connectionOpenedAt = 0;
+  // Whether the current connection has delivered its disk space snapshot.
+  let diskSnapshotSeen = false;
   // Wall-clock timestamp of the last frame (open or any message, incl.
   // heartbeat) received on the current connection. This is the source of
   // truth for connection liveness: unlike setTimeout-based watchdogs, it is
@@ -215,7 +220,8 @@ export function connectGlobalStream({
       onNotificationEvent(data.notification_event);
     }
     if (data.disk_space_status && onDiskSpaceStatus) {
-      onDiskSpaceStatus(data.disk_space_status);
+      onDiskSpaceStatus(data.disk_space_status, !diskSnapshotSeen);
+      diskSnapshotSeen = true;
     }
 
     const convId = data.conversation_id;
@@ -296,6 +302,7 @@ export function connectGlobalStream({
     // lastFrameAt and tear down the freshly-opened one.
     lastFrameAt = Date.now();
     connectionOpenedAt = 0;
+    diskSnapshotSeen = false;
     const source = api.createStream({ conversationListHash: getHash() ?? undefined });
     eventSource = source;
 

@@ -141,6 +141,16 @@
       },
     },
   });
+  // The predictable-only server has no transcription route, which gates
+  // recording; chat is mocked below, so report transcription as available.
+  let init;
+  Object.defineProperty(window, "__SHELLEY_INIT__", {
+    configurable: true,
+    get: () => init,
+    set: (value) => {
+      init = { ...value, transcription_available: true };
+    },
+  });
   Object.defineProperty(window, "__recordingMock", {
     configurable: true,
     value: mock,

@@ -26,7 +26,6 @@ type ModelAPI struct {
 	APIKey          string `json:"api_key"`
 	ModelName       string `json:"model_name"`
 	MaxTokens       int64  `json:"max_tokens"`
-	Tags            string `json:"tags"` // Comma-separated tags (e.g., "slug" for slug generation)
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	// ReasoningReplay is "auto", "none", or "reasoning_content".
 	ReasoningReplay         oai.ReasoningReplay `json:"reasoning_replay"`
@@ -50,7 +49,6 @@ type CreateModelRequest struct {
 	APIKey           string              `json:"api_key"`
 	ModelName        string              `json:"model_name"`
 	MaxTokens        int64               `json:"max_tokens"`
-	Tags             string              `json:"tags"` // Comma-separated tags
 	ReasoningEffort  string              `json:"reasoning_effort,omitempty"`
 	ReasoningReplay  oai.ReasoningReplay `json:"reasoning_replay,omitempty"`
 	ImageSupport     string              `json:"image_support"`     // "auto"|"yes"|"no"; empty = "auto"
@@ -66,7 +64,6 @@ type UpdateModelRequest struct {
 	APIKey           string               `json:"api_key"` // Empty string means keep existing
 	ModelName        string               `json:"model_name"`
 	MaxTokens        *int64               `json:"max_tokens"`
-	Tags             string               `json:"tags"` // Comma-separated tags
 	ReasoningEffort  *string              `json:"reasoning_effort,omitempty"`
 	ReasoningReplay  *oai.ReasoningReplay `json:"reasoning_replay,omitempty"`
 	ImageSupport     string               `json:"image_support"`     // "auto"|"yes"|"no"; empty preserves existing
@@ -154,7 +151,6 @@ func toModelAPI(m generated.Model) ModelAPI {
 		APIKey:                  m.ApiKey,
 		ModelName:               m.ModelName,
 		MaxTokens:               m.MaxTokens,
-		Tags:                    m.Tags,
 		ReasoningEffort:         m.ReasoningEffort,
 		ReasoningReplay:         reasoningReplay,
 		ResolvedReasoningReplay: oai.ResolveReasoningReplay(m.Endpoint, m.ModelName, reasoningReplay),
@@ -163,17 +159,6 @@ func toModelAPI(m generated.Model) ModelAPI {
 		ReasoningMap:            m.ReasoningMap,
 		SupportsReasoning:       models.ResolveSupportsReasoning(m.Endpoint, m.ModelName, m.ReasoningSupport),
 		SupportsImages:          models.ResolveSupportsImages(m.Endpoint, m.ModelName, m.ImageSupport),
-	}
-}
-
-func (s *Server) handleCustomModels(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		s.handleListModels(w, r)
-	case http.MethodPost:
-		s.handleCreateModel(w, r)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -251,7 +236,6 @@ func (s *Server) handleCreateModel(w http.ResponseWriter, r *http.Request) {
 		ApiKey:           req.APIKey,
 		ModelName:        req.ModelName,
 		MaxTokens:        req.MaxTokens,
-		Tags:             req.Tags,
 		ReasoningEffort:  req.ReasoningEffort,
 		ImageSupport:     imageSupport,
 		ReasoningSupport: reasoningSupport,
@@ -271,43 +255,6 @@ func (s *Server) handleCreateModel(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(toModelAPI(*model))
-}
-
-func (s *Server) handleCustomModel(w http.ResponseWriter, r *http.Request) {
-	// Extract model ID from URL path: /api/custom-models/{id} or /api/custom-models/{id}/duplicate
-	path := strings.TrimPrefix(r.URL.Path, "/api/custom-models/")
-	if path == "" {
-		http.Error(w, "Invalid model ID", http.StatusBadRequest)
-		return
-	}
-
-	// Check for /duplicate suffix
-	if strings.HasSuffix(path, "/duplicate") {
-		modelID := strings.TrimSuffix(path, "/duplicate")
-		if r.Method == http.MethodPost {
-			s.handleDuplicateModel(w, r, modelID)
-		} else {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-		return
-	}
-
-	if strings.Contains(path, "/") {
-		http.Error(w, "Invalid model ID", http.StatusBadRequest)
-		return
-	}
-	modelID := path
-
-	switch r.Method {
-	case http.MethodGet:
-		s.handleGetModel(w, r, modelID)
-	case http.MethodPut:
-		s.handleUpdateModel(w, r, modelID)
-	case http.MethodDelete:
-		s.handleDeleteModel(w, r, modelID)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
 }
 
 func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request, modelID string) {
@@ -391,7 +338,6 @@ func (s *Server) handleUpdateModel(w http.ResponseWriter, r *http.Request, model
 		ApiKey:           apiKey,
 		ModelName:        req.ModelName,
 		MaxTokens:        maxTokens,
-		Tags:             req.Tags,
 		ReasoningEffort:  reasoningEffort,
 		ImageSupport:     imageSupport,
 		ReasoningSupport: reasoningSupport,
@@ -469,7 +415,6 @@ func (s *Server) handleDuplicateModel(w http.ResponseWriter, r *http.Request, mo
 		ApiKey:           source.ApiKey, // Copy the API key!
 		ModelName:        source.ModelName,
 		MaxTokens:        source.MaxTokens,
-		Tags:             "", // Don't copy tags
 		ReasoningEffort:  source.ReasoningEffort,
 		ImageSupport:     source.ImageSupport,
 		ReasoningSupport: source.ReasoningSupport,
@@ -492,11 +437,6 @@ func (s *Server) handleDuplicateModel(w http.ResponseWriter, r *http.Request, mo
 }
 
 func (s *Server) handleTestModel(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	var req TestModelRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)

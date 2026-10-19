@@ -444,7 +444,6 @@ func TestPreclaimFailureBecomesManualInterruption(t *testing.T) {
 		nil,
 		nil,
 		nil,
-		nil,
 		srv.streamPub,
 	)
 	manager.mu.Lock()
@@ -592,6 +591,53 @@ func TestUpgradeResumeFailureAfterInterruptedResult(t *testing.T) {
 // are not working, managed children, and conversations whose turn already
 // finished are not reserved for automatic resume and have stale working state
 // cleared before listeners open.
+// A delegated subagent left mid-turn resumes like a top-level conversation,
+// and its completion still reaches the idle parent.
+func TestResumeAfterUpgradeResumesSubagent(t *testing.T) {
+	t.Parallel()
+	srv, database, _ := newTestServer(t)
+	ctx := t.Context()
+	model := "predictable"
+	parent, err := database.CreateConversation(ctx, nil, true, nil, &model, db.ConversationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := database.CreateSubagentConversation(ctx, "worker", parent.ConversationID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateConversationModel(ctx, sub.ConversationID, model); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.CreateMessage(ctx, db.CreateMessageParams{
+		ConversationID: sub.ConversationID,
+		Type:           db.MessageTypeUser,
+		LLMData:        llm.UserStringMessage("echo: subagent result"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetConversationAgentWorking(ctx, sub.ConversationID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetSetting(ctx, db.ResumeAfterUpgradeSettingKey, "1"); err != nil {
+		t.Fatal(err)
+	}
+
+	startTestServer(t, srv)
+
+	waitFor(t, 15*time.Second, func() bool {
+		return countByType(listMessages(t, database, sub.ConversationID), db.MessageTypeAgent) == 1 &&
+			!srv.IsAgentWorking(sub.ConversationID)
+	})
+	msgs := listMessages(t, database, sub.ConversationID)
+	if got := countByType(msgs, db.MessageTypeUser); got != 1 {
+		t.Errorf("subagent user messages = %d, want 1", got)
+	}
+	if got := countByType(msgs, db.MessageTypeWarning); got != 1 {
+		t.Errorf("subagent warning messages = %d, want 1", got)
+	}
+}
+
 func TestResumeAfterUpgradeSkips(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -610,10 +656,34 @@ func TestResumeAfterUpgradeSkips(t *testing.T) {
 			},
 		},
 		{
-			name: "subagent conversation",
+			name: "user-initiated child conversation",
 			seed: func(t *testing.T, database *db.DB) string {
 				parent := seedInterruptedConversation(t, database, nil)
 				return seedInterruptedConversation(t, database, &parent)
+			},
+		},
+		{
+			name: "commit tour worker",
+			seed: func(t *testing.T, database *db.DB) string {
+				parent := seedInterruptedConversation(t, database, nil)
+				worker, err := database.CreateCommitTourWorker(t.Context(), parent, "/tmp", "predictable", db.ConversationOptions{
+					Kind:       db.CommitTourKind,
+					CommitTour: &db.CommitTourRequest{Commit: "0123456789abcdef", State: "building", RequestedAt: time.Now().UTC()},
+				})
+				if err != nil {
+					t.Fatalf("CreateCommitTourWorker: %v", err)
+				}
+				if _, err := database.CreateMessage(t.Context(), db.CreateMessageParams{
+					ConversationID: worker.ConversationID,
+					Type:           db.MessageTypeUser,
+					LLMData:        llm.UserStringMessage("tour"),
+				}); err != nil {
+					t.Fatalf("CreateMessage: %v", err)
+				}
+				if err := database.SetConversationAgentWorking(t.Context(), worker.ConversationID, true); err != nil {
+					t.Fatalf("SetConversationAgentWorking: %v", err)
+				}
+				return worker.ConversationID
 			},
 		},
 		{

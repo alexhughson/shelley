@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -97,6 +98,11 @@ var pngBytes = []byte{
 
 func setupFileServer(t *testing.T, cwd, msgText string) (*httptest.Server, string) {
 	t.Helper()
+	return setupFileServerContent(t, cwd, llm.Content{Type: llm.ContentTypeText, Text: msgText})
+}
+
+func setupFileServerContent(t *testing.T, cwd string, content ...llm.Content) (*httptest.Server, string) {
+	t.Helper()
 	server, database, _ := newTestServer(t)
 	conv, err := database.CreateConversation(t.Context(), nil, true, &cwd, nil, db.ConversationOptions{})
 	if err != nil {
@@ -104,7 +110,7 @@ func setupFileServer(t *testing.T, cwd, msgText string) (*httptest.Server, strin
 	}
 	msg := llm.Message{
 		Role:    llm.MessageRoleAssistant,
-		Content: []llm.Content{{Type: llm.ContentTypeText, Text: msgText}},
+		Content: content,
 	}
 	created, err := database.CreateMessage(t.Context(), db.CreateMessageParams{
 		ConversationID: conv.ConversationID,
@@ -411,5 +417,159 @@ func TestHandleMessageFile_AbsolutePathWithoutCwd(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func getDownload(t *testing.T, srv *httptest.Server, msgID, path string) *http.Response {
+	t.Helper()
+	resp, err := http.Get(srv.URL + "/api/message/" + msgID + "/download?path=" + url.QueryEscape(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+func TestHandleMessageDownload_Success(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("a b.mp4", "spaced")
+	write("a(1).txt", "parens")
+	write("auto.txt", "auto")
+	write("titled.txt", "titled")
+	srv, msgID := setupFileServer(t, "", "Done:\n"+
+		"- [angle](<sandbox:"+dir+"/a b.mp4>)\n"+
+		"- [encoded](sandbox:"+dir+"/a%20b.mp4)\n"+
+		"- [escaped](sandbox:"+dir+"/a\\(1\\).txt)\n"+
+		"- <sandbox:"+dir+"/auto.txt>\n"+
+		"- [titled](sandbox:"+dir+"/titled.txt \"Title\")\n")
+
+	tests := []struct{ path, name, body string }{
+		// path is the destination as marked hands it to the UI: backslash
+		// escapes resolved, percent-encoding intact.
+		{dir + "/a b.mp4", "a b.mp4", "spaced"},
+		{dir + "/a%20b.mp4", "a b.mp4", "spaced"},
+		{dir + "/a(1).txt", "a(1).txt", "parens"},
+		{dir + "/auto.txt", "auto.txt", "auto"},
+		{dir + "/titled.txt", "titled.txt", "titled"},
+	}
+	for _, tt := range tests {
+		resp := getDownload(t, srv, msgID, tt.path)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s: expected 200, got %d", tt.path, resp.StatusCode)
+			continue
+		}
+		cd := resp.Header.Get("Content-Disposition")
+		if disp, params, err := mime.ParseMediaType(cd); err != nil || disp != "attachment" || params["filename"] != tt.name {
+			t.Errorf("%s: Content-Disposition = %q, want attachment of %q", tt.path, cd, tt.name)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "application/octet-stream" {
+			t.Errorf("%s: Content-Type = %q, want application/octet-stream", tt.path, ct)
+		}
+		if body, _ := io.ReadAll(resp.Body); string(body) != tt.body {
+			t.Errorf("%s: body = %q, want %q", tt.path, body, tt.body)
+		}
+	}
+}
+
+// A link authorizes exactly its own destination, never a file whose name is a
+// prefix of it.
+func TestHandleMessageDownload_PrefixOfLinkIsRefused(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	for _, name := range []string{"secret.txt", "secret.txt(public)", "a", "a b.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv, msgID := setupFileServer(t, "", "[r](sandbox:"+dir+"/secret.txt(public)) [s](<sandbox:"+dir+"/a b.txt>)")
+
+	for _, p := range []string{dir + "/secret.txt", dir + "/a"} {
+		if resp := getDownload(t, srv, msgID, p); resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s: expected 404, got %d", p, resp.StatusCode)
+		}
+	}
+	if resp := getDownload(t, srv, msgID, dir+"/secret.txt(public)"); resp.StatusCode != http.StatusOK {
+		t.Errorf("full destination: expected 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestHandleMessageDownload_RelativeToCwd(t *testing.T) {
+	t.Parallel()
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "notes.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv, msgID := setupFileServer(t, cwd, "[notes](sandbox:notes.txt)")
+
+	if resp := getDownload(t, srv, msgID, "notes.txt"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+}
+
+// Only an explicit sandbox: link authorizes a download. A path the message
+// merely mentions (or shows as an image) is not an offer to download it.
+func TestHandleMessageDownload_RequiresSandboxLink(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	secret := filepath.Join(dir, "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOP SECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv, msgID := setupFileServer(t, dir, "I read "+secret+", [this](./secret.txt), and `[x](sandbox:"+secret+")`.")
+
+	for _, p := range []string{secret, "./secret.txt"} {
+		if resp := getDownload(t, srv, msgID, p); resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s: expected 404, got %d", p, resp.StatusCode)
+		}
+	}
+}
+
+func TestHandleMessageDownload_DirectoryIsRefused(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	srv, msgID := setupFileServer(t, "", "[dir](sandbox:"+dir+")")
+
+	if resp := getDownload(t, srv, msgID, dir); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.StatusCode)
+	}
+}
+
+// Download capabilities come from the links the UI renders: each run of
+// adjacent text blocks is one GFM document, and an image is not a link.
+func TestHandleMessageDownload_MatchesRenderedLinks(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	for _, name := range []string{"split.txt", "cell.txt", "alt.txt", "extra.txt", "ref.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	text := func(s string) llm.Content { return llm.Content{Type: llm.ContentTypeText, Text: s} }
+	srv, msgID := setupFileServerContent(
+		t, "",
+		text("[x](sandbox:"+dir+"/spl"), text("it.txt)\n\n"+
+			"| A | B |\n| - | - |\n| ` | [c](sandbox:"+dir+"/cell.txt) ` |\n\n"+
+			"| Visible |\n| --- |\n| nothing | [e](sandbox:"+dir+"/extra.txt) |\n\n"+
+			"![alt [a](sandbox:"+dir+"/alt.txt)](/tmp/i.png)\n\n[r][ref]"),
+		llm.Content{Type: llm.ContentTypeToolUse, ToolName: "bash", ToolInput: []byte(`{}`)},
+		text("\n\n[ref]: sandbox:"+dir+"/ref.txt"),
+	)
+
+	for name, want := range map[string]int{
+		"split.txt": http.StatusOK,       // one link across adjacent text blocks
+		"cell.txt":  http.StatusOK,       // a table cell, not a code span across cells
+		"extra.txt": http.StatusNotFound, // GFM drops a row's excess cells
+		"alt.txt":   http.StatusNotFound, // inside an image's alt text
+		"ref.txt":   http.StatusNotFound, // definition is in another run
+	} {
+		if resp := getDownload(t, srv, msgID, dir+"/"+name); resp.StatusCode != want {
+			t.Errorf("%s: expected %d, got %d", name, want, resp.StatusCode)
+		}
 	}
 }

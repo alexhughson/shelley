@@ -1,5 +1,9 @@
 import { test, expect, type Page } from "@playwright/test";
-import { createConversationViaAPI, setPageFeatureFlag } from "./helpers";
+import {
+  createConversationViaAPI,
+  setPageFeatureFlag,
+  startNewConversationFromHeader,
+} from "./helpers";
 
 async function waitForCachedHistory(page: Page, conversationId: string): Promise<void> {
   await page.waitForFunction(
@@ -150,7 +154,7 @@ test.describe("Performance HUD", () => {
       ).__shelleyLoadingStatuses;
       if (statuses) statuses.length = 0;
     });
-    await page.locator(".btn-new").click();
+    await startNewConversationFromHeader(page);
     await expect(page).toHaveURL(/\/new$/);
     const conversationTitle = page
       .locator(".conversation-title")

@@ -1357,6 +1357,10 @@ func toStopReason(reason string) llm.StopReason {
 
 func (s *Service) Provider() string { return s.ProviderName }
 
+func (s *Service) PatchProfile() string {
+	return llm.ModelPatchProfile(s.Model.ModelName)
+}
+
 // DefaultReasoningLevel reports the reasoning effort applied to un-overridden
 // requests, mirroring the precedence used when building a chat-completions
 // request: verbatim per-model ReasoningEffort wins, else a configured
@@ -1661,6 +1665,9 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			// relative "/chat/completions" path.
 			result.URL = cmp.Or(s.ModelURL, model.URL, OpenAIURL) + "/chat/completions"
 			result.Origin = &origin
+			endTime := time.Now()
+			result.StartTime = &retryStart
+			result.EndTime = &endTime
 			return result, nil
 		}
 

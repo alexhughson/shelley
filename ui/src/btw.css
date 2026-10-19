@@ -45,7 +45,7 @@
   background: transparent;
   color: var(--primary);
   cursor: pointer;
-  font-size: 0.75rem;
+  font-size: var(--font-size-12);
   font-weight: 700;
   letter-spacing: 0.08em;
   line-height: 1;
@@ -59,7 +59,7 @@
   max-width: 82%;
   margin: 0;
   color: var(--text-primary);
-  font-size: 0.8125rem;
+  font-size: var(--font-size-13);
   font-weight: 500;
   line-height: 1.45;
   text-align: right;
@@ -71,7 +71,7 @@
   max-width: 96%;
   margin-top: 0.55rem;
   color: var(--text-primary);
-  font-size: 0.8125rem;
+  font-size: var(--font-size-13);
   line-height: 1.55;
   overflow-wrap: anywhere;
 }
@@ -94,7 +94,7 @@
 .btw-inline-tool-count {
   margin-top: 0.3rem;
   color: var(--text-secondary);
-  font-size: 0.75rem;
+  font-size: var(--font-size-12);
 }
 
 .btw-inline-tool-count {
@@ -170,7 +170,7 @@
   background: var(--bg-base);
   color: var(--text-primary);
   font: inherit;
-  font-size: 0.75rem;
+  font-size: var(--font-size-12);
   line-height: 1.35;
 }
 

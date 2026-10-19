@@ -8,6 +8,8 @@
 export interface EphemeralTerminal {
   id: string;
   command: string;
+  // Chosen by the launcher, persisted by the server, and restored on attach.
+  closeOnExit: boolean;
   cwd: string;
   createdAt: Date;
   // conversationId is the conversation that owns this terminal. null means

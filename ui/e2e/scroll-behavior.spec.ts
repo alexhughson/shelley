@@ -2,7 +2,11 @@ import { test, expect, type APIRequestContext } from "@playwright/test";
 import { createServer, type ServerResponse } from "node:http";
 import { once } from "node:events";
 import type { ConversationWithState, StreamResponse } from "../src/types";
-import { createConversationViaAPI, createConversationViaAPIWithDetails } from "./helpers";
+import {
+  openWorkspaceTool,
+  createConversationViaAPI,
+  createConversationViaAPIWithDetails,
+} from "./helpers";
 
 test.describe("Scroll behavior", () => {
   test("auto-pinning does not synchronously read back scrollTop", async ({ page, request }) => {
@@ -673,10 +677,7 @@ test.describe("Scroll behavior", () => {
     const container = page.locator(".messages-container");
     const scrollButton = page.locator(".scroll-to-bottom-button");
     await expect(container).toBeVisible({ timeout: 30000 });
-    await page.evaluate(
-      ({ key }) => localStorage.setItem(key, "bottom"),
-      { key: scrollKey },
-    );
+    await page.evaluate(({ key }) => localStorage.setItem(key, "bottom"), { key: scrollKey });
     await page.reload();
     await expect(scrollButton).toBeHidden({ timeout: 10000 });
     await expect(page.locator(".messages-bottom-sentinel")).toBeAttached({ timeout: 30000 });
@@ -732,8 +733,7 @@ test.describe("Scroll behavior", () => {
     await expect(scrollButton).toBeHidden({ timeout: 10000 });
     await expect(page.locator(".messages-bottom-sentinel")).toBeAttached({ timeout: 30000 });
     await container.evaluate(
-      () =>
-        new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
     );
     const afterWheel = await container.evaluate((element, key) => {
       element.dispatchEvent(new WheelEvent("wheel", { deltaY: -200, bubbles: true }));
@@ -1780,7 +1780,7 @@ test.describe("Cmd/Ctrl+ArrowDown scroll-to-bottom shortcut", () => {
   test("leaves the terminal alone", async ({ page, request }) => {
     // Regression: xterm consumes almost every key, but deliberately passes
     // ArrowDown+Meta through (macOS reserves the chord). It arrives with the
-    // empty .xterm-helper-textarea as the target, and the terminal dock sits
+    // terminal's empty input textarea as the target, and the terminal dock sits
     // below the message list rather than over it, so neither the textarea rule
     // nor the cover check caught it -- Cmd+Down at a shell prompt scrolled the
     // conversation behind the dock.
@@ -1789,9 +1789,10 @@ test.describe("Cmd/Ctrl+ArrowDown scroll-to-bottom shortcut", () => {
     await expect(page.locator('[data-testid="message-input"]')).toBeVisible({ timeout: 30000 });
     await expect(page.getByTestId("message").first()).toBeVisible({ timeout: 30000 });
 
-    await page.locator(".chat-overflow-menu-wrapper .btn-icon").click();
-    await page.locator(".overflow-menu-item", { hasText: /terminal/i }).click();
-    const xtermInput = page.locator(".terminal-panel .xterm-helper-textarea");
+    await openWorkspaceTool(page, "Terminal");
+    const xtermInput = page
+      .locator(".terminal-panel")
+      .getByRole("textbox", { name: "Terminal input", exact: true });
     await expect(xtermInput).toBeVisible({ timeout: 30000 });
     await xtermInput.focus();
 
@@ -1824,8 +1825,7 @@ test.describe("Cmd/Ctrl+ArrowDown scroll-to-bottom shortcut", () => {
     });
     await expect(page.locator(".scroll-to-bottom-button")).toBeVisible({ timeout: 10000 });
 
-    await page.locator(".chat-overflow-menu-wrapper .btn-icon").click();
-    await page.locator(".overflow-menu-item", { hasText: /git graph/i }).click();
+    await openWorkspaceTool(page, "Git Graph");
     await expect(page.locator(".git-graph-container")).toBeVisible({ timeout: 30000 });
 
     await page.keyboard.press("ControlOrMeta+ArrowDown");
@@ -1833,11 +1833,15 @@ test.describe("Cmd/Ctrl+ArrowDown scroll-to-bottom shortcut", () => {
 
     expect(await messagesContainer.evaluate((el) => el.scrollTop)).toBeLessThan(50);
 
-    // ...and it works again once the overlay is gone. Closing the git graph
-    // returns focus to the (empty) composer, so this also re-exercises the
-    // composer-focused path the fix is about.
+    // A persistent header opener keeps focus. Focus the composer to exercise its shortcut.
     await page.keyboard.press("Escape");
     await expect(page.locator(".git-graph-container")).toBeHidden({ timeout: 10000 });
+    await expect(
+      page
+        .locator(".chat-workspace-actions")
+        .getByRole("button", { name: "Git Graph", exact: true }),
+    ).toBeFocused();
+    await page.locator('[data-testid="message-input"]').focus();
     await expect(page.locator('[data-testid="message-input"]')).toBeFocused({ timeout: 10000 });
     await expect(page.locator('[data-testid="message-input"]')).toHaveValue("");
     await page.keyboard.press("ControlOrMeta+ArrowDown");

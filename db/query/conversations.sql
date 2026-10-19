@@ -84,7 +84,13 @@ SELECT sqlc.embed(c),
          WHERE m.conversation_id = c.conversation_id
            AND m.user_email IS NOT NULL AND m.user_email <> ''
          GROUP BY m.user_email
-      ) participant), '[]') AS TEXT) AS participants_json
+      ) participant), '[]') AS TEXT) AS participants_json,
+  -- Subagents ride idx_conversations_parent_id; running jobs ride
+  -- idx_background_jobs_running.
+  CAST((SELECT COUNT(*) FROM conversations sub
+         WHERE sub.parent_conversation_id = c.conversation_id) AS INTEGER) AS subagent_count,
+  CAST((SELECT COUNT(*) FROM background_jobs bj
+         WHERE bj.conversation_id = c.conversation_id AND NOT bj.exited) AS INTEGER) AS running_background_jobs
 FROM conversations c
 WHERE c.archived = FALSE AND c.parent_conversation_id IS NULL
 ORDER BY c.updated_at DESC
@@ -129,7 +135,13 @@ SELECT sqlc.embed(c),
          WHERE m.conversation_id = c.conversation_id
            AND m.user_email IS NOT NULL AND m.user_email <> ''
          GROUP BY m.user_email
-      ) participant), '[]') AS TEXT) AS participants_json
+      ) participant), '[]') AS TEXT) AS participants_json,
+  -- Subagents ride idx_conversations_parent_id; running jobs ride
+  -- idx_background_jobs_running.
+  CAST((SELECT COUNT(*) FROM conversations sub
+         WHERE sub.parent_conversation_id = c.conversation_id) AS INTEGER) AS subagent_count,
+  CAST((SELECT COUNT(*) FROM background_jobs bj
+         WHERE bj.conversation_id = c.conversation_id AND NOT bj.exited) AS INTEGER) AS running_background_jobs
 FROM conversations c
 WHERE c.archived = FALSE
 ORDER BY c.updated_at DESC
@@ -177,7 +189,13 @@ SELECT sqlc.embed(c),
          WHERE m.conversation_id = c.conversation_id
            AND m.user_email IS NOT NULL AND m.user_email <> ''
          GROUP BY m.user_email
-      ) participant), '[]') AS TEXT) AS participants_json
+      ) participant), '[]') AS TEXT) AS participants_json,
+  -- Subagents ride idx_conversations_parent_id; running jobs ride
+  -- idx_background_jobs_running.
+  CAST((SELECT COUNT(*) FROM conversations sub
+         WHERE sub.parent_conversation_id = c.conversation_id) AS INTEGER) AS subagent_count,
+  CAST((SELECT COUNT(*) FROM background_jobs bj
+         WHERE bj.conversation_id = c.conversation_id AND NOT bj.exited) AS INTEGER) AS running_background_jobs
 FROM conversations c
 WHERE c.slug LIKE '%' || ? || '%' AND c.archived = FALSE AND c.parent_conversation_id IS NULL
 ORDER BY c.updated_at DESC
@@ -215,7 +233,13 @@ SELECT DISTINCT sqlc.embed(c),
          WHERE pm.conversation_id = c.conversation_id
            AND pm.user_email IS NOT NULL AND pm.user_email <> ''
          GROUP BY pm.user_email
-      ) participant), '[]') AS TEXT) AS participants_json
+      ) participant), '[]') AS TEXT) AS participants_json,
+  -- Subagents ride idx_conversations_parent_id; running jobs ride
+  -- idx_background_jobs_running.
+  CAST((SELECT COUNT(*) FROM conversations sub
+         WHERE sub.parent_conversation_id = c.conversation_id) AS INTEGER) AS subagent_count,
+  CAST((SELECT COUNT(*) FROM background_jobs bj
+         WHERE bj.conversation_id = c.conversation_id AND NOT bj.exited) AS INTEGER) AS running_background_jobs
 FROM conversations c
 LEFT JOIN messages m ON c.conversation_id = m.conversation_id AND m.type IN ('user', 'agent')
 WHERE c.archived = FALSE
@@ -274,7 +298,13 @@ SELECT sqlc.embed(c),
          WHERE m.conversation_id = c.conversation_id
            AND m.user_email IS NOT NULL AND m.user_email <> ''
          GROUP BY m.user_email
-      ) participant), '[]') AS TEXT) AS participants_json
+      ) participant), '[]') AS TEXT) AS participants_json,
+  -- Subagents ride idx_conversations_parent_id; running jobs ride
+  -- idx_background_jobs_running.
+  CAST((SELECT COUNT(*) FROM conversations sub
+         WHERE sub.parent_conversation_id = c.conversation_id) AS INTEGER) AS subagent_count,
+  CAST((SELECT COUNT(*) FROM background_jobs bj
+         WHERE bj.conversation_id = c.conversation_id AND NOT bj.exited) AS INTEGER) AS running_background_jobs
 FROM conversations c
 WHERE c.parent_conversation_id IS NULL
   AND (
@@ -382,6 +412,12 @@ FROM descendants d
 CROSS JOIN messages m INDEXED BY idx_messages_conv_type_seq
 WHERE m.conversation_id = d.conversation_id
   AND m.type = 'agent' AND m.usage_data IS NOT NULL
+  -- Synthetic end-of-turn markers have usage_data but no tokens or cost.
+  AND (m.usage_data ->> 'input_tokens' > 0
+    OR m.usage_data ->> 'cache_creation_input_tokens' > 0
+    OR m.usage_data ->> 'cache_read_input_tokens' > 0
+    OR m.usage_data ->> 'output_tokens' > 0
+    OR m.usage_data ->> 'cost_usd' > 0)
 GROUP BY m.model_name, m.llm_api_url;
 
 -- name: GetSubagentOtherUsage :many
@@ -418,12 +454,6 @@ GROUP BY je.value ->> 'model', je.value ->> 'url';
 -- name: GetConversationBySlugAndParent :one
 SELECT * FROM conversations
 WHERE slug = ? AND parent_conversation_id = ?;
-
--- name: GetSubagentCounts :many
-SELECT parent_conversation_id, COUNT(*) AS count
-FROM conversations
-WHERE parent_conversation_id IS NOT NULL
-GROUP BY parent_conversation_id;
 
 -- name: UpdateConversationModel :exec
 UPDATE conversations
@@ -502,7 +532,6 @@ SET turn_interrupted = TRUE
 WHERE conversations.conversation_id = sqlc.arg('conversation_id')
   AND conversations.agent_working = TRUE
   AND conversations.turn_interrupted = FALSE
-  AND conversations.parent_conversation_id IS NULL
   AND conversations.current_generation = sqlc.arg('current_generation')
   AND (SELECT COALESCE(MAX(sequence_id), 0)
        FROM messages
@@ -516,18 +545,17 @@ UPDATE conversations
 SET turn_interrupted = FALSE
 WHERE conversation_id = sqlc.arg('conversation_id')
   AND agent_working = TRUE
-  AND turn_interrupted = TRUE
-  AND parent_conversation_id IS NULL;
+  AND turn_interrupted = TRUE;
 
 -- name: MarkUpgradeResumeInterrupted :execrows
 -- Converts a failed automatic resume into the ordinary manual-recovery state,
 -- but only while the startup token still names the same durable turn.
+-- Subagents have no manual resume; they just become idle.
 UPDATE conversations
 SET agent_working = FALSE,
-    turn_interrupted = TRUE
+    turn_interrupted = conversations.parent_conversation_id IS NULL
 WHERE conversations.conversation_id = sqlc.arg('conversation_id')
   AND conversations.agent_working = TRUE
-  AND conversations.parent_conversation_id IS NULL
   AND conversations.current_generation = sqlc.arg('current_generation')
   AND (SELECT COALESCE(MAX(sequence_id), 0)
        FROM messages
@@ -594,3 +622,18 @@ WHERE parent_conversation_id IS NOT NULL
   AND user_initiated = FALSE
   AND conversation_options LIKE '%"kind":"commit-tour"%'
 ORDER BY created_at ASC, rowid ASC;
+
+-- name: CreateChannelConversation :one
+INSERT INTO conversations (conversation_id, user_initiated, model, conversation_options, external_conversation_id, external_endpoint)
+VALUES (?, TRUE, ?, ?, ?, ?)
+RETURNING *;
+
+-- name: GetConversationByExternalID :one
+SELECT * FROM conversations WHERE external_conversation_id = ?;
+
+-- name: ListChannelConversationsWithQueuedMessages :many
+-- Conversations bound to an external chat with queued messages. Used once
+-- at startup to drain them.
+SELECT * FROM conversations
+WHERE external_conversation_id IS NOT NULL AND queued_messages != '[]'
+ORDER BY created_at ASC;

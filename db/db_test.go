@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -150,6 +151,67 @@ func TestDB_Migrate_TracksByName(t *testing.T) {
 	if gotColumn != 1 {
 		t.Fatalf("conversation_options column was not re-added; row keyed by number prevented re-run")
 	}
+}
+
+// Default predates managed profiles: the upgrade marks it built-in and keeps
+// any customization, which also stops shipped updates for it.
+func TestDB_Migrate_MarksDefaultBuiltin(t *testing.T) {
+	for _, settings := range []string{`{}`, `{"model":"custom-default","system_prompt":"Keep my instructions"}`} {
+		t.Run(settings, func(t *testing.T) {
+			db := setupDBMigratedThrough(t, 44)
+			defer db.Close()
+			ctx := t.Context()
+			// Raw SQL: the current generated queries include columns not yet
+			// present in this pre-upgrade fixture.
+			if err := db.Pool().Tx(ctx, func(ctx context.Context, tx *Tx) error {
+				_, err := tx.Exec("UPDATE profiles SET settings = ? WHERE name = 'Default'", settings)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Migrate(ctx); err != nil {
+				t.Fatal(err)
+			}
+			after := listMigrationProfiles(t, db)
+			if p := after[0]; p.Name != "Default" || p.Settings != settings || !p.IsDefault || !p.Builtin || p.UserEdited != (settings != `{}`) {
+				t.Fatalf("upgrade marked Default wrong: %+v", p)
+			}
+		})
+	}
+}
+
+func TestDB_Migrate_KeepsEditedBuiltin(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := t.Context()
+	if err := db.QueriesTx(ctx, func(q *generated.Queries) error {
+		_, err := q.UpdateProfile(ctx, generated.UpdateProfileParams{
+			Name: "Default", Settings: `{"model":"custom-default","system_prompt":"My edited instructions"}`,
+		})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := listMigrationProfiles(t, db)
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if after := listMigrationProfiles(t, db); !slices.Equal(before, after) {
+		t.Fatalf("Migrate reset an edited built-in:\nbefore: %+v\nafter: %+v", before, after)
+	}
+}
+
+func listMigrationProfiles(t *testing.T, db *DB) []generated.Profile {
+	t.Helper()
+	var profiles []generated.Profile
+	if err := db.Queries(t.Context(), func(q *generated.Queries) error {
+		var err error
+		profiles, err = q.ListProfiles(t.Context())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return profiles
 }
 
 func TestDB_WithTx(t *testing.T) {
@@ -765,5 +827,70 @@ func TestCreateMessageFoldsAgentWorkingAndTimestamp(t *testing.T) {
 		MarkAgentDone:  true,
 	}); err == nil {
 		t.Fatalf("expected error when both MarkAgentStart and MarkAgentDone are set")
+	}
+}
+
+// Jobs already notified had exited; the rest stay running until watched.
+func TestBackgroundJobsExitedMigration(t *testing.T) {
+	database := setupDBMigratedThrough(t, 41)
+	defer database.Close()
+	ctx := t.Context()
+	// Raw SQL: generated queries assume the latest schema.
+	err := database.pool.Tx(ctx, func(ctx context.Context, tx *Tx) error {
+		if _, err := tx.Exec(`INSERT INTO conversations (conversation_id, user_initiated) VALUES ('c', TRUE)`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO background_jobs (job_id, conversation_id, tool_use_id, command, pid, process_start_time, log_path, exit_path, started_at, notified)
+			VALUES ('done', 'c', '', '', 0, 0, '', '', CURRENT_TIMESTAMP, TRUE), ('pending', 'c', '', '', 0, 0, '', '', CURRENT_TIMESTAMP, FALSE)`)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var running []generated.BackgroundJob
+	err = database.Queries(ctx, func(q *generated.Queries) error {
+		var err error
+		running, err = q.ListRunningBackgroundJobs(ctx, "c")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(running) != 1 || running[0].JobID != "pending" {
+		t.Fatalf("running jobs = %+v, want only pending", running)
+	}
+}
+
+// Conversations from before copy-on-write keep their settings.
+func TestDB_Migrate_MarksExistingConversationsEdited(t *testing.T) {
+	db := setupDBMigratedThrough(t, 45)
+	defer db.Close()
+	ctx := t.Context()
+	withProfile, err := db.CreateConversation(ctx, nil, true, nil, nil, ConversationOptions{Profile: "Default", ThinkingLevel: "high"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	without, err := db.CreateConversation(ctx, nil, true, nil, nil, ConversationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		id     string
+		edited bool
+	}{{withProfile.ConversationID, true}, {without.ConversationID, false}} {
+		conv, err := db.GetConversationByID(ctx, tc.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts := ParseConversationOptions(conv.ConversationOptions)
+		if opts.SettingsEdited != tc.edited || (tc.edited && opts.ThinkingLevel != "high") {
+			t.Fatalf("migrated options %s: %+v", conv.ConversationOptions, opts)
+		}
 	}
 }

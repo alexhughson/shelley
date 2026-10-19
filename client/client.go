@@ -4,10 +4,12 @@ package client
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -29,8 +31,10 @@ func DefaultSocketPath() string {
 	return filepath.Join(configDir, "shelley", "shelley.sock")
 }
 
+// defaultClientURL is the socket of the Shelley server running this command
+// ($SHELLEY_SOCKET), else the default socket.
 func defaultClientURL() string {
-	return "unix://" + DefaultSocketPath()
+	return "unix://" + cmp.Or(os.Getenv("SHELLEY_SOCKET"), DefaultSocketPath())
 }
 
 func parseClientURL(rawURL string) (scheme, address string, err error) {
@@ -120,6 +124,7 @@ func Run(args []string) {
 		fmt.Fprintf(fs.Output(), "  tag      Show/add/remove a conversation's tags\n")
 		fmt.Fprintf(fs.Output(), "  tags     List tags already in use\n")
 		fmt.Fprintf(fs.Output(), "  archive  Archive a conversation\n")
+		fmt.Fprintf(fs.Output(), "  call-transcript  Print a voice call's transcript\n")
 		fmt.Fprintf(fs.Output(), "  help     Print detailed help\n")
 	}
 	fs.Parse(args)
@@ -157,6 +162,8 @@ func Run(args []string) {
 		cmdTags(cc, subArgs[1:])
 	case "archive":
 		cmdArchive(cc, subArgs[1:])
+	case "call-transcript":
+		cmdCallTranscript(cc, subArgs[1:])
 	case "help":
 		cmdHelp()
 	default:
@@ -729,6 +736,49 @@ func cmdArchive(cc *clientConfig, args []string) {
 	fmt.Fprintf(os.Stderr, "Archived %s\n", conversationID)
 }
 
+func cmdCallTranscript(cc *clientConfig, args []string) {
+	fs := flag.NewFlagSet("client call-transcript", flag.ExitOnError)
+	conversationID := fs.String("c", os.Getenv("SHELLEY_CONVERSATION_ID"), "conversation (default: $SHELLEY_CONVERSATION_ID)")
+	fs.Parse(args)
+	if fs.NArg() != 1 || *conversationID == "" {
+		fmt.Fprintf(os.Stderr, "Usage: shelley client call-transcript [-c CONVERSATION_ID] CALL\n")
+		os.Exit(1)
+	}
+	client, baseURL, err := cc.newHTTPClient()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	transcript, err := fetchCallTranscript(cc, client, baseURL, *conversationID, fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Print(transcript)
+}
+
+// fetchCallTranscript reads a voice call's saved transcript.
+func fetchCallTranscript(cc *clientConfig, client *http.Client, baseURL, conversationID, call string) (string, error) {
+	u := baseURL + "/api/conversation/" + url.PathEscape(conversationID) + "/call/" + url.PathEscape(call) + "/transcript"
+	req, err := cc.newRequest("GET", u, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return string(body), nil
+}
+
 // --- Wire types for JSON parsing ---
 
 type streamResponseWire struct {
@@ -821,7 +871,7 @@ Usage:
   shelley client [flags] <subcommand> [args...]
 
 Flags:
-  -url URL     Server URL (default: unix://%s)
+  -url URL     Server URL (default: unix://$SHELLEY_SOCKET if set, else unix://%s)
   -H HEADER    Extra HTTP header "Name: Value" (can be repeated)
 
 Subcommands:
@@ -873,6 +923,12 @@ Subcommands:
 
   archive CONVERSATION_ID
       Archive a conversation.
+
+  call-transcript [-c CONVERSATION_ID] CALL
+      Print a voice call's saved transcript, one line per turn, numbered
+      by its last caption; captions are numbered 1, 2, ... through the call.
+      Calls are numbered 1, 2, ... within their conversation, which
+      defaults to $SHELLEY_CONVERSATION_ID.
 
   help
       Print this help text.

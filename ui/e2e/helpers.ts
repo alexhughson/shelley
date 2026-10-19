@@ -1,10 +1,44 @@
-import { expect, type APIRequestContext, type Page } from "@playwright/test";
+import { expect, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { hermeticGitEnvironment } from "../scripts/git-test-env";
+
+export async function openWorkspaceTool(page: Page, name: string): Promise<void> {
+  // Phones keep workspace tools in the overflow menu, so the toolbar is
+  // empty there.
+  await expect(page.locator(".header")).toBeVisible();
+  const button = page.locator(".chat-workspace-actions").getByRole("button", { name, exact: true });
+  if (await button.isVisible()) {
+    await button.click();
+    return;
+  }
+  await page.getByRole("button", { name: "More options", exact: true }).click();
+  await page
+    .locator(".chat-overflow-popover")
+    .getByRole("button", { name: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`) })
+    .click();
+}
+
+export async function startNewConversationFromHeader(page: Page): Promise<void> {
+  const button = page
+    .locator(".header")
+    .getByRole("button", { name: "New Conversation", exact: true });
+  if (await button.isVisible()) {
+    await button.click();
+    return;
+  }
+  await page.getByRole("button", { name: "More options", exact: true }).click();
+  await page
+    .locator(".chat-overflow-popover")
+    .getByRole("button", {
+      name: "New Conversation",
+      exact: true,
+    })
+    .click();
+}
 
 export function git(cwd: string, ...args: string[]): string {
   return execFileSync(
@@ -49,6 +83,7 @@ interface CreateConversationOptions {
   agentTimeout?: number;
   cwd?: string;
   model?: string;
+  conversationOptions?: Record<string, unknown>;
 }
 
 function sanitizeSlug(input: string): string {
@@ -134,9 +169,14 @@ export async function createConversationViaAPIWithDetails(
   message: string,
   opts: CreateConversationOptions = {},
 ): Promise<CreatedConversation> {
-  const { agentTimeout = 30000, cwd = testWorkingDirectory(), model = "predictable" } = opts;
+  const {
+    agentTimeout = 30000,
+    cwd = testWorkingDirectory(),
+    model = "predictable",
+    conversationOptions,
+  } = opts;
   const newResp = await request.post("/api/conversations/new", {
-    data: { message, model, cwd },
+    data: { message, model, cwd, conversation_options: conversationOptions },
   });
   expect(newResp.ok()).toBeTruthy();
   const { conversation_id: conversationId } = await newResp.json();
@@ -192,6 +232,35 @@ export async function setPageFeatureFlag(page: Page, name: string, value: boolea
     },
     [name, value] as const,
   );
+}
+
+/** End the terminals running in `cwd`. Every page load replays every running
+ *  terminal on the shared server, so ones left running slow later tests. */
+export async function closeTerminalsIn(request: APIRequestContext, cwd: string): Promise<void> {
+  const terminals: Array<{ id: string; cwd: string }> = await (
+    await request.get("/api/terminals")
+  ).json();
+  for (const { id } of terminals.filter((terminal) => terminal.cwd === cwd)) {
+    expect((await request.delete(`/api/terminals/${id}`)).ok()).toBe(true);
+  }
+}
+
+/** Choose `item` from the terminal panel's menu. */
+export async function chooseTerminalMenuItem(page: Page, item: string): Promise<void> {
+  await page.getByRole("button", { name: "Terminal menu", exact: true }).click();
+  await page
+    .locator(".overflow-menu-panel")
+    .getByRole("button", { name: item, exact: true })
+    .click();
+}
+
+/** Have terminals on this page render with `renderer`, as if chosen in the
+ *  terminal panel's menu. Call before the first `page.goto(...)`. */
+export async function setPageTerminalRenderer(
+  page: Page,
+  renderer: "ghostty" | "xterm",
+): Promise<void> {
+  await page.addInitScript((r) => localStorage.setItem("shelley-terminal-renderer", r), renderer);
 }
 
 /** Run `fn` with a fresh temp directory, removing it afterwards. Specs that
@@ -265,4 +334,39 @@ function crc32(buf: Buffer): number {
   let c = -1;
   for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
   return (c ^ -1) >>> 0;
+}
+
+// Recording needs a transcription route, which the predictable-only test
+// server never has; specs that record mock the chat endpoint instead.
+export async function installTranscriptionAvailability(page: Page, available: boolean) {
+  await page.addInitScript((transcriptionAvailable) => {
+    let init: Record<string, unknown> | undefined;
+    Object.defineProperty(window, "__SHELLEY_INIT__", {
+      configurable: true,
+      get: () => init,
+      set: (value) => {
+        init = { ...value, transcription_available: transcriptionAvailable };
+      },
+    });
+  }, available);
+}
+
+// Keep link ordering deliberate: the VM link is not the first configured link.
+export async function installServerLinks(page: Page, includeVM = true) {
+  const links = [
+    { title: "Manage on exe.dev", url: "https://exe.example/vm/vm" },
+    ...(includeVM ? [{ title: "vm.example", url: "https://vm.example/website" }] : []),
+    { title: "Documentation", url: "https://docs.example/documentation" },
+  ];
+  await page.addInitScript((serverLinks) => {
+    let init: Record<string, unknown> | undefined;
+    Object.defineProperty(window, "__SHELLEY_INIT__", {
+      configurable: true,
+      get: () => init,
+      set: (value) => {
+        init = { ...value, hostname: "vm.example", links: serverLinks };
+      },
+    });
+  }, links);
+  return links;
 }

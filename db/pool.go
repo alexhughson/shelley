@@ -23,8 +23,9 @@ type Pool struct {
 	writer  chan *sql.Conn
 	readers chan *sql.Conn
 
-	hooksMu     sync.RWMutex
-	commitHooks []func()
+	hooksMu       sync.RWMutex
+	commitHooks   []func()
+	diskFullHooks []func()
 }
 
 // OnCommit registers a callback fired synchronously after each successful Tx
@@ -39,6 +40,28 @@ func (p *Pool) OnCommit(fn func()) {
 func (p *Pool) fireCommitHooks() {
 	p.hooksMu.RLock()
 	hooks := p.commitHooks
+	p.hooksMu.RUnlock()
+	for _, fn := range hooks {
+		fn()
+	}
+}
+
+// OnDiskFull registers fn to run after any Tx, Rx, or Exec fails because the
+// disk is full. fn runs synchronously on the caller's goroutine after the
+// connection has been returned, so it must not block.
+func (p *Pool) OnDiskFull(fn func()) {
+	p.hooksMu.Lock()
+	defer p.hooksMu.Unlock()
+	p.diskFullHooks = append(p.diskFullHooks, fn)
+}
+
+// checkDiskFull runs the disk-full hooks if err is a disk-full error.
+func (p *Pool) checkDiskFull(err error) {
+	if !IsDiskFull(err) {
+		return
+	}
+	p.hooksMu.RLock()
+	hooks := p.diskFullHooks
 	p.hooksMu.RUnlock()
 	for _, fn := range hooks {
 		fn()
@@ -78,9 +101,11 @@ func NewPool(dataSourceName string, readerCount int) (*Pool, error) {
 	}
 	p.writer <- conns[0]
 	for _, conn := range conns[1:] {
-		if _, err := conn.ExecContext(context.Background(), "PRAGMA query_only=1;"); err != nil {
+		// temp_store=MEMORY keeps read-side sorts and temp tables off the
+		// disk, so reads keep working when the disk is full.
+		if _, err := conn.ExecContext(context.Background(), "PRAGMA query_only=1; PRAGMA temp_store=MEMORY;"); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("NewPool query_only: %w", err)
+			return nil, fmt.Errorf("NewPool reader pragmas: %w", err)
 		}
 		p.readers <- conn
 	}
@@ -157,7 +182,7 @@ func checkNoTx(ctx context.Context, typ string) {
 // Exec executes a single statement outside of a transaction.
 // Useful in the rare case of PRAGMAs that cannot execute inside a tx,
 // such as PRAGMA wal_checkpoint.
-func (p *Pool) Exec(ctx context.Context, query string, args ...interface{}) error {
+func (p *Pool) Exec(ctx context.Context, query string, args ...interface{}) (err error) {
 	checkNoTx(ctx, "Tx")
 	var conn *sql.Conn
 	select {
@@ -165,9 +190,9 @@ func (p *Pool) Exec(ctx context.Context, query string, args ...interface{}) erro
 		return fmt.Errorf("Pool.Exec: %w", ctx.Err())
 	case conn = <-p.writer:
 	}
-	var err error
 	defer func() {
 		p.writer <- conn
+		p.checkDiskFull(err)
 	}()
 	_, err = conn.ExecContext(ctx, query, args...)
 	return wrapErr("pool.exec", err)
@@ -217,6 +242,7 @@ func (p *Pool) Tx(ctx context.Context, fn func(ctx context.Context, tx *Tx) erro
 		if committed {
 			p.fireCommitHooks()
 		}
+		p.checkDiskFull(err)
 	}()
 	if ctxErr := tx.ctx.Err(); ctxErr != nil {
 		return ctxErr // fast path for canceled context
@@ -254,6 +280,7 @@ func (p *Pool) Rx(ctx context.Context, fn func(ctx context.Context, rx *Rx) erro
 		// always return conn,
 		// either the entire database is closed or the conn is fine.
 		rx.p.readers <- conn
+		p.checkDiskFull(err)
 	}()
 	if ctxErr := rx.ctx.Err(); ctxErr != nil {
 		return ctxErr // fast path for canceled context

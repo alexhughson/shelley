@@ -25,6 +25,12 @@
   </div>
 
   <template v-else>
+    <div v-if="error" class="error-banner" role="alert">
+      <div class="error-banner-content">
+        <span class="error-message">{{ error }}</span>
+        <Button label="Dismiss" text @click="error = null" />
+      </div>
+    </div>
     <div v-if="banner" class="top-banner" :title="banner">{{ banner }}</div>
     <div class="app-container">
       <ConversationDrawer
@@ -35,6 +41,7 @@
         :current-conversation-id="currentConversationId"
         :viewed-conversation="viewedConversation"
         :show-active-trigger="showActiveTrigger"
+        :message-sent-trigger="messageSentTrigger"
         @close="drawerOpen = false"
         @toggle-collapse="toggleDrawerCollapsed"
         @select-conversation="selectConversation"
@@ -57,7 +64,9 @@
           :on-select-conversation="selectConversation"
           :on-archive-conversation="archiveFromChat"
           :current-conversation="currentConversation"
+          :conversations="conversations"
           :on-conversation-update="updateConversation"
+          :on-message-sent="handleMessageSent"
           :on-first-message="handleFirstMessage"
           :on-draft-created="onDraftCreated"
           :on-distill-new-generation="handleDistillNewGeneration"
@@ -70,6 +79,7 @@
           :models-refresh-trigger="modelsRefreshTrigger"
           :cwd-sync-trigger="cwdSyncTrigger"
           :on-open-models-modal="() => (modelsModalOpen = true)"
+          :on-open-mcp-servers-modal="() => (mcpServersModalOpen = true)"
           :on-open-file-finder="openFileFinder"
           :on-open-command-palette="() => (commandPaletteOpen = true)"
           :ephemeral-terminals="ephemeralTerminals"
@@ -143,6 +153,12 @@
             commandPaletteOpen = false;
           }
         "
+        @open-mcp-servers-modal="
+          () => {
+            mcpServersModalOpen = true;
+            commandPaletteOpen = false;
+          }
+        "
         @open-integrations-modal="
           () => {
             integrationsModalOpen = true;
@@ -161,6 +177,12 @@
             commandPaletteOpen = false;
           }
         "
+        @open-favicon-emoji-picker="
+          () => {
+            faviconEmojiPickerOpen = true;
+            commandPaletteOpen = false;
+          }
+        "
         @next-conversation="navigateToNextConversation"
         @previous-conversation="navigateToPreviousConversation"
         @next-user-message="navigateToNextUserMessage"
@@ -176,6 +198,18 @@
           }
         "
         @models-changed="modelsRefreshTrigger++"
+      />
+
+      <McpServersModal
+        :is-open="mcpServersModalOpen"
+        :login-result="mcpLoginResult"
+        @close="
+          () => {
+            mcpServersModalOpen = false;
+            mcpLoginResult = null;
+            focusMessageInputIfUnfocused();
+          }
+        "
       />
 
       <IntegrationsModal
@@ -214,6 +248,16 @@
         "
       />
 
+      <FaviconEmojiPicker
+        :is-open="faviconEmojiPickerOpen"
+        @close="
+          () => {
+            faviconEmojiPickerOpen = false;
+            focusMessageInputIfUnfocused();
+          }
+        "
+      />
+
       <FileFinderModal
         :is-open="fileFinderOpen"
         :initial-dir="finderDir"
@@ -242,7 +286,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, provide, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, provide, ref, watch, shallowRef } from "vue";
 import ChatInterface from "./components/ChatInterface.vue";
 import type { RecordingMode } from "./components/recordingDestination";
 import { isImeComposing } from "../utils/imeComposing";
@@ -250,9 +294,11 @@ import { comboMatches, MENU_COMBOS } from "../utils/menuShortcuts";
 import ConversationDrawer from "./components/ConversationDrawer.vue";
 import CommandPalette from "./components/CommandPalette.vue";
 import ModelsModal from "./components/ModelsModal.vue";
+import McpServersModal from "./components/McpServersModal.vue";
 import IntegrationsModal from "./components/IntegrationsModal.vue";
 import NotificationsModal from "./components/NotificationsModal.vue";
 import FeatureFlagsModal from "./components/FeatureFlagsModal.vue";
+import FaviconEmojiPicker from "./components/FaviconEmojiPicker.vue";
 import FileFinderModal from "./components/FileFinderModal.vue";
 import EditableFileModal from "./components/EditableFileModal.vue";
 import Button from "primevue/button";
@@ -265,8 +311,9 @@ import {
   type ConversationWithState,
   type ConversationListPatchEvent,
   type DiskSpaceStatus,
+  type ChatRequest,
 } from "../types";
-import { api } from "../services/api";
+import { api, ApiError } from "../services/api";
 import { btwStore } from "../services/btwStore";
 import { messageStore } from "../services/messageStore";
 import {
@@ -345,7 +392,8 @@ function updatePageTitle(conversation: Conversation | undefined) {
 const banner = window.__SHELLEY_INIT__?.banner;
 
 // ---- state ----
-const conversations = ref<ConversationWithState[]>([]);
+// Patches replace the list (and only the rows they touch), so deep reactivity is unnecessary.
+const conversations = shallowRef<ConversationWithState[]>([]);
 const currentConversationId = ref<string | null>(null);
 // Subagent tool widgets (SubagentTool.vue) join their slug against the live
 // conversation list to show what the subagent is doing right now.
@@ -365,9 +413,24 @@ const diffViewerTrigger = ref(0);
 const gitGraphTrigger = ref(0);
 const terminalTrigger = ref(0);
 const modelsModalOpen = ref(false);
+// The MCP login callback redirects to /?mcp_login=NAME, with &mcp_error=MSG if
+// it failed (or only ?mcp_error=MSG): show that in the MCP Servers dialog.
+const mcpLoginResult = ref(takeMcpLoginResult());
+const mcpServersModalOpen = ref(mcpLoginResult.value !== null);
+function takeMcpLoginResult() {
+  const url = new URL(window.location.href);
+  const name = url.searchParams.get("mcp_login");
+  const error = url.searchParams.get("mcp_error");
+  if (name === null && error === null) return null;
+  url.searchParams.delete("mcp_login");
+  url.searchParams.delete("mcp_error");
+  window.history.replaceState(window.history.state, "", url);
+  return { name, error };
+}
 const integrationsModalOpen = ref(false);
 const notificationsModalOpen = ref(false);
 const featureFlagsModalOpen = ref(false);
+const faviconEmojiPickerOpen = ref(false);
 // Fuzzy file finder (Cmd/Ctrl+P) + the generic editor it opens.
 const fileFinderOpen = ref(false);
 const editorFilePath = ref<string | null>(null);
@@ -383,13 +446,19 @@ const error = ref<string | null>(null);
 const ephemeralTerminals = ref<EphemeralTerminal[]>([]);
 const streamStatus = ref<StreamStatus>("connected");
 // Server-wide low-disk notice; the server sends a snapshot on every (re)connect.
+// Revisions only order statuses from one server process: a transition that
+// could not be persisted (e.g. the disk was full) is lost on restart, so a
+// snapshot is accepted even when its revision is older.
 const diskSpaceStatus = ref<DiskSpaceStatus | null>(null);
-function applyDiskSpaceStatus(status: DiskSpaceStatus) {
-  if (diskSpaceStatus.value && status.revision < diskSpaceStatus.value.revision) return;
+function applyDiskSpaceStatus(status: DiskSpaceStatus, snapshot = false) {
+  if (!snapshot && diskSpaceStatus.value && status.revision < diskSpaceStatus.value.revision) {
+    return;
+  }
   diskSpaceStatus.value = status;
 }
 const reconnectNonce = ref(0);
 const showActiveTrigger = ref(0);
+const messageSentTrigger = ref(0);
 
 // ---- non-reactive refs ----
 let initialSlugResolved = false;
@@ -404,8 +473,10 @@ function setEphemeralTerminals(
   ephemeralTerminals.value = typeof next === "function" ? next(ephemeralTerminals.value) : next;
 }
 
-function handleTerminalAttached(id: string, termId: string) {
-  setEphemeralTerminals((prev) => prev.map((tm) => (tm.id === id ? { ...tm, termId } : tm)));
+function handleTerminalAttached(id: string, termId: string, closeOnExit: boolean) {
+  setEphemeralTerminals((prev) =>
+    prev.map((tm) => (tm.id === id ? { ...tm, termId, closeOnExit } : tm)),
+  );
 }
 
 // Applied only after the server has persisted the new scope.
@@ -442,17 +513,19 @@ const currentConversation = computed<ConversationWithState | undefined>(() => {
       ...viewedConversation.value,
       working: false,
       subagent_count: 0,
+      running_background_jobs: 0,
       max_sequence_id: 0,
     } as ConversationWithState;
   }
   return undefined;
 });
 
-const mostRecentCwd = computed(
-  () =>
-    currentConversation.value?.cwd ||
-    (topLevelConversations.value.length > 0 ? topLevelConversations.value[0].cwd : null),
-);
+const mostRecentCwd = computed(() => {
+  const conversation = currentConversation.value?.cwd
+    ? currentConversation.value
+    : topLevelConversations.value[0];
+  return conversation?.git_worktree_root || conversation?.cwd;
+});
 
 const commandPaletteHasCwd = computed(
   () =>
@@ -601,21 +674,42 @@ async function loadConversations() {
     }
   } catch (err) {
     console.error("Failed to load conversations:", err);
-    error.value = "Failed to load conversations. Please refresh the page.";
+    // The server's reason (e.g. a full disk) beats a generic line.
+    error.value = err instanceof ApiError ? err.message : t("failedToLoadConversations");
   } finally {
     loading.value = false;
   }
 }
 
 // ---- conversation actions ----
-function startNewConversation() {
-  if (currentConversation.value?.cwd) {
-    localStorage.setItem("shelley_selected_cwd", currentConversation.value.cwd);
+async function startNewConversation(): Promise<boolean> {
+  error.value = null;
+  const conversation = currentConversation.value;
+  let cwd = conversation?.git_worktree_root || conversation?.cwd;
+  // Conversations opened outside the list (e.g. archived ones) have no git metadata.
+  if (
+    cwd &&
+    !conversations.value.some((c) => c.conversation_id === conversation?.conversation_id)
+  ) {
+    try {
+      const directory = await api.listDirectory(cwd);
+      if (currentConversationId.value !== conversation?.conversation_id) return false;
+      if (directory.error) throw new Error(directory.error);
+      cwd = directory.git_worktree_root || cwd;
+    } catch (err) {
+      if (currentConversationId.value !== conversation?.conversation_id) return false;
+      error.value = err instanceof Error ? err.message : "Failed to resolve working directory";
+      return false;
+    }
+  }
+  if (cwd) {
+    localStorage.setItem("shelley_selected_cwd", cwd);
   }
   currentConversationId.value = null;
   viewedConversation.value = null;
   window.history.replaceState({}, "", "/new");
   drawerOpen.value = false;
+  return true;
 }
 
 function startNewConversationWithCwd(cwd: string) {
@@ -658,6 +752,10 @@ function updateConversation(updatedConversation: Conversation) {
   if (updatedConversation.conversation_id === currentConversationId.value) {
     viewedConversation.value = updatedConversation;
   }
+}
+
+function handleMessageSent(conversationId: string) {
+  if (conversationId === currentConversationId.value) messageSentTrigger.value++;
 }
 
 function handleConversationArchived(
@@ -753,28 +851,19 @@ async function handleFirstMessage(
   message: string,
   model: string,
   cwd?: string,
-  toolOverrides?: Record<string, "on" | "off">,
-  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
+  conversationOptions?: ChatRequest["conversation_options"],
 ) {
   try {
-    const hasOverrides = toolOverrides && Object.keys(toolOverrides).length > 0;
-    const hasThinking = !!thinkingLevel;
-    const convOpts =
-      hasOverrides || hasThinking
-        ? {
-            ...(hasOverrides ? { tool_overrides: toolOverrides } : {}),
-            ...(hasThinking ? { thinking_level: thinkingLevel } : {}),
-          }
-        : undefined;
     const response = await api.sendMessageWithNewConversation({
       message,
       model,
       cwd,
-      conversation_options: convOpts,
+      conversation_options: conversationOptions,
     });
     const newConversationId = response.conversation_id;
     messageStore.setAgentWorking(newConversationId, true);
     currentConversationId.value = newConversationId;
+    handleMessageSent(newConversationId);
   } catch (err) {
     console.error("Failed to send first message:", err);
     error.value = err instanceof Error ? err.message : "Failed to send message";
@@ -941,6 +1030,7 @@ onMounted(() => {
         rows: Array<{
           id: string;
           command: string;
+          close_on_exit: boolean;
           cwd: string;
           conversation_id: string | null;
           created_at: string;
@@ -955,6 +1045,7 @@ onMounted(() => {
               id: r.id,
               termId: r.id,
               command: r.command,
+              closeOnExit: r.close_on_exit,
               cwd: r.cwd,
               conversationId: r.conversation_id ?? null,
               createdAt: new Date(r.created_at || Date.now()),

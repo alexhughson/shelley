@@ -13,10 +13,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
 	"time"
+	"unicode/utf8"
 
 	"shelley.exe.dev/exeenv"
 	"shelley.exe.dev/skills"
@@ -39,7 +41,169 @@ type SystemPromptData struct {
 	DefaultPort      int    // For exe.dev, the auto-routed HTTP port, 0 if unknown
 	SkillsXML        string // XML block for available skills
 	Skills           []skills.Skill
-	UserEmail        string // The exe.dev auth email of the user, if known
+	UserEmail        string          // The exe.dev auth email of the user, if known
+	MCPServers       []MCPServerInfo // Registered MCP servers, for the mcp skill
+
+	template string // the template to render, "" for the built-in one
+}
+
+// SystemPromptVariable documents a field of SystemPromptData for people
+// writing their own system prompt templates.
+type SystemPromptVariable struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// systemPromptVariables are the fields a system prompt template can use.
+var systemPromptVariables = []SystemPromptVariable{
+	{".WorkingDirectory", "The conversation's working directory."},
+	{".UserEmail", "The user's exe.dev email; empty if unknown."},
+	{".GitInfo.Root", "The git repository root. .GitInfo is nil outside a repository."},
+	{".IsExeDev", "Whether Shelley runs on an exe.dev VM."},
+	{".Hostname", "On exe.dev, the VM's public hostname (vmname.exe.xyz)."},
+	{".DefaultPort", "On exe.dev, the port served at the hostname; 0 if unknown."},
+	{".IsSudoAvailable", "Whether passwordless sudo works."},
+	{".Codebase.InjectFiles", "Paths of the root guidance files (AGENTS.md, CLAUDE.md, …). .Codebase is nil if they couldn't be read."},
+	{".Codebase.InjectFileContents", "Map from guidance file path to its contents."},
+	{".Codebase.SubdirGuidanceSummary", "A list of the guidance files in subdirectories."},
+	{".SkillsXML", "The available skills, as an XML block."},
+	{".Skills", "The available skills: .Name, .Description, .Activate, …"},
+	{".MCPServersXML", "The registered MCP servers, as an XML block."},
+}
+
+// validateSystemPromptTemplate reports why tmpl can't be rendered, by
+// rendering it against data with every optional part absent, and present:
+// outside a git repository, say, GitInfo is nil.
+func validateSystemPromptTemplate(tmpl string) *TemplateProblem {
+	for _, data := range []*SystemPromptData{{template: tmpl}, {
+		WorkingDirectory: "/home/user/project",
+		GitInfo:          &GitInfo{Root: "/home/user/project"},
+		Codebase: &CodebaseInfo{
+			InjectFiles:         []string{"/home/user/project/AGENTS.md"},
+			InjectFileContents:  map[string]string{"/home/user/project/AGENTS.md": "guidance"},
+			SubdirGuidanceFiles: []string{"/home/user/project/ui/AGENTS.md"},
+		},
+		IsExeDev:        true,
+		IsSudoAvailable: true,
+		Hostname:        "vm.exe.xyz",
+		DefaultPort:     8000,
+		SkillsXML:       "<available_skills></available_skills>",
+		Skills:          []skills.Skill{{Name: "skill", Description: "A skill."}},
+		UserEmail:       "user@example.com",
+		MCPServers:      []MCPServerInfo{{Name: "server", Description: "An MCP server."}},
+		template:        tmpl,
+	}} {
+		if _, err := renderSystemPrompt(data); err != nil {
+			return err.(*TemplateProblem)
+		}
+	}
+	return nil
+}
+
+// renderSystemPrompt renders data's template. Its errors are
+// *TemplateProblem.
+func renderSystemPrompt(data *SystemPromptData) (string, error) {
+	text := data.template
+	if text == "" {
+		text = systemPromptTemplate
+	}
+	tmpl, err := template.New("system_prompt").Option("missingkey=error").Parse(text)
+	if err != nil {
+		return "", templateProblemOf(text, err)
+	}
+	var buf strings.Builder
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return "", templateProblemOf(text, err)
+	}
+	return collapseBlankLines(buf.String()), nil
+}
+
+// TemplateProblem is why a system prompt template can't be rendered, and
+// where: a line, and within it a column in characters, both counted from
+// 1, and 0 if unknown.
+type TemplateProblem struct {
+	Line    int    `json:"line,omitempty"`
+	Column  int    `json:"column,omitempty"`
+	Message string `json:"message"`
+}
+
+func (p *TemplateProblem) Error() string {
+	if p.Line == 0 {
+		return p.Message
+	}
+	return fmt.Sprintf("line %d: %s", p.Line, p.Message)
+}
+
+var (
+	// template: system_prompt:49:2: executing "sub" at <.X>: detail
+	// (49:2 is a line and a 0-based byte offset in it).
+	templateErrorRe = regexp.MustCompile(`(?s)^template: system_prompt:(\d+)(?::(\d+))?: (.*)$`)
+	templateExecRe  = regexp.MustCompile(`(?s)^executing ".*?" at <(.*?)>: (.*)$`)
+)
+
+// templateProblemOf says what err, from parsing or executing the system
+// prompt template text, means for the person who wrote it.
+func templateProblemOf(text string, err error) *TemplateProblem {
+	m := templateErrorRe.FindStringSubmatch(err.Error())
+	if m == nil {
+		return &TemplateProblem{Message: err.Error()}
+	}
+	p := &TemplateProblem{Message: m[3]}
+	p.Line, _ = strconv.Atoi(m[1])
+	if m[2] != "" {
+		offset, _ := strconv.Atoi(m[2])
+		if lines := strings.Split(text, "\n"); p.Line >= 1 && p.Line <= len(lines) && offset <= len(lines[p.Line-1]) {
+			p.Column = 1 + utf8.RuneCountInString(lines[p.Line-1][:offset])
+		}
+	}
+	if m := templateExecRe.FindStringSubmatch(p.Message); m != nil {
+		expr, detail := m[1], m[2]
+		switch {
+		case strings.HasPrefix(detail, "can't evaluate field "):
+			p.Message = "unknown variable " + expr
+		case strings.HasPrefix(detail, "nil pointer evaluating "):
+			parent := expr
+			if i := strings.LastIndex(expr, "."); i > 0 {
+				parent = expr[:i]
+			}
+			p.Message = fmt.Sprintf("%s can be missing; use it inside {{if %s}}…{{end}}", parent, parent)
+		default:
+			p.Message = expr + ": " + detail
+		}
+	} else if p.Message == "unexpected EOF" {
+		p.Message = "the template ends before a }} or {{end}}"
+	}
+	return p
+}
+
+// MCPServerInfo is a registered MCP server, named in the system prompt so the
+// model knows which external services it can reach with `shelley mcp`.
+type MCPServerInfo struct {
+	Name        string
+	Description string
+}
+
+// MCPServersXML renders the registered MCP servers as a block for the system
+// prompt, or "" when none are registered.
+func (d *SystemPromptData) MCPServersXML() string { return mcpServersXML(d.MCPServers) }
+
+// mcpServersXML renders servers as an <mcp_servers> block, or "" when empty.
+func mcpServersXML(servers []MCPServerInfo) string {
+	if len(servers) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("<mcp_servers>\n")
+	b.WriteString("These MCP servers are registered. Reach them with `shelley mcp` (see the mcp skill); they are not model tools.\n")
+	for _, s := range servers {
+		if desc := strings.TrimSpace(s.Description); desc != "" {
+			fmt.Fprintf(&b, "- %s: %s\n", s.Name, desc)
+		} else {
+			fmt.Fprintf(&b, "- %s\n", s.Name)
+		}
+	}
+	b.WriteString("</mcp_servers>")
+	return b.String()
 }
 
 // DBPath is the path to the shelley database, set at startup
@@ -87,6 +251,21 @@ func WithUserEmail(email string) SystemPromptOption {
 	}
 }
 
+// WithTemplate renders tmpl instead of the built-in template; "" keeps the
+// built-in one.
+func WithTemplate(tmpl string) SystemPromptOption {
+	return func(d *SystemPromptData) {
+		d.template = tmpl
+	}
+}
+
+// WithMCPServers lists the registered MCP servers in the system prompt.
+func WithMCPServers(servers []MCPServerInfo) SystemPromptOption {
+	return func(d *SystemPromptData) {
+		d.MCPServers = servers
+	}
+}
+
 // GenerateSystemPrompt generates the system prompt using the embedded template.
 // If workingDir is empty, it uses the current working directory.
 func GenerateSystemPrompt(workingDir string, opts ...SystemPromptOption) (string, error) {
@@ -108,18 +287,10 @@ func generateSystemPromptWithIntegrationSkills(workingDir string, integrationSki
 		opt(data)
 	}
 
-	tmpl, err := template.New("system_prompt").Parse(systemPromptTemplate)
+	prompt, err := renderSystemPrompt(data)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to parse template: %w", err)
+		return "", nil, err
 	}
-
-	var buf strings.Builder
-	err = tmpl.Execute(&buf, data)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to execute template: %w", err)
-	}
-
-	prompt := collapseBlankLines(buf.String())
 	prompt, err = runHook(hookSystemPrompt, prompt)
 	if err != nil {
 		return "", nil, err
@@ -342,13 +513,6 @@ type EndOfTurnHookInput struct {
 	FinalResponse   string `json:"final_response,omitempty"`
 }
 
-// RunEndOfTurnHook fires the end-of-turn hook from the default user
-// hooks directory ($HOME/.config/shelley/hooks). See RunEndOfTurnHookIn
-// for the dir-explicit variant used by tests.
-func RunEndOfTurnHook(input EndOfTurnHookInput) error {
-	return RunEndOfTurnHookIn(defaultHooksDir(), input)
-}
-
 // RunEndOfTurnHookIn runs the end-of-turn hook from an explicit hooks
 // directory. It runs the hook with the event JSON on stdin and ignores
 // stdout. A non-nil error means the hook failed (non-zero exit, etc.);
@@ -403,12 +567,6 @@ type ChatMessageReadonly struct {
 	ReasoningLevel string      `json:"reasoning_level"`
 	Queued         bool        `json:"queued"`
 	Headers        [][2]string `json:"headers,omitempty"`
-}
-
-// RunChatMessageHook runs the chat-message hook from the default user hooks
-// directory. See RunChatMessageHookIn for the dir-explicit variant.
-func RunChatMessageHook(input ChatMessageHookInput) (string, error) {
-	return RunChatMessageHookIn(defaultHooksDir(), input)
 }
 
 // RunChatMessageHookIn runs the chat-message hook from an explicit hooks dir.
@@ -965,25 +1123,28 @@ type SubagentSystemPromptData struct {
 	GitInfo          *GitInfo
 	ShelleyDBPath    string
 	ConversationID   string
-	SkillsXML        string // XML block for available skills
-	Skills           []skills.Skill
+	// MessageParent is set for delegated subagents, which have the
+	// message_parent tool.
+	MessageParent bool
+	SkillsXML     string // XML block for available skills
+	Skills        []skills.Skill
+	MCPServers    []MCPServerInfo // Registered MCP servers, for the mcp skill
 }
+
+// MCPServersXML renders the registered MCP servers for the subagent prompt.
+func (d *SubagentSystemPromptData) MCPServersXML() string { return mcpServersXML(d.MCPServers) }
 
 // GenerateSubagentSystemPrompt generates a minimal system prompt for subagent conversations.
 func GenerateSubagentSystemPrompt(workingDir, parentConversationID string) (string, error) {
-	prompt, _, err := generateSubagentSystemPromptData(workingDir, parentConversationID, nil)
+	prompt, _, err := generateSubagentSystemPromptData(workingDir, parentConversationID, true, nil, nil)
 	return prompt, err
 }
 
-func generateSubagentSystemPrompt(workingDir string) (string, []skills.Skill, error) {
-	return generateSubagentSystemPromptWithIntegrationSkills(workingDir, nil)
+func generateSubagentSystemPromptWithIntegrationSkills(workingDir string, messageParent bool, integrationSkills []skills.Skill, mcpServers []MCPServerInfo) (string, []skills.Skill, error) {
+	return generateSubagentSystemPromptData(workingDir, "", messageParent, integrationSkills, mcpServers)
 }
 
-func generateSubagentSystemPromptWithIntegrationSkills(workingDir string, integrationSkills []skills.Skill) (string, []skills.Skill, error) {
-	return generateSubagentSystemPromptData(workingDir, "", integrationSkills)
-}
-
-func generateSubagentSystemPromptData(workingDir, parentConversationID string, integrationSkills []skills.Skill) (string, []skills.Skill, error) {
+func generateSubagentSystemPromptData(workingDir, parentConversationID string, messageParent bool, integrationSkills []skills.Skill, mcpServers []MCPServerInfo) (string, []skills.Skill, error) {
 	wd := workingDir
 	if wd == "" {
 		var err error
@@ -997,6 +1158,8 @@ func generateSubagentSystemPromptData(workingDir, parentConversationID string, i
 		WorkingDirectory: wd,
 		ShelleyDBPath:    DBPath,
 		ConversationID:   parentConversationID,
+		MessageParent:    messageParent,
+		MCPServers:       mcpServers,
 	}
 
 	// Try to collect git info

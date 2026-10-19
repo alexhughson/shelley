@@ -56,39 +56,6 @@ func TestBuildPromptTreatsUserMessageAsData(t *testing.T) {
 	}
 }
 
-// TestGenerateUniqueSlug tests that slug generation adds numeric suffixes when there are conflicts
-func TestGenerateSlug_UniquenessSuffix(t *testing.T) {
-	// This test verifies the numeric suffix logic without needing a real database or LLM
-	// We'll test the error handling and retry logic by mocking the behavior
-
-	// Test the sanitization works as expected first
-	baseSlug := Sanitize("Test Message")
-	expected := "test-message"
-	if baseSlug != expected {
-		t.Errorf("Sanitize failed: got %q, expected %q", baseSlug, expected)
-	}
-
-	// Test that numeric suffixes would be correctly formatted
-	// This mimics what the GenerateSlug function does internally
-	tests := []struct {
-		baseSlug string
-		attempt  int
-		expected string
-	}{
-		{"test-message", 0, "test-message-1"},
-		{"test-message", 1, "test-message-2"},
-		{"test-message", 2, "test-message-3"},
-		{"help-python", 9, "help-python-10"},
-	}
-
-	for _, test := range tests {
-		result := fmt.Sprintf("%s-%d", test.baseSlug, test.attempt+1)
-		if result != test.expected {
-			t.Errorf("Suffix generation failed: got %q, expected %q", result, test.expected)
-		}
-	}
-}
-
 // MockLLMService provides a mock LLM service for testing
 type MockLLMService struct {
 	ResponseText string
@@ -155,57 +122,28 @@ func TestGenerateSlug_DatabaseIntegration(t *testing.T) {
 		Level: slog.LevelWarn, // Only show warnings and errors
 	}))
 
-	// Create first conversation to establish the base slug
-	conv1, err := database.CreateConversation(ctx, nil, true, nil, nil, db.ConversationOptions{})
-	if err != nil {
-		t.Fatalf("Failed to create first conversation: %v", err)
+	// The same generated slug: base, -1, -2, -3, then random suffixes.
+	seen := map[string]bool{}
+	for i, want := range []string{"test-slug", "test-slug-1", "test-slug-2", "test-slug-3", "", ""} {
+		conv, err := database.CreateConversation(ctx, nil, true, nil, nil, db.ConversationOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		slug, _, err := GenerateSlug(ctx, mockLLM, database, logger, conv.ConversationID, "Test message", "test-model")
+		if err != nil {
+			t.Fatalf("slug %d: %v", i, err)
+		}
+		if want != "" && slug != want {
+			t.Errorf("slug %d = %q, want %q", i, slug, want)
+		}
+		if want == "" && (!strings.HasPrefix(slug, "test-slug-") || len(slug) != len("test-slug-")+6) {
+			t.Errorf("slug %d = %q, want test-slug-<random>", i, slug)
+		}
+		if seen[slug] {
+			t.Errorf("slug %d = %q is a duplicate", i, slug)
+		}
+		seen[slug] = true
 	}
-
-	// Generate first slug - should succeed with "test-slug"
-	slug1, _, err := GenerateSlug(ctx, mockLLM, database, logger, conv1.ConversationID, "Test message", "test-model")
-	if err != nil {
-		t.Fatalf("Failed to generate first slug: %v", err)
-	}
-	if slug1 != "test-slug" {
-		t.Errorf("Expected first slug to be 'test-slug', got %q", slug1)
-	}
-
-	// Create second conversation
-	conv2, err := database.CreateConversation(ctx, nil, true, nil, nil, db.ConversationOptions{})
-	if err != nil {
-		t.Fatalf("Failed to create second conversation: %v", err)
-	}
-
-	// Generate second slug - should get "test-slug-1" due to conflict
-	slug2, _, err := GenerateSlug(ctx, mockLLM, database, logger, conv2.ConversationID, "Test message", "test-model")
-	if err != nil {
-		t.Fatalf("Failed to generate second slug: %v", err)
-	}
-	if slug2 != "test-slug-1" {
-		t.Errorf("Expected second slug to be 'test-slug-1', got %q", slug2)
-	}
-
-	// Create third conversation
-	conv3, err := database.CreateConversation(ctx, nil, true, nil, nil, db.ConversationOptions{})
-	if err != nil {
-		t.Fatalf("Failed to create third conversation: %v", err)
-	}
-
-	// Generate third slug - should get "test-slug-2" due to conflict
-	slug3, _, err := GenerateSlug(ctx, mockLLM, database, logger, conv3.ConversationID, "Test message", "test-model")
-	if err != nil {
-		t.Fatalf("Failed to generate third slug: %v", err)
-	}
-	if slug3 != "test-slug-2" {
-		t.Errorf("Expected third slug to be 'test-slug-2', got %q", slug3)
-	}
-
-	// Verify all slugs are different
-	if slug1 == slug2 || slug1 == slug3 || slug2 == slug3 {
-		t.Errorf("All slugs should be unique: slug1=%q, slug2=%q, slug3=%q", slug1, slug2, slug3)
-	}
-
-	t.Logf("Successfully generated unique slugs: %q, %q, %q", slug1, slug2, slug3)
 }
 
 func TestGenerateSlug_PreservesConcurrentAssignment(t *testing.T) {
@@ -440,12 +378,6 @@ func TestGenerateSlug_SanitizationError(t *testing.T) {
 	if err.Error() != "generated slug is empty after sanitization" {
 		t.Errorf("Expected 'empty after sanitization' error, got %q", err.Error())
 	}
-}
-
-// TestGenerateSlug_MaxAttempts tests the case where we exceed maximum attempts to generate unique slug
-// This test is skipped because it's difficult to set up correctly without modifying the core logic
-func TestGenerateSlug_MaxAttempts(t *testing.T) {
-	t.Skip("Skipping max attempts test due to complexity of setup")
 }
 
 // TestGenerateSlug_DatabaseError tests error handling when database update fails with non-unique error

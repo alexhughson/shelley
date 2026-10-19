@@ -5,9 +5,16 @@ import (
 	"net/http"
 	"os"
 	"testing"
+
+	"shelley.exe.dev/exeenv"
 )
 
 func TestMain(m *testing.M) {
+	env, err := exeenv.New("https", "exe.xyz")
+	if err != nil {
+		panic(err)
+	}
+	exeenv.Configure(env) // server tests must not reach the VM metadata service
 	exeDevDefaultPortHTTPClient = &http.Client{Transport: defaultPortTestTransport{}}
 	// Default to a failing reflection client so server tests never make real
 	// network calls. Tests that exercise reflection override this explicitly.

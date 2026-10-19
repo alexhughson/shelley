@@ -14,6 +14,7 @@ func TestShelleyEnvEnviron(t *testing.T) {
 		Model:            "claude",
 		UserEmail:        "a@b.com",
 		Port:             8123,
+		Socket:           "/run/shelley.sock",
 	}
 	got := e.Environ("") // no cwd -> no SHELLEY_CWD / SHELLEY_GIT_ROOT
 	want := []string{
@@ -23,6 +24,7 @@ func TestShelleyEnvEnviron(t *testing.T) {
 		"SHELLEY_USER_EMAIL=a@b.com",
 		"SHELLEY_PORT=8123",
 		"SHELLEY_URL=http://localhost:8123",
+		"SHELLEY_SOCKET=/run/shelley.sock",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("Environ() = %v, want %v", got, want)
@@ -59,6 +61,7 @@ func TestStripShelleyEnv(t *testing.T) {
 		"SHELLEY_URL=http://localhost:1",
 		"HOME=/root",
 		"SHELLEY_GIT_ROOT=/x",
+		"SHELLEY_SOCKET=/old.sock",
 	}
 	got := stripShelleyEnv(slices.Clone(in))
 	want := []string{"PATH=/bin", "HOME=/root"}

@@ -608,22 +608,24 @@ func TestAdaptiveThinkingOmitsForcedToolChoice(t *testing.T) {
 		{name: "any omitted", level: llm.ThinkingLevelMedium, choice: llm.ToolChoice{Type: llm.ToolChoiceTypeAny}},
 		{name: "specific tool omitted", level: llm.ThinkingLevelMedium, choice: llm.ToolChoice{Type: llm.ToolChoiceTypeTool, Name: "bash"}},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := (&Service{Model: Claude55Opus, ThinkingLevel: tt.level}).fromLLMRequest(&llm.Request{
-				Messages:   []llm.Message{llm.UserStringMessage("hi")},
-				ToolChoice: &tt.choice,
-			})
-			if !tt.wantChoice {
-				if got.ToolChoice != nil {
-					t.Fatalf("ToolChoice = %+v, want nil", got.ToolChoice)
+	for _, model := range []string{Claude55Opus, Claude55Haiku} {
+		for _, tt := range tests {
+			t.Run(model+"/"+tt.name, func(t *testing.T) {
+				got := (&Service{Model: model, ThinkingLevel: tt.level}).fromLLMRequest(&llm.Request{
+					Messages:   []llm.Message{llm.UserStringMessage("hi")},
+					ToolChoice: &tt.choice,
+				})
+				if !tt.wantChoice {
+					if got.ToolChoice != nil {
+						t.Fatalf("ToolChoice = %+v, want nil", got.ToolChoice)
+					}
+					return
 				}
-				return
-			}
-			if got.ToolChoice == nil || got.ToolChoice.Type != tt.wantType {
-				t.Fatalf("ToolChoice = %+v, want type %q", got.ToolChoice, tt.wantType)
-			}
-		})
+				if got.ToolChoice == nil || got.ToolChoice.Type != tt.wantType {
+					t.Fatalf("ToolChoice = %+v, want type %q", got.ToolChoice, tt.wantType)
+				}
+			})
+		}
 	}
 }
 
@@ -933,6 +935,11 @@ func TestMaxOutputTokensCapping(t *testing.T) {
 	}
 	if got5.Thinking == nil || got5.Thinking.Type != "adaptive" {
 		t.Errorf("Opus 5.5 thinking = %+v, want adaptive", got5.Thinking)
+	}
+	haiku := (&Service{Model: Claude55Haiku, MaxTokens: 200000, ThinkingLevel: llm.ThinkingLevelMedium}).fromLLMRequest(simpleReq)
+	if haiku.MaxTokens != 128000 || haiku.Thinking == nil || haiku.Thinking.Type != "adaptive" ||
+		haiku.OutputConfig == nil || haiku.OutputConfig.Effort != "medium" {
+		t.Errorf("Haiku 5.5 request = %+v, want 128k output with adaptive medium", haiku)
 	}
 
 	// Fable 5.1 has a 128k limit and uses adaptive thinking.
@@ -2043,6 +2050,7 @@ func TestLiveAnthropicModels(t *testing.T) {
 		model string
 	}{
 		{"Haiku 4.5", Claude45Haiku},
+		{"Haiku 5.5", Claude55Haiku},
 		{"Sonnet 4.6", Claude46Sonnet},
 		{"Opus 4.5", Claude45Opus},
 		{"Opus 4.6", Claude46Opus},
@@ -2980,6 +2988,7 @@ func TestUseAdaptiveThinking(t *testing.T) {
 		model string
 		want  bool
 	}{
+		{Claude55Haiku, true},
 		{Claude55Opus, true},
 		{Claude48Opus, true},
 		{Claude47Opus, true},
@@ -3027,6 +3036,7 @@ func TestSupportedReasoningLevels(t *testing.T) {
 		model string
 		want  string
 	}{
+		{Claude55Haiku, "low,medium,high,xhigh,max"},
 		{Claude55Opus, "low,medium,high,xhigh,max"},
 		{Claude55Sonnet, "low,medium,high,xhigh,max"},
 		{Claude48Opus, "low,medium,high,xhigh,max"},
@@ -3058,6 +3068,9 @@ func TestFromLLMRequestThinkingLevels(t *testing.T) {
 		wantEffort      string
 		wantBudgetGreat int // wantBudgetGreat: BudgetTokens must equal this when set
 	}{
+		{name: "adaptive haiku 5.5 medium", model: Claude55Haiku, svcLevel: llm.ThinkingLevelMedium, wantType: "adaptive", wantEffort: "medium"},
+		{name: "adaptive haiku 5.5 xhigh", model: Claude55Haiku, svcLevel: llm.ThinkingLevelMedium, reqLevel: llm.ThinkingLevelXHigh, wantType: "adaptive", wantEffort: "xhigh"},
+		{name: "adaptive haiku 5.5 off rounds to low", model: Claude55Haiku, svcLevel: llm.ThinkingLevelMedium, reqLevel: llm.ThinkingLevelOff, wantType: "adaptive", wantEffort: "low"},
 		{name: "adaptive opus 5.5 default medium", model: Claude55Opus, svcLevel: llm.ThinkingLevelMedium, wantType: "adaptive", wantEffort: "medium"},
 		{name: "adaptive sonnet 5.5 default medium", model: Claude55Sonnet, svcLevel: llm.ThinkingLevelMedium, wantType: "adaptive", wantEffort: "medium"},
 		{name: "adaptive default medium", model: Claude47Opus, svcLevel: llm.ThinkingLevelMedium, wantType: "adaptive", wantEffort: "medium"},

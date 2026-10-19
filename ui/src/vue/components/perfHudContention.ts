@@ -21,13 +21,21 @@ export interface IdbContention {
  */
 const IN_FLIGHT_ALERT_FRACTION = 0.5;
 
+/**
+ * Below this, "stalled" time is timer jitter and busy-but-healthy turns, not
+ * a blocked tab worth pointing out.
+ */
+const STALL_NOTE_MS = 50;
+
 export function summarizeIdbContention(
   missed: MissedDeadline[],
   pending: PendingWait[],
 ): IdbContention {
   const rows = missed.filter((m) => isIndexedDBWait(m.what)).reverse();
   const inFlight = pending.filter(
-    (w) => isIndexedDBWait(w.what) && w.elapsedMs >= w.deadlineMs * IN_FLIGHT_ALERT_FRACTION,
+    // Budget used, not wall time: a wait that is only old because this tab
+    // was blocked or throttled says nothing about IndexedDB.
+    (w) => isIndexedDBWait(w.what) && w.chargedMs >= w.deadlineMs * IN_FLIGHT_ALERT_FRACTION,
   );
   return {
     alert: rows.length > 0 || inFlight.length > 0,
@@ -55,4 +63,13 @@ export function describeStallOutcome(m: MissedDeadline): string {
     case "failed":
       return `failed${after}: ${m.error ?? "unknown error"}`;
   }
+}
+
+/**
+ * Time a wait spent with this tab blocked or throttled (not charged to its
+ * deadline), or "" when too small to mention. A miss with a large stall means
+ * the tab was busy as well as the cache being slow.
+ */
+export function describeStall(stalledMs: number): string {
+  return stalledMs >= STALL_NOTE_MS ? `tab blocked ${formatDuration(stalledMs)}` : "";
 }

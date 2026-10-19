@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -492,10 +493,7 @@ func TestInsertMissingToolResults(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			loop := NewLoop(Config{
-				LLM:     predictable.NewService(),
-				History: []llm.Message{},
-			})
+			loop := &RunConfig{Logger: slog.Default()}
 
 			req := &llm.Request{
 				Messages: tt.messages,
@@ -535,10 +533,7 @@ func TestInsertMissingToolResultsWithEdgeCases(t *testing.T) {
 	// but before tool execution, the tool_use is "hidden" from insertMissingToolResults
 	// because it only checks the last two messages.
 	t.Run("tool_use hidden by subsequent assistant message", func(t *testing.T) {
-		loop := NewLoop(Config{
-			LLM:     predictable.NewService(),
-			History: []llm.Message{},
-		})
+		loop := &RunConfig{Logger: slog.Default()}
 
 		// Scenario:
 		// 1. LLM responds with tool_use
@@ -595,10 +590,7 @@ func TestInsertMissingToolResultsWithEdgeCases(t *testing.T) {
 
 	// Test for tool_use in earlier message (not the second-to-last)
 	t.Run("tool_use in earlier message without result", func(t *testing.T) {
-		loop := NewLoop(Config{
-			LLM:     predictable.NewService(),
-			History: []llm.Message{},
-		})
+		loop := &RunConfig{Logger: slog.Default()}
 
 		req := &llm.Request{
 			Messages: []llm.Message{
@@ -649,10 +641,7 @@ func TestInsertMissingToolResultsWithEdgeCases(t *testing.T) {
 	})
 
 	t.Run("empty message list", func(t *testing.T) {
-		loop := NewLoop(Config{
-			LLM:     predictable.NewService(),
-			History: []llm.Message{},
-		})
+		loop := &RunConfig{Logger: slog.Default()}
 
 		req := &llm.Request{
 			Messages: []llm.Message{},
@@ -663,10 +652,7 @@ func TestInsertMissingToolResultsWithEdgeCases(t *testing.T) {
 	})
 
 	t.Run("single message", func(t *testing.T) {
-		loop := NewLoop(Config{
-			LLM:     predictable.NewService(),
-			History: []llm.Message{},
-		})
+		loop := &RunConfig{Logger: slog.Default()}
 
 		req := &llm.Request{
 			Messages: []llm.Message{
@@ -682,10 +668,7 @@ func TestInsertMissingToolResultsWithEdgeCases(t *testing.T) {
 	})
 
 	t.Run("wrong role order - user then assistant", func(t *testing.T) {
-		loop := NewLoop(Config{
-			LLM:     predictable.NewService(),
-			History: []llm.Message{},
-		})
+		loop := &RunConfig{Logger: slog.Default()}
 
 		req := &llm.Request{
 			Messages: []llm.Message{
@@ -710,10 +693,7 @@ func TestInsertMissingToolResults_EmptyAssistantContent(t *testing.T) {
 	// final assistant message"
 
 	t.Run("empty assistant content in middle of conversation", func(t *testing.T) {
-		loop := NewLoop(Config{
-			LLM:     predictable.NewService(),
-			History: []llm.Message{},
-		})
+		loop := &RunConfig{Logger: slog.Default()}
 
 		req := &llm.Request{
 			Messages: []llm.Message{
@@ -761,10 +741,7 @@ func TestInsertMissingToolResults_EmptyAssistantContent(t *testing.T) {
 	})
 
 	t.Run("empty assistant content at end of conversation - no modification needed", func(t *testing.T) {
-		loop := NewLoop(Config{
-			LLM:     predictable.NewService(),
-			History: []llm.Message{},
-		})
+		loop := &RunConfig{Logger: slog.Default()}
 
 		req := &llm.Request{
 			Messages: []llm.Message{
@@ -791,10 +768,7 @@ func TestInsertMissingToolResults_EmptyAssistantContent(t *testing.T) {
 	})
 
 	t.Run("non-empty assistant content - no modification needed", func(t *testing.T) {
-		loop := NewLoop(Config{
-			LLM:     predictable.NewService(),
-			History: []llm.Message{},
-		})
+		loop := &RunConfig{Logger: slog.Default()}
 
 		req := &llm.Request{
 			Messages: []llm.Message{
@@ -3222,4 +3196,12 @@ func TestExecuteToolCallsAbandonsContextIgnoringTool(t *testing.T) {
 	if len(recordedMessages) != 1 {
 		t.Fatalf("late tool result was persisted: %+v", recordedMessages)
 	}
+}
+
+// executeToolCalls runs one tool round through the Run engine with this
+// Loop's tools and hooks, so tool-execution tests can drive it directly.
+func (l *Loop) executeToolCalls(ctx context.Context, content []llm.Content) error {
+	messages := l.GetHistory()
+	config := RunConfig{Tools: l.tools, WorkingDir: l.workingDir, Hooks: l.hooks(), Logger: l.logger}
+	return config.executeToolCalls(ctx, content, &messages)
 }

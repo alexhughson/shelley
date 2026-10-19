@@ -18,6 +18,3 @@ func RegisterBrowserTools(ctx context.Context) ([]*llm.Tool, func()) {
 		browserTools.Close()
 	}
 }
-
-// Tool is an alias for llm.Tool to make the documentation clearer
-type Tool = llm.Tool

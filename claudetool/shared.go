@@ -11,27 +11,6 @@ import (
 	"shelley.exe.dev/llm"
 )
 
-func WithWorkingDir(ctx context.Context, wd string) context.Context {
-	return llm.WithWorkingDir(ctx, wd)
-}
-
-func WorkingDir(ctx context.Context) string {
-	return llm.WorkingDir(ctx)
-}
-
-func WithSessionID(ctx context.Context, sessionID string) context.Context {
-	return llm.WithSessionID(ctx, sessionID)
-}
-
-func SessionID(ctx context.Context) string {
-	return llm.SessionID(ctx)
-}
-
-// WithToolProgress returns a context with the given ToolProgressFunc.
-func WithToolProgress(ctx context.Context, fn llm.ToolProgressFunc) context.Context {
-	return llm.WithToolProgress(ctx, fn)
-}
-
 // GetToolProgress retrieves the ToolProgressFunc from the context, or nil.
 func GetToolProgress(ctx context.Context) llm.ToolProgressFunc {
 	return llm.GetToolProgress(ctx)

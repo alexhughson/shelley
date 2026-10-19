@@ -15,7 +15,7 @@ import (
 )
 
 func TestPendingDrainCoalescesWakeup(t *testing.T) {
-	manager := &ConversationManager{pendingBatches: []pendingBatch{{Kind: pendingBatchUser}}}
+	manager := &ConversationManager{}
 	owner, done := manager.beginPendingDrain()
 	if !owner {
 		t.Fatal("first drain did not claim ownership")
@@ -174,7 +174,7 @@ func TestHydrateSystemPromptDisplayDataRespectsToolOverrides(t *testing.T) {
 	t.Parallel()
 	h := NewTestHarness(t)
 
-	chatBody := `{"message":"Hello","model":"predictable","conversation_options":{"tool_overrides":{"bash":"off","shell":"on"}}}`
+	chatBody := `{"message":"Hello","model":"predictable","conversation_options":{"tool_overrides":{"bash":"off"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/conversations/new", strings.NewReader(chatBody))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -220,20 +220,20 @@ func TestHydrateSystemPromptDisplayDataRespectsToolOverrides(t *testing.T) {
 		t.Fatalf("unmarshal display data: %v", err)
 	}
 
-	var hasBash, hasShell bool
+	var hasBash, hasPatch bool
 	for _, tool := range displayData.Tools {
 		switch tool.Name {
 		case "bash":
 			hasBash = true
-		case "shell":
-			hasShell = true
+		case "patch":
+			hasPatch = true
 		}
 	}
 	if hasBash {
 		t.Fatalf("display data should not include disabled bash tool: %+v", displayData.Tools)
 	}
-	if !hasShell {
-		t.Fatalf("display data should include enabled shell tool: %+v", displayData.Tools)
+	if !hasPatch {
+		t.Fatalf("display data should include default-on patch tool: %+v", displayData.Tools)
 	}
 }
 

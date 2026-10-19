@@ -30,12 +30,17 @@ export interface CoalescedItem {
   hasResult?: boolean;
   toolInterrupted?: boolean;
   display?: unknown;
+  /** The message_id of the row holding the tool's result. */
+  toolResultMessageId?: string;
 }
 
 export function coalesceMessages(
   messages: Message[],
   interruptedGeneration?: number,
+  /** Full hashes of tours still building. */
+  buildingTours: ReadonlySet<string> = new Set(),
 ): CoalescedItem[] {
+  messages = messages.filter((message) => message.type !== "livetranscript");
   if (messages.length === 0) return [];
 
   const items: CoalescedItem[] = [];
@@ -70,6 +75,13 @@ export function coalesceMessages(
       }
     });
   }
+  // Tour request rows duplicate an ordinary gitinfo strip for the same commit and worktree,
+  // and add noise directly under another git row unless the tour is still building.
+  const stripTargets: GitInfoTarget[] = [];
+  messages.forEach((message) => {
+    const target = gitInfoTarget(message);
+    if (target && !target.tourRequest) stripTargets.push(target);
+  });
   const toolResultMap: Record<
     string,
     {
@@ -78,6 +90,7 @@ export function coalesceMessages(
       startTime: string | null;
       endTime: string | null;
       interrupted: boolean;
+      messageId: string;
     }
   > = {};
   const displayDataMap: Record<string, unknown> = {};
@@ -100,6 +113,7 @@ export function coalesceMessages(
                 error: content.ToolError || false,
                 startTime: content.ToolUseStartTime || null,
                 endTime: content.ToolUseEndTime || null,
+                messageId: message.message_id,
                 interrupted:
                   userData?.interrupted_tool_result === true ||
                   (content.ToolError === true &&
@@ -132,13 +146,24 @@ export function coalesceMessages(
     // header with nothing underneath it. Their cost is read straight off
     // messages in ChatInterface's usage walk, not from coalesced items.
     if (message.type === "slug") return;
+    const target = gitInfoTarget(message);
+    if (target?.tourRequest) {
+      if (stripTargets.some((strip) => sameGitTarget(strip, target))) return;
+      const previous = items.at(-1);
+      if (previous?.message?.type === "gitinfo" && !buildingTours.has(target.commit)) return;
+    }
     if (message.type === "system") {
       if (!isDistillStatusMessage(message)) return;
       items.push(messageItem(message, carried));
       return;
     }
 
-    if (message.type === "error" || message.type === "warning" || message.type === "modelchange") {
+    if (
+      message.type === "error" ||
+      message.type === "warning" ||
+      message.type === "modelchange" ||
+      message.type === "inplacecompaction"
+    ) {
       items.push(messageItem(message, carried));
       return;
     }
@@ -250,6 +275,7 @@ export function coalesceMessages(
                   interruptedGeneration !== undefined &&
                   message.generation === interruptedGeneration),
               display: displayData,
+              toolResultMessageId: resultData?.messageId,
             });
           });
 
@@ -278,4 +304,32 @@ function messageItem(message: Message, carried: boolean): CoalescedItem {
     sourceSequenceID: message.sequence_id,
     anchorKey: `message:${message.message_id}`,
   };
+}
+
+interface GitInfoTarget {
+  commit: string;
+  worktree: string;
+  tourRequest: boolean;
+}
+
+function gitInfoTarget(message: Message): GitInfoTarget | null {
+  if (message.type !== "gitinfo" || !message.user_data) return null;
+  try {
+    const userData =
+      typeof message.user_data === "string" ? JSON.parse(message.user_data) : message.user_data;
+    if (!userData?.commit) return null;
+    return {
+      commit: userData.commit,
+      worktree: userData.worktree ?? "",
+      tourRequest: userData.tour_request === true,
+    };
+  } catch (err) {
+    console.error("Failed to parse gitinfo user_data:", err);
+    return null;
+  }
+}
+
+// Ordinary strips may carry an abbreviated commit; tour requests carry the full SHA.
+function sameGitTarget(strip: GitInfoTarget, request: GitInfoTarget): boolean {
+  return strip.worktree === request.worktree && request.commit.startsWith(strip.commit);
 }

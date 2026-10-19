@@ -342,10 +342,6 @@ func (s *customService) Do(ctx context.Context, req *llm.Request) (*llm.Response
 	return resp.response, resp.err
 }
 
-func (s *customService) GetDefaultModel() string {
-	return "custom-test"
-}
-
 func (s *customService) Provider() string { return "" }
 
 func (s *customService) MaxImageDimension() int {

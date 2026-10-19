@@ -22,10 +22,3 @@ var FlagCompactSendThresholds = featureflags.Register(featureflags.Flag{
 	Description: "Default the composer to Compact and send once the context reaches 200k tokens.",
 	Default:     false,
 })
-
-// FlagPatchSimple selects simplified edits for models without native apply_patch.
-var FlagPatchSimple = featureflags.Register(featureflags.Flag{
-	Name:        "patch-simple",
-	Description: "For models without native apply_patch, use simplified path-and-edits replacements instead of the full nested patches schema.",
-	Default:     false,
-})

@@ -224,37 +224,6 @@
         </div>
       </div>
 
-      <!-- Tags -->
-      <div class="form-group">
-        <label>
-          {{ t("tags") }}
-          <span
-            class="info-icon-wrapper"
-            v-tooltip.top="t('tagsTooltip')"
-            tabindex="0"
-            role="note"
-            :aria-label="t('tagsTooltip')"
-          >
-            <span class="info-icon">
-              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" width="14" height="14">
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  :stroke-width="2"
-                  d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                />
-              </svg>
-            </span>
-          </span>
-        </label>
-        <InputText
-          v-model="form.tags"
-          :placeholder="t('tagsPlaceholder')"
-          fluid
-          :dt="inputFieldDt"
-        />
-      </div>
-
       <!-- Test Result -->
       <div v-if="testResult" :class="`test-result ${testResult.success ? 'success' : 'error'}`">
         {{ testResult.success ? "✓" : "✗" }} {{ testResult.message }}
@@ -411,7 +380,6 @@ watch(
         api_key: m.api_key,
         model_name: m.model_name,
         max_tokens: m.max_tokens,
-        tags: m.tags,
         reasoning_effort: m.reasoning_effort || "",
         reasoning_replay: m.reasoning_replay || "auto",
         reasoning_support: m.reasoning_support || "auto",
@@ -490,7 +458,6 @@ async function handleSave() {
       api_key: form.api_key,
       model_name: form.model_name,
       max_tokens: form.max_tokens,
-      tags: form.tags,
       reasoning_effort: form.reasoning_effort,
       reasoning_replay: form.reasoning_replay,
       reasoning_support: form.reasoning_support,

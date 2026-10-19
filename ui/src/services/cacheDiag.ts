@@ -135,6 +135,7 @@ function cacheDiagWhy(): void {
         deadlineMs: m.deadlineMs,
         outcome: m.outcome,
         settledAfterMs: m.settledAfterMs ?? "",
+        stalledMs: m.stalledMs,
         error: m.error ?? "",
         agoMs: Date.now() - m.at,
       })),

@@ -357,10 +357,15 @@ export function rowAAD(parts: Record<string, string | number>): Uint8Array {
 interface KeyAttempt {
   /** Resolves to the material, or null if the fetch failed. Never rejects. */
   promise: Promise<CacheKeyMaterial | null>;
-  /** When a caller gave up on this attempt; 0 while it is still awaited. */
+  /**
+   * `promise` bounded by the deadline: null on timeout. Every caller awaits
+   * this one wait, so late joiners share the attempt's budget instead of
+   * deriving their own from the wall clock, which a stalled tab would
+   * have spent without charging the deadline (see deadline.ts).
+   */
+  bounded: Promise<CacheKeyMaterial | null>;
+  /** When the attempt's deadline expired; 0 while it is still awaited. */
   timedOutAt: number;
-  /** Wall clock at kick-off, so late joiners share the attempt's deadline. */
-  startedAt: number;
 }
 
 export class CacheKeyHolder {
@@ -413,28 +418,7 @@ export class CacheKeyHolder {
     if (!attempt) attempt = this.startAttempt();
     // Late joiners share the attempt's deadline rather than restarting the
     // clock, so the bound is a property of the tab, not of the call.
-    const remaining = Math.max(0, this.timeoutMs - (Date.now() - attempt.startedAt));
-    try {
-      return await withDeadline(attempt.promise, remaining, {
-        what: "GET /api/cache-key",
-        // A late key is still worth installing (startAttempt does it, under
-        // its staleness check) so the NEXT hydrate is a hit, not a round trip.
-        onLate: (m) => cacheDiag("info", "cache_key.late_arrival", { installed: m !== null }),
-        onLateError: (err) => cacheDiag("fail", "cache_key.late_failure", { error: String(err) }),
-      });
-    } catch (err) {
-      if (isDeadlineExceeded(err)) {
-        // Mark the attempt WE waited on. If it has already been superseded,
-        // this is a no-op on the current one, which is the point.
-        if (attempt.timedOutAt === 0) attempt.timedOutAt = Date.now();
-        cacheDiag("fail", "cache_key.timeout", { timeout_ms: this.timeoutMs });
-        return null;
-      }
-      // startAttempt converts failures to null and logs them, so this is
-      // unreachable in practice; be defensive anyway.
-      cacheDiag("fail", "cache_key.unavailable", { error: String(err) });
-      return null;
-    }
+    return attempt.bounded;
   }
 
   /**
@@ -450,8 +434,8 @@ export class CacheKeyHolder {
   private startAttempt(): KeyAttempt {
     const a: KeyAttempt = {
       promise: Promise.resolve(null),
+      bounded: Promise.resolve(null),
       timedOutAt: 0,
-      startedAt: Date.now(),
     };
     a.promise = this.fetcher
       .fetch()
@@ -476,6 +460,26 @@ export class CacheKeyHolder {
         }
         return null;
       });
+    a.bounded = withDeadline(a.promise, this.timeoutMs, {
+      what: "GET /api/cache-key",
+      // A late key is still worth installing (the handler above does it,
+      // under its staleness check) so the NEXT hydrate is a hit, not a round
+      // trip.
+      onLate: (m) => cacheDiag("info", "cache_key.late_arrival", { installed: m !== null }),
+      onLateError: (err) => cacheDiag("fail", "cache_key.late_failure", { error: String(err) }),
+    }).catch((err) => {
+      if (isDeadlineExceeded(err)) {
+        // Marks this attempt only. If it has already been superseded, the
+        // current attempt is untouched, which is the point.
+        if (a.timedOutAt === 0) a.timedOutAt = Date.now();
+        cacheDiag("fail", "cache_key.timeout", { timeout_ms: this.timeoutMs });
+        return null;
+      }
+      // The handlers above convert failures to null and log them, so this
+      // is unreachable in practice; be defensive anyway.
+      cacheDiag("fail", "cache_key.unavailable", { error: String(err) });
+      return null;
+    });
     this.attempt = a;
     return a;
   }

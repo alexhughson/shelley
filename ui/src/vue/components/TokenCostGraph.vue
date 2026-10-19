@@ -1,23 +1,28 @@
-<!-- Stacked cumulative token-cost graph shown in the context usage popup.
-     X axis: LLM calls or wall-clock time (toggle); in time mode, idle time
-     between turns is collapsed into fixed-width gaps. Y axis: cumulative
-     dollars per (model, token-band) segment — every segment has its own color
-     — falling back to raw token counts when no model in the conversation has
-     known pricing.
+<!-- The graphs in the context usage popup, stacked on one shared x axis and
+     switched on and off independently: context length (colored by estimated
+     composition), cumulative cost, and each call's own cost as a short strip.
+     Each pane is labeled down its left side. X axis: LLM calls or wall-clock
+     time (toggle); in time mode, idle time between turns is collapsed into
+     fixed-width gaps. Cost Y axes are cumulative dollars per (model,
+     token-band) segment — every segment has its own color — falling back to
+     raw token counts when no model in the conversation has known pricing. The
+     strip stacks the same segments per call; where calls are denser than bars
+     can be drawn, a bar shows its group's most expensive call, and hovering
+     picks that call. A hover guide runs through every pane, and the readout
+     and context legend follow it. With a cost graph on, the readout also
+     splits the hovered call's cost by token type, and notes a cache miss or
+     what its uncached prompt was (see utils/callCost.ts). A triangle above
+     the strip marks each bar whose call missed the cache.
 
      Subagent cost and "other" (indirect) LLM usage — compaction
      summarization, LLM-backed tools, slug generation, … — are not part of the
-     graph. Other-usage rows arrive via the otherUsageRows prop (aggregated
+     graphs. Other-usage rows arrive via the otherUsageRows prop (aggregated
      client-side from message other_usage_data) and subagent cost is fetched
      separately. One shared per-model table compares the main conversation
-     and sub-agents in aligned columns, with subtotals and a combined total. -->
+     and sub-agents in aligned columns, with a combined total and subtotals. -->
 <template>
   <div class="token-cost-graph">
-    <div v-if="loading" class="token-cost-graph-note">Loading pricing…</div>
-    <div v-else-if="stack && stack.n > 0" class="token-cost-timeline">
-      <div v-if="hasSubagents" class="token-cost-graph-note">
-        Main conversation · cumulative direct {{ stack.weighted ? "cost" : "tokens" }}
-      </div>
+    <div v-if="stack && stack.n > 0">
       <div class="token-cost-controls">
         <button
           :class="{ 'token-cost-toggle-active': xMode === 'calls' }"
@@ -33,89 +38,156 @@
         >
           time
         </button>
-        <span class="token-cost-controls-spacer" />
-        <slot name="mode-controls" />
       </div>
-      <svg
-        :viewBox="`0 0 ${W} ${H}`"
-        class="token-cost-graph-svg"
-        @mousemove="onMove"
-        @mouseleave="hoverIndex = null"
-      >
-        <line
-          v-for="t in ticks"
-          :key="`tick-${t}`"
-          :x1="PADL"
-          :y1="yAt(t)"
-          :x2="W - PADR"
-          :y2="yAt(t)"
-          class="token-cost-gridline"
-        />
-        <path v-for="(d, s) in segPaths" :key="s" :d="d" :fill="stack.segments[s].color" />
-        <line
-          v-for="i in genStarts"
-          :key="`gen-${i}`"
-          :x1="xAt(i)"
-          :y1="PADT"
-          :x2="xAt(i)"
-          :y2="H - PADB"
-          class="token-cost-gen-line"
-        />
-        <line :x1="PADL" :y1="PADT" :x2="PADL" :y2="H - PADB" class="token-cost-axis" />
-        <line :x1="PADL" :y1="H - PADB" :x2="W - PADR" :y2="H - PADB" class="token-cost-axis" />
-        <line
-          v-if="hoverIndex !== null && stack.n > 1"
-          :x1="xAt(hoverIndex)"
-          :y1="PADT"
-          :x2="xAt(hoverIndex)"
-          :y2="H - PADB"
-          class="token-cost-hover-line"
-        />
-        <text
-          v-for="t in ticks"
-          :key="`ticklabel-${t}`"
-          :x="PADL - 3"
-          :y="yAt(t) + 3"
-          text-anchor="end"
-          class="token-cost-label"
+      <div v-if="pricingPending" class="token-cost-graph-note">Loading pricing…</div>
+      <template v-else>
+        <svg
+          v-if="paneViews.length > 0"
+          ref="svgRef"
+          :viewBox="`0 0 ${W} ${H}`"
+          role="group"
+          :aria-label="`Usage graphs across ${stack.n} LLM calls`"
+          class="token-cost-graph-svg"
+          @mousemove="onMove"
+          @mouseleave="clearHover"
         >
-          {{ tickLabel(t) }}
-        </text>
-        <text :x="(PADL + W - PADR) / 2" :y="H - 4" text-anchor="middle" class="token-cost-label">
-          {{ xAxisLabel }}
-        </text>
-      </svg>
-      <div class="token-cost-hover-readout">
-        <template v-if="hoverEntry">
-          <div>
-            call {{ hoverIndex! + 1 }} of {{ stack.n
-            }}<template v-if="hoverGeneration"> (gen {{ hoverGeneration }})</template
-            ><template v-if="hoverTime"> · {{ hoverTime }}</template> · cumulative {{ hoverTotal }}
+          <g v-for="pane in paneViews" :key="pane.id" :data-pane="pane.id">
+            <line
+              v-for="tick in pane.ticks.filter((t) => t.grid)"
+              :key="`tick-${tick.value}`"
+              :x1="PADL"
+              :y1="tick.y"
+              :x2="W - PADR"
+              :y2="tick.y"
+              class="token-cost-gridline"
+            />
+            <path v-for="(d, s) in pane.paths" :key="s" :d="d" :fill="pane.colors[s]" />
+            <line
+              :x1="PADL"
+              :y1="pane.box.top"
+              :x2="PADL"
+              :y2="pane.box.bottom"
+              class="token-cost-axis"
+            />
+            <line
+              :x1="PADL"
+              :y1="pane.box.bottom"
+              :x2="W - PADR"
+              :y2="pane.box.bottom"
+              class="token-cost-axis"
+            />
+            <g role="img" :aria-label="pane.label.join(' ')" class="token-cost-pane-title">
+              <text
+                v-for="(line, k) in pane.label"
+                :key="k"
+                :transform="`translate(${LABEL_X[k]},${pane.box.top + pane.box.height / 2}) rotate(-90)`"
+                text-anchor="middle"
+                aria-hidden="true"
+                class="token-cost-label token-cost-pane-label"
+              >
+                {{ line }}
+              </text>
+            </g>
+            <text
+              v-for="tick in pane.ticks"
+              :key="`ticklabel-${tick.value}`"
+              :x="PADL - 3"
+              :y="tick.y + 3"
+              text-anchor="end"
+              class="token-cost-label"
+            >
+              {{ tick.label }}
+            </text>
+          </g>
+          <path v-if="missMarks" :d="missMarks" class="token-cost-miss-mark" />
+          <path
+            v-for="i in markStarts"
+            :key="`mark-${i}`"
+            :d="guide(markX(i))"
+            class="token-cost-gen-line"
+          />
+          <path
+            v-if="hoverX !== null && stack.n > 1"
+            :d="guide(hoverX)"
+            class="token-cost-hover-line"
+          />
+          <text :x="(PADL + W - PADR) / 2" :y="H - 4" text-anchor="middle" class="token-cost-label">
+            {{ xAxisLabel }}
+          </text>
+        </svg>
+        <!-- The live readout shares a grid cell with hidden, worst-case
+             ones, which keep its height constant: the popup is anchored at
+             its bottom, so a readout that grew on hover would move the graph
+             out from under the pointer. -->
+        <div v-if="paneViews.length > 0" class="token-cost-hover-readout">
+          <div
+            v-for="view in readoutViews"
+            :key="view.key"
+            :class="view.key === 'live' ? 'token-cost-readout-live' : 'token-cost-readout-sizer'"
+            :aria-hidden="view.key === 'live' ? undefined : 'true'"
+          >
+            <template v-if="view.text">
+              <div class="token-cost-hover-text">
+                <span>{{ view.text }}</span>
+                <span v-if="view.snippet" class="token-cost-hover-snippet">
+                  ({{ view.snippet }})</span
+                >
+              </div>
+              <div v-if="view.parts.length > 0" class="token-cost-call-parts">
+                <span v-for="part in view.parts" :key="part.text" class="token-cost-call-part">
+                  <span
+                    class="token-cost-chip"
+                    :style="{ backgroundColor: part.color }"
+                    aria-hidden="true"
+                  />{{ part.text }}
+                </span>
+              </div>
+              <div v-if="view.why" class="token-cost-call-why text-primary">
+                <span v-if="view.miss" class="text-error" aria-hidden="true">▼ </span>{{ view.why }}
+              </div>
+            </template>
+            <div v-else>
+              {{ hintText
+              }}<template v-if="missMarks"
+                >{{ hintText ? " " : "" }}<span class="text-error">▼</span> marks a cache
+                miss.</template
+              >
+            </div>
           </div>
-          <div v-if="hoverEntry.snippet" class="token-cost-hover-snippet">
-            {{ hoverEntry.snippet }}
+        </div>
+        <ContextLegend
+          v-if="showsContext && legendPoint"
+          :categories="categories"
+          :point="legendPoint"
+        />
+        <div v-if="showsContext && legendPoint" class="token-cost-graph-note">
+          The context mix is estimated from message contents.
+        </div>
+        <div v-if="hasSubagents && paneViews.length > 0" class="token-cost-graph-note">
+          Graphs show the main conversation only.
+        </div>
+        <template v-if="needsPricing">
+          <div v-if="stack.weighted && fetchFailed" class="token-cost-graph-note">
+            Pricing lookup failed for some models.
+          </div>
+          <div v-if="stack.weighted && stack.reportedCostUsd > 0" class="token-cost-graph-note">
+            Provider-reported direct cost: {{ formatUsd(stack.reportedCostUsd) }}.
+          </div>
+          <div v-if="!stack.weighted" class="token-cost-graph-note">
+            <template v-if="fetchFailed">
+              Pricing lookup failed — showing raw token counts.
+            </template>
+            <template v-else
+              >Raw token counts — no pricing known.<template v-if="stack.reportedCostUsd > 0">
+                Provider-reported {{ formatUsd(stack.reportedCostUsd) }}.</template
+              ></template
+            >
           </div>
         </template>
-        <template v-else>
-          <div>{{ hintText }}</div>
-        </template>
-      </div>
-      <div v-if="stack.weighted && fetchFailed" class="token-cost-graph-note">
-        Pricing lookup failed for some models.
-      </div>
-      <div v-if="stack.weighted && stack.reportedCostUsd > 0" class="token-cost-graph-note">
-        Provider-reported direct cost: {{ formatUsd(stack.reportedCostUsd) }}.
-      </div>
-      <div v-if="!stack.weighted" class="token-cost-graph-note">
-        <template v-if="fetchFailed"> Pricing lookup failed — showing raw token counts. </template>
-        <template v-else
-          >Raw token counts — no pricing known.<template v-if="stack.reportedCostUsd > 0">
-            Provider-reported {{ formatUsd(stack.reportedCostUsd) }}.</template
-          ></template
-        >
-      </div>
+      </template>
     </div>
-    <div v-else-if="!loading" class="token-cost-graph-note">No direct usage data yet.</div>
+    <div v-else-if="loading" class="token-cost-graph-note">Loading pricing…</div>
+    <div v-else class="token-cost-graph-note">No direct usage data yet.</div>
     <table
       v-if="!loading && (stack || otherBreakdown || hasSubagents)"
       class="token-cost-table"
@@ -134,6 +206,37 @@
           <th v-if="hasSubagents" scope="col">Sub-agents</th>
         </tr>
       </thead>
+      <tbody class="token-cost-summary">
+        <tr
+          v-if="!subagentLoading && showCostSummary"
+          class="token-cost-total-row"
+          data-testid="token-cost-total"
+        >
+          <th scope="row" :colspan="hasSubagents ? 2 : 1">Total</th>
+          <td>
+            <span class="token-cost-legend-cost">≈{{ formatUsd(costSummary.totalUsd) }}</span>
+          </td>
+        </tr>
+        <tr class="token-cost-subtotal-row">
+          <th scope="row">Subtotal</th>
+          <td data-testid="conversation-cost-subtotal">
+            <span
+              v-if="mainKnownUsd > 0 || mainUnpricedCalls === 0"
+              class="token-cost-legend-cost"
+              >{{ formatUsd(mainKnownUsd) }}</span
+            >
+            <span v-else class="token-cost-legend-unit">no pricing</span>
+          </td>
+          <td v-if="hasSubagents" data-testid="subagent-cost-row">
+            <span
+              v-if="subagentKnownUsd > 0 || subagentUsage?.unpriced_calls === 0"
+              class="token-cost-legend-cost"
+              >{{ formatUsd(subagentKnownUsd) }}</span
+            >
+            <span v-else class="token-cost-legend-unit">no pricing</span>
+          </td>
+        </tr>
+      </tbody>
       <ModelCostBreakdown
         v-for="model in modelComparison"
         :key="model.model"
@@ -173,37 +276,6 @@
           <td v-if="hasSubagents" class="token-cost-empty">—</td>
         </tr>
       </tbody>
-      <tfoot>
-        <tr class="token-cost-subtotal-row">
-          <th scope="row">Subtotal</th>
-          <td data-testid="conversation-cost-subtotal">
-            <span
-              v-if="mainKnownUsd > 0 || mainUnpricedCalls === 0"
-              class="token-cost-legend-cost"
-              >{{ formatUsd(mainKnownUsd) }}</span
-            >
-            <span v-else class="token-cost-legend-unit">no pricing</span>
-          </td>
-          <td v-if="hasSubagents" data-testid="subagent-cost-row">
-            <span
-              v-if="subagentKnownUsd > 0 || subagentUsage?.unpriced_calls === 0"
-              class="token-cost-legend-cost"
-              >{{ formatUsd(subagentKnownUsd) }}</span
-            >
-            <span v-else class="token-cost-legend-unit">no pricing</span>
-          </td>
-        </tr>
-        <tr
-          v-if="!subagentLoading && showCostSummary"
-          class="token-cost-total-row"
-          data-testid="token-cost-total"
-        >
-          <th scope="row" :colspan="hasSubagents ? 2 : 1">Total</th>
-          <td>
-            <span class="token-cost-legend-cost">≈{{ formatUsd(costSummary.totalUsd) }}</span>
-          </td>
-        </tr>
-      </tfoot>
     </table>
     <div v-if="!loading && hasSubagents" class="token-cost-graph-note">
       Sub-agent model totals include nested sub-agents and indirect usage.
@@ -233,7 +305,8 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import type { Model } from "../../types";
+import type { Message, Model } from "../../types";
+import ContextLegend from "./ContextLegend.vue";
 import ModelCostBreakdown from "./ModelCostBreakdown.vue";
 import {
   modelCostsApi,
@@ -248,13 +321,17 @@ import {
   buildTokenCostStack,
   callXLayout,
   countConfirmedUnpricedCalls,
+  deltaBars,
   formatDuration,
   formatTokenCount,
   formatUsd,
+  generationBoundary,
   generationStarts,
+  stackedAreaPaths,
   timeXLayout,
   yTicks,
   TOKEN_BANDS,
+  type DeltaBar,
   type ModelUsage,
   type OtherPurposeUsage,
   type OtherUsageBreakdown,
@@ -263,21 +340,67 @@ import {
   type UsageEntry,
   type XLayout,
 } from "../../utils/tokenCostGraph";
+import { callCostParts, callNote, missedBars, readPrompts } from "../../utils/callCost";
+import { layoutPanes, type PaneBox, type UsagePane } from "../../utils/usagePanes";
+import {
+  contextCategories,
+  contextLayers,
+  contextSegmentStarts,
+  promptGrowth,
+} from "./contextCategories";
+import { contextCompositionPoints, type Point } from "./contextComposition";
 
 const props = defineProps<{
   entries: UsageEntry[];
+  /** The conversation's messages, for the context graph. */
+  messages?: Message[];
   models: Model[];
   otherUsageRows?: OtherUsageRow[];
   conversationId?: string | null;
   active?: boolean;
+  /** Which graphs are on; they stack in a fixed order whatever this one is. */
+  panes: UsagePane[];
 }>();
 
-const W = 280;
-const H = 150;
-const PADL = 32;
-const PADR = 6;
-const PADT = 6;
+// Pixel geometry, drawn 1:1: the viewBox is as wide as the svg actually is
+// (measured below), so the graph stretches with the popup instead of scaling
+// its text. Each pane's label runs down the left edge, in one or two lines
+// (LABEL_X); tick labels sit between it and the plot.
+const DEFAULT_W = 420;
+const MIN_W = 200;
+const PADL = 52;
+const PADR = 8;
+// Room above the first pane for its label, which can be taller than the pane
+// (the incremental strip is shorter than "Incremental" is long).
+const PADT = 12;
+const PANE_GAP = 10;
 const PADB = 18;
+const LABEL_X = [9, 20];
+
+const W = ref(DEFAULT_W);
+const svgRef = ref<SVGSVGElement | null>(null);
+let resizeObserver: ResizeObserver | null = null;
+watch(svgRef, (svg) => {
+  resizeObserver?.disconnect();
+  resizeObserver = null;
+  if (!svg || typeof ResizeObserver === "undefined") return;
+  // contentRect is layout size: unlike getBoundingClientRect it ignores the
+  // popup's open animation, which scales it.
+  resizeObserver = new ResizeObserver((entries) => {
+    const width = Math.round(entries[entries.length - 1].contentRect.width);
+    if (width > 0) W.value = Math.max(MIN_W, width);
+  });
+  resizeObserver.observe(svg);
+});
+onBeforeUnmount(() => resizeObserver?.disconnect());
+
+const plotW = computed(() => W.value - PADL - PADR);
+const paneBoxes = computed<PaneBox[]>(() => layoutPanes(props.panes, PADT, PANE_GAP));
+const H = computed(() => (paneBoxes.value.at(-1)?.bottom ?? PADT) + PADB);
+const showsContext = computed(() => props.panes.includes("context"));
+// The context graph needs no pricing, so it need not wait for the lookup.
+const needsPricing = computed(() => props.panes.some((pane) => pane !== "context"));
+const pricingPending = computed(() => loading.value && needsPricing.value);
 
 const loading = ref(false);
 const fetchFailed = ref(false);
@@ -528,9 +651,6 @@ const showCostSummary = computed(() => {
   );
 });
 
-const plotW = W - PADL - PADR;
-const plotH = H - PADT - PADB;
-
 const xMode = ref<"calls" | "time">("calls");
 
 const layout = computed<XLayout>(() =>
@@ -538,48 +658,86 @@ const layout = computed<XLayout>(() =>
 );
 
 function xAt(i: number): number {
-  return PADL + layout.value.xs[i] * plotW;
+  return PADL + layout.value.xs[i] * plotW.value;
 }
 
-function yAt(v: number): number {
-  const maxY = stack.value?.maxY || 1;
-  return PADT + plotH * (1 - v / maxY);
+const unit = computed(() => (stack.value?.weighted ? "cost" : "tokens"));
+
+// The context graph's points are one per LLM call, like the usage entries, so
+// they normally share the cost graph's x positions. Should the two ever
+// disagree on the number of calls, the context graph spreads its own points
+// evenly instead.
+const ctxPoints = computed<Point[]>(() =>
+  props.messages ? contextCompositionPoints(props.messages) : [],
+);
+const categories = computed(() => contextCategories(ctxPoints.value));
+const ctxLayers = computed(() => contextLayers(ctxPoints.value, categories.value));
+const ctxAligned = computed(() => ctxPoints.value.length === (stack.value?.n ?? 0));
+const ctxLayout = computed<XLayout>(() =>
+  ctxAligned.value ? layout.value : callXLayout(ctxPoints.value.length),
+);
+
+// A vertical guide through every pane, skipping the gaps between them.
+function guide(x: number): string {
+  const px = x.toFixed(1);
+  return paneBoxes.value.map((b) => `M${px},${b.top}V${b.bottom}`).join("");
 }
 
-// One path per (model, band) segment; each turn is a separate subpath so
-// idle time between turns renders as a gap in time mode. Zero-width turns
-// (single call, or all calls sharing one second-granularity timestamp)
-// become narrow slabs so they stay visible.
-const segPaths = computed<string[]>(() => {
-  const s = stack.value;
-  const lay = layout.value;
-  if (!s || s.n === 0 || s.maxY === 0) return [];
-  const px = (i: number) => (PADL + lay.xs[i] * plotW).toFixed(1);
-  const lower = (si: number, i: number) => (si === 0 ? 0 : s.layers[si - 1][i]);
-  return s.segments.map((_, si) => {
-    let d = "";
-    for (const [a, b] of lay.turns) {
-      if (lay.xs[a] === lay.xs[b]) {
-        const x = PADL + lay.xs[a] * plotW;
-        const hw = Math.max(1, plotW * 0.006);
-        const x0 = Math.max(PADL, x - hw).toFixed(1);
-        const x1 = Math.min(W - PADR, x + hw).toFixed(1);
-        const yT = yAt(s.layers[si][b]).toFixed(1);
-        const yB = yAt(lower(si, b)).toFixed(1);
-        d += `M${x0},${yT}L${x1},${yT}L${x1},${yB}L${x0},${yB}Z`;
-        continue;
-      }
-      const top: string[] = [];
-      for (let i = a; i <= b; i++) top.push(`${px(i)},${yAt(s.layers[si][i]).toFixed(1)}`);
-      const bottom: string[] = [];
-      for (let i = b; i >= a; i--) bottom.push(`${px(i)},${yAt(lower(si, i)).toFixed(1)}`);
-      d += `M${top.join("L")}L${bottom.join("L")}Z`;
-    }
-    return d;
-  });
+// Compactions: new generations, and in-place records in the context. Both
+// reset the context, so they are marked through every pane.
+const markStarts = computed<number[]>(() => {
+  const starts = new Set(generationStarts(props.entries));
+  if (ctxAligned.value) for (const i of contextSegmentStarts(ctxPoints.value)) starts.add(i);
+  return [...starts].sort((a, b) => a - b);
 });
 
-const ticks = computed<number[]>(() => yTicks(stack.value?.maxY ?? 0));
+function markX(i: number): number {
+  return PADL + generationBoundary(bars.value, layout.value.xs, i) * plotW.value;
+}
+
+// Non-overlapping per-call bars; each draws (and hovers as) one call.
+const bars = computed<DeltaBar[]>(() => {
+  const s = stack.value;
+  if (!s || s.n === 0 || s.segments.length === 0) return [];
+  return deltaBars(layout.value.xs, s.deltaLayers[s.segments.length - 1]);
+});
+
+// What each call's prompt was against the cache; misses are marked above
+// their bars in the incremental strip.
+const promptReadings = computed(() => readPrompts(props.entries));
+
+const missMarks = computed(() => {
+  const box = paneViews.value.find((pane) => pane.id === "incremental")?.box;
+  if (!box) return "";
+  return missedBars(bars.value, promptReadings.value)
+    .map((b) => {
+      const x = PADL + ((b.left + b.right) / 2) * plotW.value;
+      return `M${(x - 3).toFixed(1)},${box.top - 6}h6l-3,5z`;
+    })
+    .join("");
+});
+
+// One path per segment holding a rect per bar with a nonzero share.
+function barPaths(s: TokenCostStack, yAt: (v: number) => number): string[] {
+  if (s.maxDelta === 0) return [];
+  const xs = bars.value.map((b) => [
+    (PADL + b.left * plotW.value).toFixed(2),
+    (PADL + b.right * plotW.value).toFixed(2),
+  ]);
+  return s.segments.map((_, si) => {
+    let d = "";
+    bars.value.forEach((b, k) => {
+      const top = s.deltaLayers[si][b.call];
+      const bottom = si === 0 ? 0 : s.deltaLayers[si - 1][b.call];
+      if (top <= bottom) return;
+      const [x0, x1] = xs[k];
+      const yT = yAt(top).toFixed(1);
+      const yB = yAt(bottom).toFixed(1);
+      d += `M${x0},${yB}V${yT}H${x1}V${yB}Z`;
+    });
+    return d;
+  });
+}
 
 function tickLabel(v: number): string {
   if (!stack.value?.weighted) return formatTokenCount(v);
@@ -589,22 +747,104 @@ function tickLabel(v: number): string {
   return formatUsd(v);
 }
 
+interface PaneTick {
+  value: number;
+  y: number;
+  label: string;
+  /** Draw a gridline across the plot. */
+  grid: boolean;
+}
+
+interface PaneView {
+  id: UsagePane;
+  box: PaneBox;
+  /** Label lines, read bottom-to-top down the pane's left side. */
+  label: string[];
+  ticks: PaneTick[];
+  /** One filled path per band, drawn bottom-to-top. */
+  paths: string[];
+  colors: string[];
+}
+
+function yScale(box: PaneBox, max: number): (v: number) => number {
+  return (v) => box.top + box.height * (1 - v / (max || 1));
+}
+
+const paneViews = computed<PaneView[]>(() => {
+  const s = stack.value;
+  if (!s || s.n === 0) return [];
+  const area = (yAt: (v: number) => number) => ({ left: PADL, right: W.value - PADR, yAt });
+  return paneBoxes.value.map((box): PaneView => {
+    switch (box.pane) {
+      case "context": {
+        const max = ctxLayers.value.at(-1)?.reduce((m, v) => Math.max(m, v), 0) ?? 0;
+        const yAt = yScale(box, max);
+        return {
+          id: box.pane,
+          box,
+          label: ["Context", "tokens"],
+          ticks: yTicks(max).map((value) => ({
+            value,
+            y: yAt(value),
+            label: formatTokenCount(value),
+            grid: true,
+          })),
+          paths: max > 0 ? stackedAreaPaths(ctxLayers.value, ctxLayout.value, area(yAt)) : [],
+          colors: categories.value.map((c) => c.color),
+        };
+      }
+      case "cumulative": {
+        const yAt = yScale(box, s.maxY);
+        return {
+          id: box.pane,
+          box,
+          label: ["Cumulative", unit.value],
+          ticks: yTicks(s.maxY).map((value) => ({
+            value,
+            y: yAt(value),
+            label: tickLabel(value),
+            grid: true,
+          })),
+          paths: s.maxY > 0 ? stackedAreaPaths(s.layers, layout.value, area(yAt)) : [],
+          colors: s.segments.map((seg) => seg.color),
+        };
+      }
+      case "incremental": {
+        // Too short for gridlines: just the tallest call's value, by the top.
+        const yAt = yScale(box, s.maxDelta);
+        return {
+          id: box.pane,
+          box,
+          label: ["Incremental", unit.value],
+          ticks:
+            s.maxDelta > 0
+              ? [{ value: s.maxDelta, y: box.top + 3, label: tickLabel(s.maxDelta), grid: false }]
+              : [],
+          paths: barPaths(s, yAt),
+          colors: s.segments.map((seg) => seg.color),
+        };
+      }
+    }
+  });
+});
+
 const xAxisLabel = computed(() => {
   const s = stack.value;
   if (!s) return "";
-  if (xMode.value === "calls") return `LLM call number (${s.n} calls)`;
+  if (xMode.value === "calls") return "LLM call";
   const lay = layout.value;
   const dur = lay.activeMs > 0 ? `${formatDuration(lay.activeMs)} active` : "time";
   return lay.turns.length > 1 ? `${dur} · gaps = idle between turns` : dur;
 });
 
-const hintText = computed(() => {
-  const parts: string[] = [];
-  if (genStarts.value.length) parts.push("Dashed lines mark new generations (compactions).");
-  if (xMode.value === "time" && layout.value.turns.length > 1)
-    parts.push("Idle time between turns is not to scale.");
-  return parts.join(" ");
-});
+const hintText = computed(() =>
+  [
+    needsPricing.value ? "Hover a call to see what drove its cost." : "",
+    markStarts.value.length ? "Dashed lines mark compactions." : "",
+  ]
+    .filter(Boolean)
+    .join(" "),
+);
 
 // ChatGPT subscriptions report zero writes even when caching works.
 // Usage uses native model names, not picker IDs. A graph group can combine
@@ -639,68 +879,206 @@ function isSubscriptionUsage(name: string, url?: string): boolean {
   return sources.length > 0 && sources.every((model) => model.mode === "chatgpt");
 }
 
-const hoverIndex = ref<number | null>(null);
+// Pointer position as a plot fraction. The hovered call is derived from it,
+// so a redraw (pricing arriving, axis switch) can't leave the readout
+// describing a different call than the one drawn under the pointer.
+const hoverFrac = ref<number | null>(null);
 
-// A shrinking entries list (e.g. switching conversations) could leave a stale
-// out-of-range index behind.
-watch(
-  () => stack.value?.n,
-  () => (hoverIndex.value = null),
-);
-
-function onMove(ev: MouseEvent) {
-  const s = stack.value;
-  if (!s || s.n === 0) return;
-  const svg = ev.currentTarget as SVGSVGElement;
-  const rect = svg.getBoundingClientRect();
-  const px = ((ev.clientX - rect.left) / rect.width) * W;
-  const frac = (px - PADL) / plotW;
-  const xs = layout.value.xs;
-  let best = 0;
-  let bestD = Infinity;
-  for (let i = 0; i < xs.length; i++) {
-    const d = Math.abs(xs[i] - frac);
-    if (d < bestD) {
-      bestD = d;
-      best = i;
-    }
-  }
-  hoverIndex.value = best;
+function clearHover() {
+  hoverFrac.value = null;
 }
 
-const hoverEntry = computed<UsageEntry | null>(() => {
+// Switching conversations swaps the graph out from under a still pointer.
+watch(() => stack.value?.n, clearHover);
+
+// The call under the pointer: the one its per-call bar draws, so the readout
+// always matches the bar beneath the cursor. Every call lies inside its bar,
+// so the hover line (at the call's x) does too.
+const hoverIndex = computed<number | null>(() => {
+  const frac = hoverFrac.value;
+  if (frac === null) return null;
+  let best: DeltaBar | null = null;
+  let bestD = Infinity;
+  for (const b of bars.value) {
+    const d = Math.max(b.left - frac, frac - b.right, 0);
+    if (d < bestD) {
+      bestD = d;
+      best = b;
+    }
+  }
+  return best?.call ?? null;
+});
+
+const hoverX = computed(() => (hoverIndex.value === null ? null : xAt(hoverIndex.value)));
+
+function onMove(ev: MouseEvent) {
+  const rect = (ev.currentTarget as SVGSVGElement).getBoundingClientRect();
+  const px = ((ev.clientX - rect.left) / rect.width) * W.value;
+  hoverFrac.value = (px - PADL) / plotW.value;
+}
+
+function amount(v: number): string {
+  return stack.value?.weighted ? formatUsd(v) : `${formatTokenCount(v)} tok`;
+}
+
+// The context point under the pointer: the hovered call's own, or, when the
+// two series disagree on how many calls there are, the nearest by position.
+const ctxHoverIndex = computed<number | null>(() => {
+  const points = ctxPoints.value;
+  if (points.length === 0) return null;
+  if (ctxAligned.value) return hoverIndex.value;
+  const frac = hoverFrac.value;
+  if (frac === null) return null;
+  const xs = ctxLayout.value.xs;
+  let best = 0;
+  for (let i = 1; i < xs.length; i++) {
+    if (Math.abs(xs[i] - frac) < Math.abs(xs[best] - frac)) best = i;
+  }
+  return best;
+});
+
+// What the context legend counts: the hovered call, else the latest.
+const legendPoint = computed<Point | null>(() => {
+  const i = ctxHoverIndex.value;
+  return ctxPoints.value[i ?? ctxPoints.value.length - 1] ?? null;
+});
+
+// "call 169, $1.61, cumulative $47.05, context 174k", then the snippet:
+// "(bash)". Each graph that is on adds its figure. Time mode adds the time.
+function readoutHeader(call: number, f: ReadoutFigures): string {
+  const parts = [`call ${call}`];
+  if (xMode.value === "time" && f.time) {
+    const d = new Date(f.time);
+    const day = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    parts.push(`${day} ${d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`);
+  }
+  if (props.panes.includes("incremental")) parts.push(f.cost);
+  if (props.panes.includes("cumulative")) parts.push(`cumulative ${f.cumulative}`);
+  if (f.context) parts.push(`context ${f.context}`);
+  return parts.join(", ");
+}
+
+interface ReadoutFigures {
+  time?: number;
+  cost: string;
+  cumulative: string;
+  context?: string;
+}
+
+const hoverText = computed(() => {
   const s = stack.value;
   const i = hoverIndex.value;
-  if (!s || i === null || i >= s.n) return null;
-  return props.entries[i];
-});
-
-const genStarts = computed(() => generationStarts(props.entries));
-
-// Generation number shown in the hover readout, only when the conversation
-// actually spans multiple generations.
-const hoverGeneration = computed<number | null>(() => {
-  if (genStarts.value.length === 0) return null;
-  return hoverEntry.value?.generation ?? null;
-});
-
-// Wall-clock time of the hovered call, shown in time mode.
-const hoverTime = computed(() => {
-  const ts = hoverEntry.value?.timestamp;
-  if (xMode.value !== "time" || !ts) return "";
-  return new Date(ts).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
+  if (!s || i === null) return "";
+  const e = props.entries[i];
+  const top = s.segments.length - 1;
+  // A call to an unpriced model adds nothing to a dollar graph, but it is
+  // not free: say so, with the provider's own figure when there is one.
+  const cost =
+    s.weighted && !(e.model && costs.value[e.model])
+      ? e.cost_usd > 0
+        ? `${formatUsd(e.cost_usd)} reported`
+        : "unpriced"
+      : amount(s.deltaLayers[top][i]);
+  const point = props.panes.includes("context") ? legendPoint.value : null;
+  return readoutHeader(i + 1, {
+    time: e.timestamp,
+    cost,
+    cumulative: amount(s.layers[top][i]),
+    context: point && ctxHoverIndex.value !== null ? formatTokenCount(point.total) : undefined,
   });
 });
 
-const hoverTotal = computed(() => {
+// The hovered call's cost by token type, colored like its bar: what it paid
+// for. Shown whenever a cost graph is on.
+const hoverParts = computed(() => {
   const s = stack.value;
   const i = hoverIndex.value;
-  if (!s || i === null || i >= s.n || s.segments.length === 0) return "";
-  const top = s.layers[s.segments.length - 1][i];
-  return s.weighted ? formatUsd(top) : `${formatTokenCount(top)} tok`;
+  if (!s || i === null || !needsPricing.value) return [];
+  const e = props.entries[i];
+  const model = e.model || "unknown model";
+  const rows = s.perModel.find((m) => m.model === model)?.rows;
+  const parts = callCostParts(e, e.model ? costs.value[e.model] : null);
+  // A free call's split is all "$0": the token counts say enough.
+  const free = parts.every((part) => !part.usd);
+  return parts.map((part) => ({
+    // "Cache write 148k $0.739": one string, so no template whitespace is lost.
+    text: [
+      TOKEN_BANDS[part.band].label,
+      formatTokenCount(part.tokens),
+      ...(part.usd === null || free ? [] : [formatUsd(part.usd)]),
+    ].join(" "),
+    color: rows?.[part.band].color ?? "",
+  }));
 });
+
+// A note on the hovered call: a cache miss, or what its uncached prompt
+// was when that cost the most.
+const hoverWhy = computed(() => {
+  const i = hoverIndex.value;
+  if (i === null || !needsPricing.value) return "";
+  const e = props.entries[i];
+  const growth = ctxAligned.value ? promptGrowth(ctxPoints.value, i, categories.value) : null;
+  return callNote(e, promptReadings.value[i], e.model ? costs.value[e.model] : null, growth);
+});
+const hoverMiss = computed(
+  () => hoverIndex.value !== null && promptReadings.value[hoverIndex.value]?.kind === "miss",
+);
+
+const hoverSnippet = computed(() =>
+  hoverIndex.value === null ? "" : props.entries[hoverIndex.value]?.snippet || "",
+);
+
+interface ReadoutView {
+  key: string;
+  text: string;
+  snippet: string;
+  parts: { text: string; color: string }[];
+  why: string;
+  miss: boolean;
+}
+
+// Readouts at least as tall as any call's, for the live one to share a cell
+// with: the longest header, all four token types, and each of the longest
+// notes.
+const sizerViews = computed<ReadoutView[]>(() => {
+  const s = stack.value;
+  if (!s) return [];
+  const big = s.weighted ? "$99,999" : "999.9M tok";
+  const text = readoutHeader(99_999, {
+    time: new Date(2026, 8, 30, 12, 59).getTime(),
+    cost: s.weighted ? "$0.0000 reported" : big,
+    cumulative: big,
+    context: props.panes.includes("context") ? "999k" : undefined,
+  });
+  const parts = needsPricing.value
+    ? TOKEN_BANDS.map((band) => ({
+        text: `${band.label} 999k${s.weighted ? " $9.999" : ""}`,
+        color: "",
+      }))
+    : [];
+  const longest = (names: string[]) => names.reduce((a, b) => (b.length > a.length ? b : a), "");
+  const model = longest(s.perModel.map((m) => m.model));
+  const category = longest(categories.value.map((c) => c.label));
+  const whys = needsPricing.value
+    ? [
+        `Cache miss, 9999h 59m after the previous call: 999k of 999k prompt tokens were still cached (999k new, mostly ${category}).`,
+        `Cache miss on switching back to ${model}: 999k of 999k prompt tokens were still cached (999k new).`,
+        `First call on ${model}: 999k prompt tokens weren't cached yet.`,
+      ]
+    : [""];
+  const snippet = "x".repeat(100);
+  return whys.map((why, k) => ({ key: `sizer-${k}`, text, snippet, parts, why, miss: true }));
+});
+
+const readoutViews = computed<ReadoutView[]>(() => [
+  ...sizerViews.value,
+  {
+    key: "live",
+    text: hoverText.value,
+    snippet: hoverSnippet.value,
+    parts: hoverParts.value,
+    why: hoverWhy.value,
+    miss: hoverMiss.value,
+  },
+]);
 </script>

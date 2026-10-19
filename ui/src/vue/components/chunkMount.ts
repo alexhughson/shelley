@@ -31,6 +31,9 @@ export interface ChunkMountState {
   // re-query the DOM after nextTick. False means "already mounted or unknown"
   // — callers treat both as "just query the DOM".
   revealTarget: (target: { messageId?: string; toolUseId?: string; fragment?: string }) => boolean;
+  // Keys of the expanded carried bands. Here rather than in each band so a
+  // jump to a message inside a collapsed band can expand it. Reactive Set.
+  expandedBands: Set<string>;
 }
 
 export const chunkMountKey: InjectionKey<ChunkMountState> = Symbol("chunkMount");

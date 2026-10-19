@@ -175,6 +175,8 @@ function conv(convId: string, agentWorking: boolean): Conversation {
     current_generation: 0,
     agent_working: agentWorking,
     turn_interrupted: false,
+    external_conversation_id: null,
+    external_endpoint: null,
     tags: "[]",
     is_draft: false,
     draft: "",

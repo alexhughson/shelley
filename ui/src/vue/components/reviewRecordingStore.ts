@@ -2,7 +2,14 @@
 // are written as they are produced and kept until the server has accepted the
 // finished recording, so a crash, reload, or failed upload never loses one.
 import { openDB, type DBSchema, type IDBPDatabase } from "idb";
+import type { ChatRequest } from "../../types";
 import type { ReviewEvent } from "./reviewCapture";
+
+// How a conversation started by a recording is set up; taken at start.
+export interface NewReviewConversation {
+  model: string;
+  conversation_options?: ChatRequest["conversation_options"];
+}
 
 export interface ReviewSession {
   id: string;
@@ -11,8 +18,14 @@ export interface ReviewSession {
   // Wall-clock time of audio t=0.
   startedAt: string;
   durationMs: number;
-  // Receives the recording; bound when recording starts.
-  conversationId: string;
+  // Receives the recording; bound when recording starts. One made outside a
+  // conversation (newConversation) goes to the page's draft when it has one,
+  // else to a draft of its own made when first sent.
+  conversationId?: string;
+  newConversation?: NewReviewConversation;
+  // conversationId is a draft this recording made; discarding deletes it
+  // while it is still empty.
+  ownsConversation?: boolean;
   audioPath?: string;
   eventsPath?: string;
 }

@@ -244,8 +244,7 @@ func TestCustomModelUpdatePersistsMaxOutputTokens(t *testing.T) {
 		"endpoint":"https://example.test/v1",
 		"api_key":"",
 		"model_name":"test-model",
-		"max_tokens":77777,
-		"tags":"updated"
+		"max_tokens":77777
 	}`)
 	req := httptest.NewRequest(http.MethodPut, "/api/custom-models/"+created.ModelID, bytes.NewReader(body))
 	rec := httptest.NewRecorder()
@@ -276,8 +275,7 @@ func TestCustomModelUpdateWithoutMaxOutputTokensPreservesExistingValue(t *testin
 		"provider_type":"openai",
 		"endpoint":"https://example.test/v1",
 		"api_key":"",
-		"model_name":"test-model",
-		"tags":"updated"
+		"model_name":"test-model"
 	}`)
 	req := httptest.NewRequest(http.MethodPut, "/api/custom-models/"+created.ModelID, bytes.NewReader(body))
 	rec := httptest.NewRecorder()

@@ -12,10 +12,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"shelley.exe.dev/claudetool"
 	"shelley.exe.dev/exeenv"
 	"shelley.exe.dev/llm"
 	"shelley.exe.dev/models"
@@ -96,12 +98,17 @@ func TestBuildLLMConfigSkipsGatewayWhenReflectionFoundLLMIntegration(t *testing.
 	}
 }
 
-func TestBuildLLMConfigAppliesExeEnvironmentBeforeDiscovery(t *testing.T) {
-	oldEnv, err := exeenv.Current()
+func TestBuildLLMConfigDoesNotOverrideMetadataEnvironment(t *testing.T) {
+	oldEnv, err := exeenv.New("https", "exe.xyz")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { exeenv.Configure(oldEnv) })
+	metadataEnv, err := exeenv.New("http", "exe.cloud")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exeenv.Configure(metadataEnv)
 
 	oldDiscover := discoverLLMIntegrations
 	discoverLLMIntegrations = func(context.Context, *http.Client, *slog.Logger) modelsources.LLMIntegrationDiscoveryResult {
@@ -109,7 +116,7 @@ func TestBuildLLMConfigAppliesExeEnvironmentBeforeDiscovery(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := env.ReflectionURL(); got != "https://reflection.int.example.test" {
+		if got := env.ReflectionURL(); got != metadataEnv.ReflectionURL() {
 			t.Fatalf("discovery environment = %q", got)
 		}
 		return modelsources.LLMIntegrationDiscoveryResult{}
@@ -261,7 +268,7 @@ func TestModelsCommandDefaultIDMatchesServerVisibility(t *testing.T) {
 	}
 }
 
-func TestBuildLLMConfigRejectsInvalidExeEnvironmentBeforeDiscovery(t *testing.T) {
+func TestBuildLLMConfigIgnoresInvalidLegacyExeEnvironment(t *testing.T) {
 	oldDiscover := discoverLLMIntegrations
 	discoveryCalls := 0
 	discoverLLMIntegrations = func(context.Context, *http.Client, *slog.Logger) modelsources.LLMIntegrationDiscoveryResult {
@@ -276,11 +283,11 @@ func TestBuildLLMConfigRejectsInvalidExeEnvironmentBeforeDiscovery(t *testing.T)
 	}
 
 	_, err := buildLLMConfig(GlobalConfig{ConfigPath: configPath}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
-	if err == nil || !strings.Contains(err.Error(), "exe_environment") {
-		t.Fatalf("buildLLMConfig() error = %v", err)
+	if err != nil {
+		t.Fatalf("legacy exe_environment should be ignored: %v", err)
 	}
-	if discoveryCalls != 0 {
-		t.Fatalf("discovery called %d times before config validation", discoveryCalls)
+	if discoveryCalls != 1 {
+		t.Fatalf("discovery called %d times, want 1", discoveryCalls)
 	}
 }
 
@@ -294,9 +301,13 @@ func TestToolModelsHideUnknownIntegrationModelsButKeepCustomModels(t *testing.T)
 		},
 	}
 
-	got := setupToolSetConfig(nil, provider, nil).BuildAvailableModels()
-	if len(got) != 2 || got[0].ID != "gpt-5.6-sol" || got[1].ID != "my-custom-model" {
-		t.Fatalf("available tool models = %+v, want known and custom models", got)
+	got := setupToolSetConfig(nil, provider).BuildAvailableModels("")
+	want := []claudetool.AvailableModel{
+		{Name: "gpt-5.6-sol", ID: "gpt-5.6-sol"},
+		{Name: "my-custom-model", ID: "my-custom-model"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("available tool models = %+v, want %+v", got, want)
 	}
 }
 
@@ -305,9 +316,177 @@ func TestToolModelsKeepBothLunaGenerationsAvailable(t *testing.T) {
 		ids: []string{"gpt-6-luna", "gpt-5.6-luna", "gpt-6-sol", "gpt-5.6-sol"},
 	}
 
-	got := setupToolSetConfig(nil, provider, nil).BuildAvailableModels()
-	if len(got) != 3 || got[0].ID != "gpt-6-luna" || got[1].ID != "gpt-5.6-luna" || got[2].ID != "gpt-6-sol" {
-		t.Fatalf("available tool models = %+v, want both Luna generations but only the latest Sol", got)
+	got := setupToolSetConfig(nil, provider).BuildAvailableModels("")
+	want := []claudetool.AvailableModel{
+		{Name: "gpt-6-luna", ID: "gpt-6-luna"},
+		{Name: "gpt-5.6-luna", ID: "gpt-5.6-luna"},
+		{Name: "gpt-6-sol", ID: "gpt-6-sol"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("available tool models = %+v, want %+v", got, want)
+	}
+}
+
+func TestToolModelsPreferParentChatGPTSubscriptionForDuplicates(t *testing.T) {
+	const (
+		parentModel  = "gpt-6-astra@llm-sub-oai"
+		subscription = "https://llm-sub-oai.int.exe.xyz"
+	)
+	provider := &tieredModelProvider{
+		ids: []string{
+			parentModel,
+			"gpt-6-luna@llm-sub-oai",
+			"gpt-6-luna",
+			"gpt-6-sol",
+			"claude-opus-5.5",
+			"custom-luna-endpoint",
+			"upstream-only@llm-sub-oai",
+		},
+		infos: map[string]*models.ModelInfo{
+			parentModel:                 {Mode: "chatgpt", BaseURL: subscription, Provider: models.ProviderOpenAI, APIModelName: "gpt-6-astra"},
+			"gpt-6-luna@llm-sub-oai":    {Mode: "chatgpt", BaseURL: subscription, Provider: models.ProviderOpenAI, APIModelName: "gpt-6-luna"},
+			"gpt-6-luna":                {Mode: "managed", BaseURL: "https://llm.int.exe.xyz", Provider: models.ProviderOpenAI, APIModelName: "gpt-6-luna"},
+			"gpt-6-sol":                 {Mode: "managed", BaseURL: "https://llm.int.exe.xyz", Provider: models.ProviderOpenAI, APIModelName: "gpt-6-sol"},
+			"claude-opus-5.5":           {Provider: models.ProviderAnthropic, APIModelName: "claude-opus-5.5"},
+			"custom-luna-endpoint":      {Source: models.SourceCustomLabel, Provider: models.ProviderOpenAI, APIModelName: "gpt-6-luna"},
+			"upstream-only@llm-sub-oai": {Mode: "chatgpt", BaseURL: subscription, Provider: models.ProviderOpenAI, APIModelName: "upstream-only"},
+		},
+	}
+
+	// Agents see catalog names; the subscription route is chosen when used.
+	got := setupToolSetConfig(nil, provider).BuildAvailableModels(parentModel)
+	want := []claudetool.AvailableModel{
+		{Name: "gpt-6-astra", ID: parentModel},
+		{Name: "gpt-6-luna", ID: "gpt-6-luna@llm-sub-oai"},
+		{Name: "gpt-6-sol", ID: "gpt-6-sol"},
+		{Name: "claude-opus-5.5", ID: "claude-opus-5.5"},
+		{Name: "custom-luna-endpoint", ID: "custom-luna-endpoint"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("available models = %+v, want %+v", got, want)
+	}
+}
+
+func TestToolModelsKeepDistinctNativeModelsWithSameCatalogID(t *testing.T) {
+	const (
+		parentModel  = "gpt-6-astra@subscription"
+		subscription = "https://subscription.int.exe.xyz"
+	)
+	provider := &tieredModelProvider{
+		ids: []string{parentModel, "gpt-6-luna@subscription", "gpt-6-luna"},
+		infos: map[string]*models.ModelInfo{
+			parentModel:               {Mode: "chatgpt", BaseURL: subscription, Provider: models.ProviderOpenAI, APIModelName: "gpt-6-astra"},
+			"gpt-6-luna@subscription": {Mode: "chatgpt", BaseURL: subscription, Provider: models.ProviderOpenAI, APIModelName: "subscription-luna"},
+			"gpt-6-luna":              {Mode: "managed", BaseURL: "https://gateway.int.exe.xyz", Provider: models.ProviderOpenAI, APIModelName: "gpt-6-luna"},
+		},
+	}
+
+	// Both routes stay selectable, so their names must stay distinct.
+	got := setupToolSetConfig(nil, provider).BuildAvailableModels(parentModel)
+	want := []claudetool.AvailableModel{
+		{Name: "gpt-6-astra", ID: parentModel},
+		{Name: "gpt-6-luna@subscription", ID: "gpt-6-luna@subscription"},
+		{Name: "gpt-6-luna", ID: "gpt-6-luna"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("available models = %+v, want %+v", got, want)
+	}
+}
+
+func TestToolModelsDoNotPreferHiddenSubscriptionDuplicate(t *testing.T) {
+	const (
+		parentModel  = "gpt-6-astra@subscription"
+		subscription = "https://subscription.int.exe.xyz"
+	)
+	provider := &tieredModelProvider{
+		ids: []string{parentModel, "future-luna@subscription", "gpt-6-luna"},
+		infos: map[string]*models.ModelInfo{
+			parentModel:                {Mode: "chatgpt", BaseURL: subscription, Provider: models.ProviderOpenAI, APIModelName: "gpt-6-astra"},
+			"future-luna@subscription": {Mode: "chatgpt", BaseURL: subscription, Provider: models.ProviderOpenAI, APIModelName: "gpt-6-luna"},
+			"gpt-6-luna":               {Mode: "managed", BaseURL: "https://gateway.int.exe.xyz", Provider: models.ProviderOpenAI, APIModelName: "gpt-6-luna"},
+		},
+	}
+
+	got := setupToolSetConfig(nil, provider).BuildAvailableModels(parentModel)
+	want := []claudetool.AvailableModel{
+		{Name: "gpt-6-astra", ID: parentModel},
+		{Name: "gpt-6-luna", ID: "gpt-6-luna"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("available models = %+v, want %+v", got, want)
+	}
+}
+
+func TestToolModelsPreferUnqualifiedParentSubscription(t *testing.T) {
+	const (
+		parentModel  = "gpt-6-astra"
+		subscription = "https://llm.int.exe.xyz"
+	)
+	provider := &tieredModelProvider{
+		ids: []string{
+			parentModel,
+			"gpt-6-luna",
+			"gpt-6-luna@gateway",
+			"gpt-6-sol",
+		},
+		infos: map[string]*models.ModelInfo{
+			parentModel:          {Mode: "chatgpt", BaseURL: subscription, Provider: models.ProviderOpenAI, APIModelName: "gpt-6-astra"},
+			"gpt-6-luna":         {Mode: "chatgpt", BaseURL: subscription, Provider: models.ProviderOpenAI, APIModelName: "gpt-6-luna"},
+			"gpt-6-luna@gateway": {Mode: "managed", BaseURL: "https://gateway.int.exe.xyz", Provider: models.ProviderOpenAI, APIModelName: "gpt-6-luna"},
+			"gpt-6-sol":          {Mode: "managed", BaseURL: "https://gateway.int.exe.xyz", Provider: models.ProviderOpenAI, APIModelName: "gpt-6-sol"},
+		},
+	}
+
+	got := setupToolSetConfig(nil, provider).BuildAvailableModels(parentModel)
+	want := []claudetool.AvailableModel{
+		{Name: parentModel, ID: parentModel},
+		{Name: "gpt-6-luna", ID: "gpt-6-luna"},
+		{Name: "gpt-6-sol", ID: "gpt-6-sol"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("available models = %+v, want %+v", got, want)
+	}
+}
+
+func TestToolModelsDoNotPreferSubscriptionForOtherParents(t *testing.T) {
+	const parentModel = "gpt-6-astra"
+	provider := &tieredModelProvider{
+		ids: []string{parentModel, "gpt-6-luna", "gpt-6-luna@subscription"},
+		infos: map[string]*models.ModelInfo{
+			parentModel:               {Mode: "managed", BaseURL: "https://gateway.int.exe.xyz", Provider: models.ProviderOpenAI, APIModelName: "gpt-6-astra"},
+			"gpt-6-luna":              {Mode: "managed", BaseURL: "https://gateway.int.exe.xyz", Provider: models.ProviderOpenAI, APIModelName: "gpt-6-luna"},
+			"gpt-6-luna@subscription": {Mode: "chatgpt", BaseURL: "https://subscription.int.exe.xyz", Provider: models.ProviderOpenAI, APIModelName: "gpt-6-luna"},
+		},
+	}
+
+	got := setupToolSetConfig(nil, provider).BuildAvailableModels(parentModel)
+	want := []claudetool.AvailableModel{
+		{Name: parentModel, ID: parentModel},
+		{Name: "gpt-6-luna", ID: "gpt-6-luna"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("available models = %+v, want %+v", got, want)
+	}
+}
+
+func TestToolModelsKeepGlobalChoicesWhenSubscriptionEndpointUnknown(t *testing.T) {
+	const parentModel = "upstream-parent@subscription"
+	provider := &tieredModelProvider{
+		ids: []string{parentModel, "gpt-6-luna", "claude-opus-5.5"},
+		infos: map[string]*models.ModelInfo{
+			parentModel:       {Mode: "chatgpt"},
+			"gpt-6-luna":      {Mode: "managed", BaseURL: "https://gateway.int.exe.xyz"},
+			"claude-opus-5.5": {Provider: models.ProviderAnthropic, APIModelName: "claude-opus-5.5"},
+		},
+	}
+
+	got := setupToolSetConfig(nil, provider).BuildAvailableModels(parentModel)
+	want := []claudetool.AvailableModel{
+		{Name: "gpt-6-luna", ID: "gpt-6-luna"},
+		{Name: "claude-opus-5.5", ID: "claude-opus-5.5"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("available models = %+v, want %+v", got, want)
 	}
 }
 

@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { createConversationViaAPIWithDetails } from './helpers';
+import { createConversationViaAPIWithDetails, startNewConversationFromHeader } from './helpers';
 
 test.describe('File Upload via Paste and Drag', () => {
   let testImagePath: string;
@@ -304,7 +304,7 @@ test.describe('File Upload via Paste and Drag', () => {
     const openDrawer = page.locator('button[aria-label="Open conversations"]');
     if (await openDrawer.isVisible()) await openDrawer.click();
     await page.locator(`[data-conversation-id="${existing.conversationId}"]`).click();
-    await page.locator('.btn-new').click();
+    await startNewConversationFromHeader(page);
 
     await expect(page.locator('.message-attachment')).toHaveCount(0);
   });

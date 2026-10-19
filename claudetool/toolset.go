@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"sync"
+	"time"
 
 	"shelley.exe.dev/claudetool/browse"
 	"shelley.exe.dev/llm"
@@ -53,9 +54,7 @@ type ToolSetConfig struct {
 	EnableBrowser bool
 	// ModelID is the model being used for this conversation.
 	ModelID string
-	// PatchSimpleEnabled selects the simplified path-and-edits schema. When
-	// false, patch uses the full nested patches schema.
-	PatchSimpleEnabled func() bool
+
 	// ReasoningLevel is the parent conversation's user-facing reasoning/thinking
 	// level (one of "off", "minimal", "low", "medium", "high", "xhigh", or ""
 	// for the service default). Subagents inherit this when their "reasoning"
@@ -69,6 +68,25 @@ type ToolSetConfig struct {
 	SubagentRunner SubagentRunner
 	// SubagentDB is the database for subagent conversations.
 	SubagentDB SubagentDB
+	// ParentMessenger, if set, provides the message_parent tool. The server
+	// sets it only for delegated subagents.
+	ParentMessenger ParentMessenger
+	// InPlaceCompactor, if set, provides the compact_in_place tool (on
+	// unless ToolOverrides turns it off).
+	InPlaceCompactor InPlaceCompactor
+	// UserMessageFinder, if set, provides the message_user tool (off unless
+	// enabled by ToolOverrides). The server sets it only for top-level
+	// conversations.
+	UserMessageFinder UserMessageFinder
+	// UserChat, if set, is the external chat message_user's messages also
+	// go to.
+	UserChat UserChat
+	// BackgroundJobs is told about bash commands moved to the background.
+	BackgroundJobs BackgroundJobs
+	// BashBackgroundAfter overrides DefaultBashBackgroundAfter when nonzero.
+	BashBackgroundAfter time.Duration
+	// DBPath is the Shelley database, named in the subagent tool's description.
+	DBPath string
 	// ParentConversationID is the ID of the parent conversation (for subagent tool).
 	ParentConversationID string
 	// ConversationID is the ID of the conversation these tools belong to.
@@ -88,13 +106,14 @@ type ToolSetConfig struct {
 	// A value of 0 means no limit (but SubagentRunner/SubagentDB must still be set).
 	// Set to 1 to allow only top-level conversations (depth 0) to spawn subagents.
 	MaxSubagentDepth int
-	// BuildAvailableModels, if set, is called by NewToolSet to compute the
-	// list of models that subagent / llm_one_shot tools can choose from.
+	// BuildAvailableModels, if set, is called by NewToolSet with the
+	// conversation's model ID to compute the list of models that subagent /
+	// llm_one_shot tools can choose from.
 	// It is invoked each time a ToolSet is built so new conversations pick
 	// up custom models added at runtime, instead of being stuck with a
 	// snapshot taken at server start. If nil, the list is built from
-	// LLMProvider.GetAvailableModels() (without display names).
-	BuildAvailableModels func() []AvailableModel
+	// LLMProvider.GetAvailableModels(), naming each model by its ID.
+	BuildAvailableModels func(parentModelID string) []AvailableModel
 	// ToolOverrides maps tool name to "on" or "off". Tools not listed use their default.
 	ToolOverrides map[string]string
 	// DisableAllTools disables every tool by default; ToolOverrides with "on" re-enable.
@@ -187,18 +206,15 @@ func NewToolSet(ctx context.Context, cfg ToolSetConfig) *ToolSet {
 		ModelID:          cfg.ModelID,
 		EnableJITInstall: cfg.EnableJITInstall,
 		Env:              env,
+		Jobs:             cfg.BackgroundJobs,
+		BackgroundAfter:  cfg.BashBackgroundAfter,
 	}
 
 	patchProvider, patchProfile := "", "nested"
-	if cfg.PatchSimpleEnabled != nil && cfg.PatchSimpleEnabled() {
-		patchProfile = "simple"
-	}
 	if cfg.LLMProvider != nil && cfg.ModelID != "" {
 		if svc, err := cfg.LLMProvider.GetService(cfg.ModelID); err == nil {
 			patchProvider = svc.Provider()
-			if llm.PatchProfile(svc) == "codex_apply_patch" {
-				patchProfile = "codex_apply_patch"
-			}
+			patchProfile = llm.PatchProfile(svc)
 		}
 	}
 	patchTool := &PatchTool{WorkingDir: wd, Provider: patchProvider, Profile: patchProfile}
@@ -210,18 +226,8 @@ func NewToolSet(ctx context.Context, cfg ToolSetConfig) *ToolSet {
 
 	outputIframeTool := &OutputIframeTool{WorkingDir: wd}
 
-	shellTool := &ShellTool{
-		WorkingDir:       wd,
-		LLMProvider:      cfg.LLMProvider,
-		ModelID:          cfg.ModelID,
-		EnableJITInstall: cfg.EnableJITInstall,
-		Env:              env,
-		BackgroundCtx:    ctx,
-	}
-
 	tools := []*llm.Tool{
 		bashTool.Tool(),
-		shellTool.Tool(),
 		patchTool.Tool(),
 		changeDirTool.Tool(),
 		outputIframeTool.Tool(),
@@ -232,10 +238,10 @@ func NewToolSet(ctx context.Context, cfg ToolSetConfig) *ToolSet {
 	// custom models added since server start.
 	var availableModels []AvailableModel
 	if cfg.BuildAvailableModels != nil {
-		availableModels = cfg.BuildAvailableModels()
+		availableModels = cfg.BuildAvailableModels(cfg.ModelID)
 	} else if cfg.LLMProvider != nil {
 		for _, id := range cfg.LLMProvider.GetAvailableModels() {
-			availableModels = append(availableModels, AvailableModel{ID: id})
+			availableModels = append(availableModels, AvailableModel{Name: id, ID: id})
 		}
 	}
 
@@ -248,11 +254,22 @@ func NewToolSet(ctx context.Context, cfg ToolSetConfig) *ToolSet {
 			ParentConversationID: cfg.ParentConversationID,
 			WorkingDir:           wd,
 			Runner:               cfg.SubagentRunner,
-			ModelID:              cfg.ModelID, // Inherit parent's model
 			AvailableModels:      availableModels,
 			ParentReasoning:      cfg.ReasoningLevel,
+			DBPath:               cfg.DBPath,
 		}
 		tools = append(tools, subagentTool.Tool())
+	}
+	if cfg.ParentMessenger != nil {
+		messageParentTool := &MessageParentTool{Messenger: cfg.ParentMessenger, ConversationID: cfg.ConversationID}
+		tools = append(tools, messageParentTool.Tool())
+	}
+
+	if cfg.InPlaceCompactor != nil {
+		tools = append(tools, CompactInPlaceTool(cfg.InPlaceCompactor))
+	}
+	if cfg.UserMessageFinder != nil {
+		tools = append(tools, MessageUserTool(cfg.UserMessageFinder, cfg.UserChat, wd))
 	}
 
 	// Add LLM one-shot tool if LLM provider is configured

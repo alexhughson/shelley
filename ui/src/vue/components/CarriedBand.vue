@@ -22,8 +22,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, inject } from "vue";
+import { chunkMountKey } from "./chunkMount";
 
-defineProps<{ count: number }>();
-const expanded = ref(false);
+const props = defineProps<{ count: number; bandKey: string }>();
+const expandedBands = inject(chunkMountKey)!.expandedBands;
+const expanded = computed({
+  get: () => expandedBands.has(props.bandKey),
+  set: (v) => (v ? expandedBands.add(props.bandKey) : expandedBands.delete(props.bandKey)),
+});
 </script>

@@ -128,13 +128,14 @@ func resetReflectionEmojiCache() {
 
 // reflectionIntegration is one entry in the reflection /integrations response.
 type reflectionIntegration struct {
-	Name    string              `json:"name"`
-	Type    string              `json:"type"`
-	Comment string              `json:"comment,omitempty"`
-	Help    string              `json:"help,omitempty"`
-	Team    bool                `json:"team,omitempty"`
-	URL     string              `json:"url,omitempty"`
-	Details *integrationDetails `json:"details,omitempty"`
+	Name       string              `json:"name"`
+	Type       string              `json:"type"`
+	Attributes []string            `json:"attributes,omitempty"`
+	Comment    string              `json:"comment,omitempty"`
+	Help       string              `json:"help,omitempty"`
+	Team       bool                `json:"team,omitempty"`
+	URL        string              `json:"url,omitempty"`
+	Details    *integrationDetails `json:"details,omitempty"`
 }
 
 type integrationDetails struct {

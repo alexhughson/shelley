@@ -36,7 +36,6 @@ func newUsageCollectingServer(t *testing.T) (*Server, *db.DB) {
 			ID:       "predictable",
 			Provider: models.ProviderBuiltIn,
 			Source:   "test",
-			Tags:     "slug",
 			Service:  predictable.NewService(),
 		}},
 		Logger: logger,
@@ -200,7 +199,7 @@ func TestRetryWorksWithTrailingSlugMarker(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return !svr.IsAgentWorking(convID) })
 
 	// Force the hazardous ordering deterministically: marker last.
-	if _, err := database.CreateSlugMessage(ctx, convID, []llm.PurposedUsage{
+	if _, err := database.CreateUsageMessage(ctx, convID, []llm.PurposedUsage{
 		{Purpose: "slug", Usage: llm.Usage{InputTokens: 20, Model: "predictable-v1"}},
 	}); err != nil {
 		t.Fatal(err)
@@ -304,8 +303,7 @@ func TestSlugMarkerReachesUnifiedStream(t *testing.T) {
 			}
 		case <-time.After(time.Until(deadline)):
 			t.Fatal("slug marker never arrived on the unified stream; GenerateSlug's caller must " +
-				"publish it via notifySubscribersNewMessage — notifySubscribers is metadata-only " +
-				"and sends Messages: nil")
+				"publish it with notifySubscribers and the marker message")
 		}
 	}
 }

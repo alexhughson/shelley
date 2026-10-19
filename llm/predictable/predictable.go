@@ -2,9 +2,12 @@ package predictable
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,17 +69,39 @@ func requestMentions(req *llm.Request, needle string) bool {
 // Available patterns include:
 //   - "echo: <text>" - echoes the text back
 //   - "bash: <command>" - triggers bash tool with command
+//   - "bash-bg: <command>" - triggers bash tool with background=true
 //   - "think: <thoughts>" - returns response with extended thinking content
 //   - "subagent: <slug> <prompt>" - triggers subagent tool
 //   - "change_dir: <path>" - triggers change_dir tool
 //   - "delay: <seconds>" - delays response by specified seconds
+//   - "cache: <read> <write>" - reports a prompt of that many cache read and
+//     cache write tokens, and no others
 //   - "fail <error>" - emits a retry warning and returns a failure
 //   - See Do() method for complete list of supported patterns
 type Service struct {
 	mu sync.Mutex
 	// Recent requests for testing inspection
 	recentRequests []*llm.Request
+	warmRequests   []*llm.Request
 	responseDelay  time.Duration
+}
+
+// CacheTTL matches Anthropic's default cache lifetime.
+func (s *Service) CacheTTL() time.Duration { return 5 * time.Minute }
+
+// WarmCache records req and reports it as fully read from cache.
+func (s *Service) WarmCache(ctx context.Context, req *llm.Request) (llm.Usage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.warmRequests = append(s.warmRequests, req)
+	return llm.Usage{CacheReadInputTokens: 1024, CostUSD: 0.0001}, nil
+}
+
+// WarmRequests returns the requests WarmCache received.
+func (s *Service) WarmRequests() []*llm.Request {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*llm.Request(nil), s.warmRequests...)
 }
 
 // NewService creates a new predictable LLM service
@@ -146,6 +171,23 @@ func (s *Service) Do(ctx context.Context, req *llm.Request) (*llm.Response, erro
 				}
 			}
 		}
+	}
+	// The real LLM sees the sequence marker; for this test fixture, unwrap
+	// the user text so its deterministic commands still work in channel chats.
+	if strings.HasPrefix(inputText, "<external_message ") || strings.HasPrefix(inputText, "<user_message ") {
+		var external struct {
+			SequenceID int64  `xml:"sequence_id,attr"`
+			Text       string `xml:",chardata"`
+		}
+		if err := xml.Unmarshal([]byte(inputText), &external); err != nil {
+			return nil, fmt.Errorf("decode external message: %w", err)
+		}
+		inputText = strings.TrimSpace(external.Text)
+	}
+
+	if id, ok := idleNudgeFirstRow(req); ok {
+		input, _ := json.Marshal(map[string]any{"action": "compact", "collapse": []map[string]string{{"from": id, "to": id, "note": "IDLE NOTE"}}})
+		return s.makeToolResponse("compact_in_place", input, inputTokens), nil
 	}
 
 	// If the message is purely a tool result (no text), acknowledge it and end turn.
@@ -241,7 +283,11 @@ func (s *Service) Do(ctx context.Context, req *llm.Request) (*llm.Response, erro
 		}
 
 		if cmd, ok := strings.CutPrefix(inputText, "bash: "); ok {
-			return s.makeBashToolResponse(cmd, inputTokens), nil
+			return s.makeBashToolResponse(cmd, false, inputTokens), nil
+		}
+
+		if cmd, ok := strings.CutPrefix(inputText, "bash-bg: "); ok {
+			return s.makeBashToolResponse(cmd, true, inputTokens), nil
 		}
 
 		if thoughts, ok := strings.CutPrefix(inputText, "think: "); ok {
@@ -280,6 +326,17 @@ func (s *Service) Do(ctx context.Context, req *llm.Request) (*llm.Response, erro
 			return s.makeSubagentToolResponse(slug, prompt, inputTokens), nil
 		}
 
+		if rest, ok := strings.CutPrefix(inputText, "cache: "); ok {
+			var read, write uint64
+			if _, err := fmt.Sscan(rest, &read, &write); err != nil {
+				return nil, fmt.Errorf("predictable cache: want \"<read> <write>\": %w", err)
+			}
+			resp := s.makeResponse("Done.", 0)
+			resp.Usage.CacheReadInputTokens = read
+			resp.Usage.CacheCreationInputTokens = write
+			return resp, nil
+		}
+
 		if text, ok := strings.CutPrefix(inputText, "markdown: "); ok {
 			return s.makeResponse(text, inputTokens), nil
 		}
@@ -292,7 +349,7 @@ func (s *Service) Do(ctx context.Context, req *llm.Request) (*llm.Response, erro
 				"printf %%s %q | base64 -d > %s && echo %s",
 				inlineImagePNGBase64, inlineImagePath, inlineImageSentinel,
 			)
-			return s.makeBashToolResponse(cmd, inputTokens), nil
+			return s.makeBashToolResponse(cmd, false, inputTokens), nil
 		}
 
 		if inputText == "screenshot image" {
@@ -303,7 +360,23 @@ func (s *Service) Do(ctx context.Context, req *llm.Request) (*llm.Response, erro
 				"mkdir -p %s && printf %%s %q | base64 -d > %s && echo %s",
 				screenshotImageDir, inlineImagePNGBase64, screenshotImagePath, screenshotImageSentinel,
 			)
-			return s.makeBashToolResponse(cmd, inputTokens), nil
+			return s.makeBashToolResponse(cmd, false, inputTokens), nil
+		}
+
+		if text, ok := strings.CutPrefix(inputText, "message_parent_final: "); ok {
+			return s.makeMessageParentToolResponse(text, true, inputTokens), nil
+		}
+
+		if text, ok := strings.CutPrefix(inputText, "message_parent: "); ok {
+			return s.makeMessageParentToolResponse(text, false, inputTokens), nil
+		}
+
+		if input, ok := strings.CutPrefix(inputText, "compact_in_place: "); ok {
+			return s.makeToolResponse("compact_in_place", json.RawMessage(input), inputTokens), nil
+		}
+
+		if input, ok := strings.CutPrefix(inputText, "message_user: "); ok {
+			return s.makeToolResponse("message_user", json.RawMessage(input), inputTokens), nil
 		}
 
 		if path, ok := strings.CutPrefix(inputText, "change_dir: "); ok {
@@ -418,9 +491,12 @@ func (s *Service) makeResponse(text string, inputTokens uint64) *llm.Response {
 }
 
 // makeBashToolResponse creates a response that calls the bash tool
-func (s *Service) makeBashToolResponse(command string, inputTokens uint64) *llm.Response {
+func (s *Service) makeBashToolResponse(command string, background bool, inputTokens uint64) *llm.Response {
 	// Properly marshal the command to avoid JSON escaping issues
-	toolInputData := map[string]string{"command": command}
+	toolInputData := map[string]any{"command": command}
+	if background {
+		toolInputData["background"] = true
+	}
 	toolInputBytes, _ := json.Marshal(toolInputData)
 	toolInput := json.RawMessage(toolInputBytes)
 	responseText := fmt.Sprintf("I'll run the command: %s", command)
@@ -436,7 +512,7 @@ func (s *Service) makeBashToolResponse(command string, inputTokens uint64) *llm.
 		Content: []llm.Content{
 			{Type: llm.ContentTypeText, Text: responseText},
 			{
-				ID:        fmt.Sprintf("tool_%d", time.Now().UnixNano()%1000),
+				ID:        "tool_bash_" + rand.Text(),
 				Type:      llm.ContentTypeToolUse,
 				ToolName:  "bash",
 				ToolInput: toolInput,
@@ -778,6 +854,25 @@ func (s *Service) makeReadImageToolResponse(path string, inputTokens uint64) *ll
 }
 
 // makeChangeDirToolResponse creates a response that calls the change_dir tool
+// makeToolResponse calls tool with input verbatim.
+func (s *Service) makeToolResponse(tool string, input json.RawMessage, inputTokens uint64) *llm.Response {
+	nano := time.Now().UnixNano()
+	return &llm.Response{
+		ID:    fmt.Sprintf("pred-%s-%d", tool, nano),
+		Type:  "message",
+		Role:  llm.MessageRoleAssistant,
+		Model: "predictable-v1",
+		Content: []llm.Content{{
+			ID:        fmt.Sprintf("tool_%s_%d", tool, nano),
+			Type:      llm.ContentTypeToolUse,
+			ToolName:  tool,
+			ToolInput: input,
+		}},
+		StopReason: llm.StopReasonToolUse,
+		Usage:      llm.Usage{InputTokens: inputTokens, OutputTokens: uint64(len(input)/4 + 1), CostUSD: 0.001},
+	}
+}
+
 func (s *Service) makeChangeDirToolResponse(path string, inputTokens uint64) *llm.Response {
 	toolInputData := map[string]string{"path": path}
 	toolInputBytes, _ := json.Marshal(toolInputData)
@@ -807,6 +902,24 @@ func (s *Service) makeChangeDirToolResponse(path string, inputTokens uint64) *ll
 			OutputTokens: outputTokens,
 			CostUSD:      0.001,
 		},
+	}
+}
+
+func (s *Service) makeMessageParentToolResponse(text string, endTurn bool, inputTokens uint64) *llm.Response {
+	toolInput, _ := json.Marshal(map[string]any{"text": text, "end_turn": endTurn})
+	return &llm.Response{
+		ID:    fmt.Sprintf("pred-message_parent-%d", time.Now().UnixNano()),
+		Type:  "message",
+		Role:  llm.MessageRoleAssistant,
+		Model: "predictable-v1",
+		Content: []llm.Content{{
+			ID:        fmt.Sprintf("tool_%d", time.Now().UnixNano()%1000),
+			Type:      llm.ContentTypeToolUse,
+			ToolName:  "message_parent",
+			ToolInput: toolInput,
+		}},
+		StopReason: llm.StopReasonToolUse,
+		Usage:      llm.Usage{InputTokens: inputTokens, OutputTokens: uint64(len(toolInput)/4 + 1), CostUSD: 0.001},
 	}
 }
 
@@ -1098,6 +1211,22 @@ func (s *Service) makeToolSmorgasbordResponse(inputTokens uint64) *llm.Response 
 		ToolInput: json.RawMessage(llmInput),
 	})
 
+	// compact_in_place tool
+	content = append(content, llm.Content{
+		ID:        fmt.Sprintf("tool_compact_%d", (baseNano+15)%1000),
+		Type:      llm.ContentTypeToolUse,
+		ToolName:  "compact_in_place",
+		ToolInput: json.RawMessage(`{"action":"index"}`),
+	})
+
+	// message_user tool (a reply to the smorgasbord request, with a reaction)
+	content = append(content, llm.Content{
+		ID:        fmt.Sprintf("tool_message_user_%d", (baseNano+20)%1000),
+		Type:      llm.ContentTypeToolUse,
+		ToolName:  "message_user",
+		ToolInput: json.RawMessage(`{"text":"On it.","reply_to":2,"reaction":"👍"}`),
+	})
+
 	// browser: screencast_stop action (tests screencast UI widget)
 	screencastInput, _ := json.Marshal(map[string]string{"action": "screencast_stop"})
 	content = append(content, llm.Content{
@@ -1105,15 +1234,6 @@ func (s *Service) makeToolSmorgasbordResponse(inputTokens uint64) *llm.Response 
 		Type:      llm.ContentTypeToolUse,
 		ToolName:  "browser",
 		ToolInput: json.RawMessage(screencastInput),
-	})
-
-	// shell tool (yielding successor to bash; should reuse BashTool widget)
-	shellInput, _ := json.Marshal(map[string]string{"command": "echo 'hello from shell'"})
-	content = append(content, llm.Content{
-		ID:        fmt.Sprintf("tool_shell_%d", (baseNano+15)%1000),
-		Type:      llm.ContentTypeToolUse,
-		ToolName:  "shell",
-		ToolInput: json.RawMessage(shellInput),
 	})
 
 	return &llm.Response{
@@ -1173,3 +1293,25 @@ const wideTablesMarkdown = `Here are some wide tables to test rendering:
 | NPS Score | 42 | 45 | 48 | 52 | +23.8% | 📈 |
 
 That's a variety of table widths for testing!`
+
+// idleIndexRow matches the first row of a compact_in_place index.
+var idleIndexRow = regexp.MustCompile("(?m)^id {2,}role.*\n(\\S+) ")
+
+// idleNudgeFirstRow returns the first row id of the compact_in_place index in
+// an idle compaction nudge ending req, which predictable answers by
+// collapsing that row.
+func idleNudgeFirstRow(req *llm.Request) (string, bool) {
+	if len(req.Messages) == 0 {
+		return "", false
+	}
+	last := req.Messages[len(req.Messages)-1]
+	if last.Role != llm.MessageRoleUser || len(last.Content) != 2 ||
+		!strings.HasPrefix(last.Content[0].Text, "[The conversation has been idle") {
+		return "", false
+	}
+	m := idleIndexRow.FindStringSubmatch(last.Content[1].Text)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}

@@ -14,6 +14,7 @@ import (
 
 	"shelley.exe.dev/db"
 	"shelley.exe.dev/llm"
+	"shelley.exe.dev/models"
 )
 
 // speech returns one 100ms Whisper word per field of text, starting at start seconds.
@@ -91,7 +92,7 @@ No speech was detected.
 }
 
 func TestReviewTimelineLines(t *testing.T) {
-	long := strings.Repeat("x", 130)
+	long := strings.Repeat("x", 210)
 	tests := []struct {
 		name     string
 		duration float64
@@ -257,7 +258,7 @@ func TestReviewTimelineLines(t *testing.T) {
 			},
 			want: []string{
 				"00:00.0    on screen: 1; 2; 3; 4; 5; 6; 7; 8; …+2 more",
-				"00:01.0    pointer: long — `" + long[:120] + "…`",
+				"00:01.0    pointer: long — `" + long[:200] + "…`",
 				`00:02.0    pointer: tick — "a ` + "`b`" + ` c"`,
 				`00:04.0    selected: sel — "one⏎two⏎` + strings.Repeat("y", 492) + `…"`,
 			},
@@ -325,13 +326,15 @@ type reviewRecordingTranscriber struct {
 	timestamps bool
 }
 
+func (*reviewRecordingTranscriber) Available() error { return nil }
+
 func (f *reviewRecordingTranscriber) Transcribe(_ context.Context, mediaPath, prompt string, timestamps bool) (transcriptionResult, error) {
 	f.prompt, f.timestamps = prompt, timestamps
-	result := transcriptionResult{Text: "This line should just go away.", Model: openAITranscriptionModel}
+	result := transcriptionResult{Text: "This line should just go away.", Model: models.TranscriptionTextModel}
 	if !timestamps {
 		return result, nil
 	}
-	result.TimestampsModel = openAITimestampedTranscriptionModel
+	result.TimestampsModel = models.TranscriptionTimestampsModel
 	result.TimestampsPath = mediaPath + ".timestamps.json"
 	body, err := json.Marshal(specReviewSpeech())
 	if err != nil {
@@ -430,7 +433,7 @@ func TestQueuedReviewRecordingTranscription(t *testing.T) {
 	if err := json.Unmarshal(audit[0].Content[0].ToolInput, &input); err != nil {
 		t.Fatal(err)
 	}
-	if input["review_events"] != mediaPath+".review.json" || input["timestamps_model"] != openAITimestampedTranscriptionModel {
+	if input["review_events"] != mediaPath+".review.json" || input["timestamps_model"] != models.TranscriptionTimestampsModel {
 		t.Fatalf("audited input = %#v", input)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,15 +96,28 @@ const piCompactionSummaryPrefix = `The conversation history before this point wa
 const piCompactionSummarySuffix = `
 </summary>`
 
+// keepRecentTokens is the budget of recent history kept verbatim: by pi
+// distillation, and as the recent part compact_in_place leaves as it is.
+func (s *Server) keepRecentTokens() int {
+	if s.piDistillKeepRecentTokens > 0 {
+		return s.piDistillKeepRecentTokens
+	}
+	return defaultPiDistillSettings.keepRecentTokens
+}
+
+// piImageTokens is pi's estimate for an image (4800 chars). The size of its
+// base64 data says little: a 1280x720 screenshot is ~1.2k tokens.
+const piImageTokens = 1200
+
 // estimatePiMessageTokens ports pi's character/4 heuristic for one message.
 func estimatePiMessageTokens(msg llm.Message) int {
-	chars := 0
+	chars, images := 0, 0
 	for _, c := range msg.Content {
 		switch c.Type {
 		case llm.ContentTypeText:
 			chars += len(c.Text)
 			if c.MediaType != "" {
-				chars += len(c.Data)
+				images++
 			}
 		case llm.ContentTypeThinking, llm.ContentTypeRedactedThinking:
 			chars += len(c.Thinking)
@@ -113,13 +127,13 @@ func estimatePiMessageTokens(msg llm.Message) int {
 			for _, r := range c.ToolResult {
 				chars += len(r.Text)
 				if r.MediaType != "" {
-					chars += len(r.Data)
+					images++
 				}
 			}
 		}
 	}
 	// ceil(chars / 4)
-	return (chars + 3) / 4
+	return (chars+3)/4 + images*piImageTokens
 }
 
 // isToolResultMessage reports whether a message carries only tool_result
@@ -162,7 +176,10 @@ func findPiCutPoint(messages []llm.Message, keepRecentTokens int) int {
 	for i := len(messages) - 1; i >= 0; i-- {
 		accumulated += estimatePiMessageTokens(messages[i])
 		if accumulated >= keepRecentTokens {
-			// Pick the first valid cut point at or after i.
+			// Pick the first valid cut point at or after i. If a tool
+			// result alone fills the budget there is none: keep it with
+			// its call, the last cut point.
+			cutIndex = cutPoints[len(cutPoints)-1]
 			for _, c := range cutPoints {
 				if c >= i {
 					cutIndex = c
@@ -323,38 +340,25 @@ func formatPiFileOperations(readFiles, modifiedFiles []string) string {
 	return "\n\n" + strings.Join(sections, "\n\n")
 }
 
-// piContextMessage pairs the LLM form of a source message with the original DB
-// row, so the pi flow can (a) resolve distillation-summary content for
-// summarization and (b) preserve user_data when copying messages verbatim into
-// the new generation.
-type piContextMessage struct {
-	llm    llm.Message
-	source generated.Message
-}
-
-// piContextMessages converts the source generation's context-eligible messages
-// into llm.Messages (preserving roles and tool structure), filtering out
-// system/error/gitinfo/warning/slug messages and anything excluded from context.
-// Each returned entry retains its source DB row.
-func piContextMessages(sourceGeneration int64, messages []generated.Message) []piContextMessage {
-	var out []piContextMessage
+// piContextMessages returns the source generation's compacted context (see
+// compactedContext), without the system prompt and context nudges: their
+// sizes and indexes are of the source generation. Each original message keeps
+// its source row, so the pi flow can (a) resolve distillation-summary content
+// for summarization and (b) preserve user_data when copying messages verbatim
+// into the new generation.
+func piContextMessages(logger logWarner, sourceGeneration int64, messages []generated.Message) ([]contextItem, error) {
+	var rows []generated.Message
 	for _, m := range messages {
-		if m.Generation != sourceGeneration || m.ExcludedFromContext {
-			continue
+		if m.Generation == sourceGeneration && !m.ExcludedFromContext {
+			rows = append(rows, m)
 		}
-		switch m.Type {
-		case string(db.MessageTypeSystem), string(db.MessageTypeError),
-			string(db.MessageTypeGitInfo), string(db.MessageTypeWarning),
-			string(db.MessageTypeSlug):
-			continue
-		}
-		llmMsg, err := convertToLLMMessage(m)
-		if err != nil {
-			continue
-		}
-		out = append(out, piContextMessage{llm: llmMsg, source: m})
 	}
-	return out
+	items, _, err := compactedContext(logger, rows)
+	if err != nil {
+		return nil, err
+	}
+	nudges, _ := compactionEvidence(items)
+	return hideItems(items, nudges, nil)
 }
 
 // resolveDistilledContent returns the real distillation summary text for a
@@ -394,12 +398,15 @@ type logWarner interface {
 
 // resolvePiSummarizationText returns the message text to feed the summarizer,
 // substituting the real summary for any distilled-message placeholder.
-func resolvePiSummarizationText(logger logWarner, entry piContextMessage) llm.Message {
-	content, ok := resolveDistilledContent(logger, entry.source)
-	if !ok {
-		return entry.llm
+func resolvePiSummarizationText(logger logWarner, entry contextItem) llm.Message {
+	if entry.source == nil {
+		return entry.message
 	}
-	msg := entry.llm
+	content, ok := resolveDistilledContent(logger, *entry.source)
+	if !ok {
+		return entry.message
+	}
+	msg := entry.message
 	// Copy the content slice so we don't mutate the shared message.
 	newContent := make([]llm.Content, len(msg.Content))
 	copy(newContent, msg.Content)
@@ -420,12 +427,12 @@ func resolvePiSummarizationText(logger logWarner, entry piContextMessage) llm.Me
 
 // userDataForCopy extracts the parsed user_data map from a source message so it
 // can be preserved when copying the message into the new generation. Returns
-// nil when there is none.
-func userDataForCopy(m generated.Message) map[string]string {
+// nil when there is none. Values keep their JSON types (context_nudge: true).
+func userDataForCopy(m generated.Message) map[string]any {
 	if m.UserData == nil {
 		return nil
 	}
-	var userData map[string]string
+	var userData map[string]any
 	if err := json.Unmarshal([]byte(*m.UserData), &userData); err != nil {
 		return nil
 	}
@@ -552,21 +559,23 @@ func (s *Server) performPiDistillation(ctx context.Context, conversationID, sour
 		return ""
 	}
 
-	ctxMsgs := piContextMessages(sourceGeneration, messages)
+	ctxMsgs, err := piContextMessages(logger, sourceGeneration, messages)
+	if err != nil {
+		logger.Error("Failed to build context for pi distillation", "error", err)
+		s.rollbackCompactionFailure(ctx, logger, conversationID, fmt.Sprintf("Compaction failed: %v", err), sourceGeneration, sourceTurnInterrupted)
+		return ""
+	}
 	if len(ctxMsgs) == 0 {
 		logger.Warn("pi distillation found no context messages")
 		s.insertDistillStatus(ctx, conversationID, "complete")
 		return ""
 	}
 
-	keepRecentTokens := defaultPiDistillSettings.keepRecentTokens
-	if s.piDistillKeepRecentTokens > 0 {
-		keepRecentTokens = s.piDistillKeepRecentTokens
-	}
+	keepRecentTokens := s.keepRecentTokens()
 	llmMsgs := make([]llm.Message, len(ctxMsgs))
 	for i, entry := range ctxMsgs {
-		llmMsgs[i] = entry.llm
-		if entry.source.Type == string(db.MessageTypeUser) && entry.source.UserData != nil {
+		llmMsgs[i] = entry.message
+		if entry.source != nil && entry.source.Type == string(db.MessageTypeUser) && entry.source.UserData != nil {
 			wrapped, wrapErr := messageWithSenderProvenance(llmMsgs[i], []byte(*entry.source.UserData))
 			if wrapErr != nil {
 				errMsg := fmt.Sprintf("Compaction failed: invalid sender provenance on message %s: %v", entry.source.MessageID, wrapErr)
@@ -588,7 +597,7 @@ func (s *Server) performPiDistillation(ctx context.Context, conversationID, sour
 	olderMsgs := make([]llm.Message, len(older))
 	for i, entry := range older {
 		olderMsgs[i] = resolvePiSummarizationText(logger, entry)
-		if entry.source.Type == string(db.MessageTypeUser) && entry.source.UserData != nil {
+		if entry.source != nil && entry.source.Type == string(db.MessageTypeUser) && entry.source.UserData != nil {
 			wrapped, wrapErr := messageWithSenderProvenance(olderMsgs[i], []byte(*entry.source.UserData))
 			if wrapErr != nil {
 				errMsg := fmt.Sprintf("Compaction failed: invalid sender provenance on message %s: %v", entry.source.MessageID, wrapErr)
@@ -694,13 +703,28 @@ func (s *Server) performPiDistillation(ctx context.Context, conversationID, sour
 	// its real summary text would be lost. Stamp compaction_carried=true on every
 	// copy so the UI can collapse the re-played tail behind a "messages carried
 	// forward" band instead of re-rendering each one (slow, jarring scroll).
+	// Stamp carried_from_sequence_id with the sequence_id of the message first
+	// copied, so that copies of copies, and forks (which keep sequence_ids),
+	// still know which message they are: message_user targets messages by it.
+	// An in-place squish summary in the tail has no source row; it is carried
+	// as a user message stamped squish_note, and trimmed tool results are
+	// carried trimmed.
 	for _, entry := range recent {
-		ud := userDataForCopy(entry.source)
-		if ud == nil {
-			ud = map[string]string{}
+		ud := map[string]any{}
+		var externalID string
+		if entry.source != nil {
+			if src := userDataForCopy(*entry.source); src != nil {
+				ud = src
+			}
+			externalID = derefString(entry.source.ExternalMessageID)
+			if _, ok := ud[carriedFromKey]; !ok {
+				ud[carriedFromKey] = strconv.FormatInt(entry.source.SequenceID, 10)
+			}
+		} else {
+			ud["squish_note"] = entry.noteID
 		}
 		ud["compaction_carried"] = "true"
-		batch = append(batch, recordMessageInput{message: entry.llm, userData: []interface{}{ud}})
+		batch = append(batch, recordMessageInput{message: entry.message, userData: []interface{}{ud}, externalMessageID: externalID})
 	}
 
 	// Append the terminal "complete" status message as an additional INSERT in

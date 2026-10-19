@@ -1,6 +1,7 @@
 // Package llmhttp provides HTTP utilities for LLM requests, namely a
-// custom transport that adds Shelley-specific headers and enforces an
-// idle/stall timeout on streaming responses.
+// custom transport that adds Shelley-specific headers, enforces an
+// idle/stall timeout on streaming responses, and records recent exchanges
+// in memory for debugging.
 package llmhttp
 
 import (
@@ -150,8 +151,8 @@ func (e *idleTimeoutError) RequestErrorInfo() llm.RequestErrorInfo {
 // runs to completion as long as it keeps making progress.
 const DefaultIdleTimeout = 3 * time.Minute
 
-// Transport wraps an http.RoundTripper to add Shelley-specific headers and
-// enforce an idle/stall timeout on the response body.
+// Transport wraps an http.RoundTripper to add Shelley-specific headers,
+// enforce an idle/stall timeout on the response body, and record exchanges.
 type Transport struct {
 	Base http.RoundTripper
 	// IdleTimeout, when > 0, aborts a request if no response bytes are
@@ -159,6 +160,8 @@ type Transport struct {
 	// it measures the gap between chunks (and time-to-first-byte), not total
 	// duration. Zero disables the mechanism.
 	IdleTimeout time.Duration
+	// Log, when non-nil, records each request and response.
+	Log *Ring
 }
 
 // RoundTrip implements http.RoundTripper.
@@ -209,6 +212,19 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 
+	var ex *exchange
+	if t.Log != nil {
+		ex = t.Log.begin(req)
+	}
+	resp, err := t.send(req, trace)
+	if ex != nil {
+		t.Log.finish(ex, resp, err)
+	}
+	return resp, err
+}
+
+// send performs req on the base transport, enforcing the idle timeout.
+func (t *Transport) send(req *http.Request, trace *llm.RequestTrace) (*http.Response, error) {
 	base := t.Base
 	if base == nil {
 		base = http.DefaultTransport
@@ -351,8 +367,8 @@ func (r *idleReadCloser) Close() error {
 	return r.ReadCloser.Close()
 }
 
-// NewClient creates an http.Client with Shelley headers applied via Transport
-// and the default idle/stall timeout.
+// NewClient creates an http.Client with Shelley headers applied via Transport,
+// the default idle/stall timeout, and recording into Recent.
 func NewClient(base *http.Client) *http.Client {
 	return NewClientWithIdleTimeout(base, DefaultIdleTimeout)
 }
@@ -370,7 +386,7 @@ func NewClientWithIdleTimeout(base *http.Client, idleTimeout time.Duration) *htt
 	}
 
 	return &http.Client{
-		Transport: &Transport{Base: transport, IdleTimeout: idleTimeout},
+		Transport: &Transport{Base: transport, IdleTimeout: idleTimeout, Log: Recent},
 		Timeout:   base.Timeout,
 	}
 }

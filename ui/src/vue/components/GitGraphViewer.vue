@@ -219,32 +219,16 @@
                 :tabindex="canOpenDiff ? undefined : -1"
                 @click="onOpenCommitClick($event, selectedCommit.hash)"
               >
-                {{ tourStatus?.status === "present" || selectedCommit.hasTour ? "Open tour →" : "Open diff →" }}
+                {{ selectedCommit.hasTour ? "Open tour →" : "Open diff →" }}
               </a>
-              <a
-                v-if="tourStatus?.status === 'building' && tourStatus.worker_slug"
-                class="git-graph-tour-action"
-                :href="`/c/${tourStatus.worker_slug}`"
-                @click="onWorkerLinkClick"
-              >
-                <span class="spinner spinner-small" aria-hidden="true" />
-                Building tour ↗
-              </a>
-              <span v-else-if="tourStatus?.status === 'building'" class="git-graph-tour-action">
-                <span class="spinner spinner-small" aria-hidden="true" />
-                Building tour
-              </span>
-              <button
-                v-else-if="canRequestTour && (tourStatus?.status === 'absent' || tourStatus?.status === 'failed')"
-                type="button"
-                class="git-graph-tour-action"
-                :disabled="requestingTour"
-                :title="tourStatus?.error"
-                @click="requestTour"
-              >
-                <span v-if="requestingTour" class="spinner spinner-small" aria-hidden="true" />
-                {{ requestingTour ? "Building tour" : "Build tour" }}
-              </button>
+              <CommitTourAction
+                v-if="isOpen && cwd"
+                :cwd="cwd"
+                :hash="selectedCommit.hash"
+                :conversation-id="canRequestTour ? conversationId : null"
+                @open="canOpenDiff && emit('open-diff', $event, cwd)"
+                @present="markTour"
+              />
 
               <a
                 v-if="data?.githubBase"
@@ -340,14 +324,9 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, watch } from "vue";
-import { api, type GitTourBuildStatus } from "../../services/api";
-import {
-  loadCommitTourStatus,
-  requestCommitTour,
-  subscribeCommitTourStatus,
-} from "../../services/commitTourStatus";
+import { api } from "../../services/api";
 import type { GitGraphResponse, GitCommitDetail } from "../../types";
-import { navigateToConversationSlug } from "../composables/subagentLive";
+import CommitTourAction from "./CommitTourAction.vue";
 import GitRepoPicker from "./GitRepoPicker.vue";
 import RefBadge from "./gitGraph/RefBadge.vue";
 import CopyButton from "./gitGraph/CopyButton.vue";
@@ -404,8 +383,6 @@ const data = ref<GitGraphResponse | null>(null);
 const loading = ref(false);
 const error = ref<string | null>(null);
 const selected = ref<string | null>(null);
-const tourStatus = ref<GitTourBuildStatus | null>(null);
-const requestingTour = ref(false);
 const limit = ref(INITIAL_LIMIT);
 const scope = ref<Scope>(loadScope());
 function setScope(s: Scope) {
@@ -661,61 +638,9 @@ onUnmounted(() => {
 
 const selectedCommit = computed(() => commits.value.find((c) => c.hash === selected.value) || null);
 
-watch(
-  [() => props.isOpen, cwd, selected],
-  ([open, dir, hash], _, onCleanup) => {
-    tourStatus.value = null;
-    if (!open || !dir || !hash) return;
-    let active = true;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const update = (status: GitTourBuildStatus) => {
-      if (!active) return;
-      tourStatus.value = status;
-      const commit = data.value?.commits.find((candidate) => candidate.hash === hash);
-      if (commit && status.status === "present") commit.hasTour = true;
-      if (timer) clearTimeout(timer);
-      timer = status.status === "building" ? setTimeout(() => void probe(), 2_000) : null;
-    };
-    const probe = async () => {
-      try {
-        update(await loadCommitTourStatus(dir, hash, true));
-      } catch (error) {
-        if (active) {
-          console.error("Failed to check commit tour:", error);
-          if (timer) clearTimeout(timer);
-          timer = setTimeout(() => void probe(), 2_000);
-        }
-      }
-    };
-    const unsubscribe = subscribeCommitTourStatus(dir, hash, update);
-    void probe();
-    onCleanup(() => {
-      active = false;
-      unsubscribe();
-      if (timer) clearTimeout(timer);
-    });
-  },
-  { immediate: true },
-);
-
-async function requestTour() {
-  const hash = selected.value;
-  const dir = cwd.value;
-  if (!hash || !dir || !props.conversationId || !props.canRequestTour || requestingTour.value) return;
-  requestingTour.value = true;
-  try {
-    await requestCommitTour(props.conversationId, dir, hash);
-  } catch (error) {
-    if (selected.value === hash && cwd.value === dir) {
-      tourStatus.value = {
-        status: "failed",
-        hash,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  } finally {
-    requestingTour.value = false;
-  }
+function markTour(hash: string) {
+  const commit = commits.value.find((c) => c.hash === hash);
+  if (commit) commit.hasTour = true;
 }
 
 // Scroll the selected row into view (React effect on [selected]).
@@ -756,14 +681,6 @@ function onOpenCommitClick(e: MouseEvent, hash: string) {
   // behind the diff viewer.
   selected.value = hash;
   emit("open-diff", hash, cwd.value);
-}
-
-function onWorkerLinkClick(e: MouseEvent) {
-  if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
-  const slug = tourStatus.value?.worker_slug;
-  if (!slug) return;
-  e.preventDefault();
-  navigateToConversationSlug(slug);
 }
 
 function onGravatarError(e: Event) {

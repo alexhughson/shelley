@@ -6,7 +6,7 @@ import type { Conversation, ConversationWithState } from "../../types";
 import type { TranslationKeys } from "../../i18n/types";
 import type { OfferedTag } from "../../utils/tagFilter";
 
-export type GroupBy = "none" | "cwd" | "git_repo" | "tag" | "participants";
+export type GroupBy = "none" | "daily" | "cwd" | "git_repo" | "tag" | "participants";
 
 // Parses the JSON-encoded tags field on a Conversation. Tolerates the empty
 // string and malformed JSON (treated as no tags).

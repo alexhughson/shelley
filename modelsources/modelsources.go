@@ -108,7 +108,9 @@ func Gateway(gatewayURL, anthropicKey, openAIKey, fireworksKey string) Source {
 // DEPRECATED: Per-provider env-var model credentials are frozen. Do NOT add
 // new providers here. New models should be served through the exe.dev LLM
 // gateway or an exe.dev LLM integration (or added as DB-backed custom
-// models) rather than a new direct env-var credential.
+// models) rather than a new direct env-var credential. The one exception is
+// transcription: an OpenAI key also serves recordings (see
+// TranscriptionModels).
 func Env(anthropicKey, openAIKey, geminiKey, fireworksKey string) Source {
 	prov := map[models.Provider]*providerConn{}
 	labels := map[models.Provider]string{}
@@ -231,7 +233,6 @@ func Build(catalog []models.Model, sources []Source, httpc *http.Client, logger 
 				ID:           id,
 				DisplayName:  id,
 				Provider:     m.Provider,
-				Tags:         m.Tags,
 				Source:       label,
 				ReleaseDate:  modelReleaseDate(baseURL, m.APIModelName),
 				Service:      svc,
@@ -245,19 +246,34 @@ func Build(catalog []models.Model, sources []Source, httpc *http.Client, logger 
 	return out
 }
 
-// TranscriptionModels returns the exact audio transcription routes advertised
-// by discovered LLM integrations.
+// TranscriptionModels returns the audio transcription routes the sources
+// serve: those advertised by discovered LLM integrations, plus Shelley's
+// transcription models for any other source with an OpenAI credential.
 func TranscriptionModels(sources []Source) []models.TranscriptionModel {
 	var out []models.TranscriptionModel
 	for _, src := range sources {
-		if src.integration == nil {
+		if src.integration != nil {
+			for _, model := range src.integration.TranscriptionModels {
+				out = append(out, models.TranscriptionModel{
+					Model:    model.apiModelName(),
+					Endpoint: strings.TrimSuffix(src.integration.URL, "/") + "/v1/audio/transcriptions",
+					Source:   src.integration.Host,
+				})
+			}
 			continue
 		}
-		for _, model := range src.integration.TranscriptionModels {
+		conn := src.providers[models.ProviderOpenAI]
+		if conn == nil {
+			continue
+		}
+		baseURL := cmp.Or(conn.baseURL, models.DefaultOpenAIBaseURL)
+		for _, name := range []string{models.TranscriptionTextModel, models.TranscriptionTimestampsModel} {
 			out = append(out, models.TranscriptionModel{
-				Model:    model.apiModelName(),
-				Endpoint: strings.TrimSuffix(src.integration.URL, "/") + "/v1/audio/transcriptions",
-				Source:   src.integration.Host,
+				Model:           name,
+				Endpoint:        baseURL + "/v1/audio/transcriptions",
+				APIKey:          conn.apiKey,
+				Source:          src.labelFor(models.ProviderOpenAI),
+				FromCredentials: true,
 			})
 		}
 	}

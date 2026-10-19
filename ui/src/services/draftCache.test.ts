@@ -6,7 +6,10 @@ import {
   loadCachedDraft,
   saveCachedDraft,
   clearCachedDraft,
+  rebaseCachedDraft,
+  markCachedDraftPending,
   pickDraft,
+  keepDraftThroughPromotion,
   reconcileComposerDraft,
   type ComposerReconcileInput,
 } from "./draftCache";
@@ -67,6 +70,40 @@ run("clearCachedDraft removes the entry", () => {
   assert(loadCachedDraft("c9") === null, "cleared → null");
 });
 
+run("rebaseCachedDraft only advances the stamp and keeps the pending flag", () => {
+  saveCachedDraft("c10", "x", "2026-01-01T00:00:05Z", true);
+  rebaseCachedDraft("c10", "2026-01-01T00:00:03Z");
+  assert(loadCachedDraft("c10")?.basedOn === "2026-01-01T00:00:05Z", "older stamp ignored");
+  rebaseCachedDraft("c10", "2026-01-01T00:00:09Z");
+  const got = loadCachedDraft("c10");
+  assert(got?.basedOn === "2026-01-01T00:00:09Z", "newer stamp applied");
+  assert(got?.pending === true, "pending survives a re-base");
+});
+
+run("markCachedDraftPending flags the submitted text and its undo unflags it", () => {
+  saveCachedDraft("c11", "sending", "t1");
+  const undo = markCachedDraftPending("c11", "sending");
+  assert(loadCachedDraft("c11")?.pending === true, "flagged");
+  // A PUT ack that lands mid-send re-bases the entry; the undo keeps that.
+  rebaseCachedDraft("c11", "t2");
+  undo();
+  const got = loadCachedDraft("c11");
+  assert(got?.pending === false && got.basedOn === "t2", "unflagged, newer stamp kept");
+});
+
+run("markCachedDraftPending leaves other text alone", () => {
+  saveCachedDraft("c12", "edited since", "");
+  markCachedDraftPending("c12", "submitted");
+  assert(loadCachedDraft("c12")?.pending === false, "mismatch not flagged");
+  saveCachedDraft("c12", "submitted", "");
+  const undo = markCachedDraftPending("c12", "submitted");
+  // Another tab's send of newer text is now in flight; our undo must not unflag it.
+  saveCachedDraft("c12", "typed more", "", true);
+  undo();
+  const got = loadCachedDraft("c12");
+  assert(got?.value === "typed more" && got.pending === true, "undo does not touch newer text");
+});
+
 run("pickDraft keeps local edits the server never acknowledged", () => {
   // Connection dropped: server's updated_at is frozen at t5; the user kept
   // typing, so the cache was stamped with that same t5 but holds newer text.
@@ -115,6 +152,8 @@ function reconcileInput(over: Partial<ComposerReconcileInput>): ComposerReconcil
     serverDraft: "",
     serverUpdatedAt: "2026-01-01T00:00:05Z",
     cached: null,
+    ownsPending: false,
+    promotedFrom: null,
     composerValue: "",
     lastSeededSession: undefined,
     lastSeededValue: "",
@@ -131,11 +170,134 @@ run("reconcile seeds the composer on first entry into a session", () => {
 });
 
 run("reconcile leaves the composer untouched during a lazy-draft flip", () => {
-  // conversationId flipped null->draftId for the same input session.
-  const r = reconcileComposerDraft(
-    reconcileInput({ conversationId: "draft9", lazyDraftId: "draft9", composerValue: "typing" }),
+  // conversationId flipped null->draftId for the same input session: the
+  // composer keeps its keystrokes, and the session is recorded as seeded so the
+  // echoes that follow count as same-session ones.
+  const flip = reconcileComposerDraft(
+    reconcileInput({
+      conversationId: "draft9",
+      lazyDraftId: "draft9",
+      composerValue: "typing",
+      lastSeededSession: null,
+    }),
   );
-  assert(r === null, "lazy-draft flip is a no-op");
+  assert(
+    flip !== null &&
+      flip.value === "typing" &&
+      flip.seededSession === "draft9" &&
+      flip.draftSyncedAt === "2026-01-01T00:00:05Z",
+    "lazy-draft flip records the session without touching the text",
+  );
+  // Later echoes while the lazy draft is still a draft stay hands-off.
+  const echo = reconcileComposerDraft(
+    reconcileInput({
+      conversationId: "draft9",
+      lazyDraftId: "draft9",
+      serverDraft: "typ",
+      composerValue: "typing more",
+      lastSeededSession: "draft9",
+      lastSeededValue: "typing",
+    }),
+  );
+  assert(echo === null, "lazy-draft echo is a no-op");
+});
+
+run("reconcile clears a typed composer when another tab sends the draft", () => {
+  // This tab typed the draft (lazily created, so lastSeededValue is what the
+  // flip recorded, not the final text); tab B opened it and sent it, and its
+  // POST is still in flight (pending entry). The promotion echo must clear the
+  // sent text here even though the typing guard would normally keep it.
+  const r = reconcileComposerDraft(
+    reconcileInput({
+      conversationId: "draft9",
+      lazyDraftId: "draft9",
+      isDraft: false,
+      serverDraft: "",
+      cached: { value: "the draft", basedOn: "2026-01-01T00:00:05Z", pending: true },
+      promotedFrom: "the draft",
+      composerValue: "the draft",
+      lastSeededSession: "draft9",
+      lastSeededValue: "the",
+    }),
+  );
+  assert(
+    r !== null && r.value === "" && r.seededSession === "draft9",
+    "promotion clears the composer",
+  );
+  // Same, once tab B's POST has returned and cleared the mirror.
+  const later = reconcileComposerDraft(
+    reconcileInput({
+      conversationId: "d2",
+      isDraft: false,
+      promotedFrom: "the draft",
+      composerValue: "the draft",
+      lastSeededSession: "d2",
+      lastSeededValue: "",
+    }),
+  );
+  assert(later !== null && later.value === "", "promotion clears the composer (mirror gone)");
+});
+
+run("reconcile keeps a typed composer the promotion did not match", () => {
+  // The user kept typing after the text the server had; another tab sent that
+  // older text. Their newer keystrokes are not what was sent: keep them.
+  const r = reconcileComposerDraft(
+    reconcileInput({
+      isDraft: false,
+      promotedFrom: "the dra",
+      composerValue: "the draft plus",
+      lastSeededSession: "c1",
+      lastSeededValue: "",
+    }),
+  );
+  assert(r === null, "unmatched promotion leaves live keystrokes alone");
+  // Tab B replaced the draft with other text and sent it before its autosave
+  // landed: the server still had this tab's text, but B's pending entry says
+  // what really went. This tab's text was never sent: keep it.
+  const replaced = reconcileComposerDraft(
+    reconcileInput({
+      isDraft: false,
+      cached: { value: "other", basedOn: "", pending: true },
+      promotedFrom: "mine",
+      composerValue: "mine",
+      lastSeededSession: "c1",
+      lastSeededValue: "",
+    }),
+  );
+  assert(replaced === null, "text another tab replaced before sending is kept");
+  // Tab B added to the draft and sent at once (before its autosave): what went
+  // contains this tab's text, so this tab's copy is done with too.
+  const extended = reconcileComposerDraft(
+    reconcileInput({
+      isDraft: false,
+      cached: { value: "mine, and more", basedOn: "", pending: true },
+      promotedFrom: "mine",
+      composerValue: "mine",
+      lastSeededSession: "c1",
+      lastSeededValue: "",
+    }),
+  );
+  assert(
+    extended !== null && extended.value === "",
+    "text another tab extended before sending is cleared",
+  );
+});
+
+run("reconcile leaves the sending tab's composer alone on its own promotion", () => {
+  // This tab sent the draft; its composer keeps the text until the POST returns
+  // (MessageInput clears it on success). The promotion echo must not blank it.
+  const r = reconcileComposerDraft(
+    reconcileInput({
+      isDraft: false,
+      cached: { value: "the draft", basedOn: "", pending: true },
+      ownsPending: true,
+      promotedFrom: "the draft",
+      composerValue: "the draft",
+      lastSeededSession: "c1",
+      lastSeededValue: "the draft",
+    }),
+  );
+  assert(r === null, "own promotion echo is a no-op");
 });
 
 run("reconcile does NOT clobber in-progress typing on a stale server echo", () => {
@@ -229,6 +391,83 @@ run("reconcile seeds a non-draft conversation from its authoritative cache once"
     }),
   );
   assert(echo === null, "non-draft echo does not clobber edits");
+});
+
+run("keeps the newer draft text through promotion", () => {
+  const server = { conversation_id: "p1", draft: "from elsewhere", updated_at: "t2" };
+  keepDraftThroughPromotion(server);
+  assert(loadCachedDraft("p1")?.value === "from elsewhere", "server text is kept");
+  saveCachedDraft("p2", "typed here", "t2");
+  keepDraftThroughPromotion({ ...server, conversation_id: "p2" });
+  assert(loadCachedDraft("p2")?.value === "typed here", "unsynced local text wins");
+  saveCachedDraft("p3", "stale", "t1");
+  keepDraftThroughPromotion({ ...server, conversation_id: "p3" });
+  assert(loadCachedDraft("p3")?.value === "from elsewhere", "stale local text loses");
+  keepDraftThroughPromotion({ conversation_id: "p4", draft: "", updated_at: "t2" });
+  assert(loadCachedDraft("p4") === null, "nothing to keep");
+  saveCachedDraft("p5", "cleared elsewhere", "t1");
+  keepDraftThroughPromotion({ conversation_id: "p5", draft: "", updated_at: "t2" });
+  assert(loadCachedDraft("p5") === null, "text cleared elsewhere stays cleared");
+});
+
+run("reconcile ignores a pending entry on a same-session echo", () => {
+  // Tab B is sending "leaving"; its row echo reaches this tab first. The
+  // shared entry is flagged pending, so an untouched composer here stays
+  // empty rather than picking up the departing text...
+  const pending = { value: "leaving", basedOn: "", pending: true };
+  const echo = reconcileComposerDraft(
+    reconcileInput({
+      conversationId: "sent1",
+      isDraft: false,
+      cached: pending,
+      lastSeededSession: "sent1",
+    }),
+  );
+  assert(echo === null, "pending entry does not seed on echo");
+  // ...and one that mirrored the text from a server echo (a draft promoted
+  // from the other tab) is cleared.
+  const promoted = reconcileComposerDraft(
+    reconcileInput({
+      conversationId: "sent1",
+      isDraft: false,
+      cached: pending,
+      composerValue: "leaving",
+      lastSeededSession: "sent1",
+      lastSeededValue: "leaving",
+    }),
+  );
+  assert(promoted !== null && promoted.value === "", "promotion echo clears the composer");
+});
+
+run("reconcile keeps the sending tab's own pending text on its echo", () => {
+  // The sender's composer was seeded (restored after a reload) and sent
+  // unedited; its own acceptance/promotion echo must not blank it while the
+  // POST can still fail.
+  const r = reconcileComposerDraft(
+    reconcileInput({
+      conversationId: "sent1",
+      isDraft: false,
+      cached: { value: "leaving", basedOn: "", pending: true },
+      ownsPending: true,
+      composerValue: "leaving",
+      lastSeededSession: "sent1",
+      lastSeededValue: "leaving",
+    }),
+  );
+  assert(r === null, "own pending entry is the composer's text");
+});
+
+run("reconcile restores a pending entry on first entry into the session", () => {
+  // Reload while the send was still in flight: the text must not be lost.
+  const r = reconcileComposerDraft(
+    reconcileInput({
+      conversationId: "sent1",
+      isDraft: false,
+      cached: { value: "leaving", basedOn: "", pending: true },
+      lastSeededSession: undefined,
+    }),
+  );
+  assert(r !== null && r.value === "leaving", "pending entry seeds on entry");
 });
 
 console.log("draftCache: all tests passed");

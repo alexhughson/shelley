@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"shelley.exe.dev/server/diskspace"
@@ -30,6 +32,11 @@ type diskSpaceMonitor struct {
 	server *Server
 	probe  func(string) (available, total uint64, err error)
 	status diskspace.DiskSpaceStatus
+	// unsaved means status is newer than the persisted episode, typically
+	// because the disk was too full to write it. Every check retries.
+	unsaved bool
+	// poking guards the single background check queued by poke.
+	poking atomic.Bool
 }
 
 func diskBytes(path string) (available, total uint64, err error) {
@@ -67,8 +74,34 @@ func (s *Server) initDiskSpace(ctx context.Context, probe func(string) (availabl
 	if err := m.check(ctx); err != nil {
 		return err
 	}
-	s.diskSpace = m
+	s.diskSpace.Store(m)
 	return nil
+}
+
+// onDiskFull runs when a database operation fails because the disk is full.
+// The failure is the most timely signal there is, so re-check right away
+// rather than waiting for the next turn end or page load.
+func (s *Server) onDiskFull() {
+	if m := s.diskSpace.Load(); m != nil {
+		m.poke()
+	}
+}
+
+// poke checks in the background: the hook runs on the failing caller's
+// goroutine, possibly while check itself holds mu (its own write can fail
+// too). At most one poke runs at a time; extra pokes are dropped.
+func (m *diskSpaceMonitor) poke() {
+	if !m.poking.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer m.poking.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		if err := m.check(ctx); err != nil {
+			m.server.logger.Error("Disk space check failed", "error", err)
+		}
+	}()
 }
 
 func (m *diskSpaceMonitor) snapshot() diskspace.DiskSpaceStatus {
@@ -98,26 +131,39 @@ func (m *diskSpaceMonitor) check(ctx context.Context) error {
 		if next.Active && !next.Dismissed {
 			m.server.streamPub.Broadcast(StreamResponse{DiskSpaceStatus: &next})
 		}
-		return nil
+	} else {
+		// Entering low, entering critical or recovering each un-dismiss: the
+		// user gets one fresh notice per escalation.
+		next.Dismissed = false
+		if next.Active && !m.status.Active {
+			next.EpisodeID++
+		}
+		next.Revision++
+		// Publish before persisting: a full disk is exactly when the write
+		// fails, and that must not hide the notice saying so.
+		m.status = next
+		m.unsaved = true
+		m.server.streamPub.Broadcast(StreamResponse{DiskSpaceStatus: &next})
 	}
-	// Entering low, entering critical or recovering each un-dismiss: the
-	// user gets one fresh notice per escalation.
-	next.Dismissed = false
-	if next.Active && !m.status.Active {
-		next.EpisodeID++
+	if m.unsaved {
+		if err := m.persist(ctx, m.status); err != nil {
+			// Not fatal: the persisted episode only matters across restarts.
+			m.server.logger.Error("Failed to persist disk space notice", "error", err)
+		} else {
+			m.unsaved = false
+		}
 	}
-	return m.transition(ctx, next)
+	return nil
 }
 
-// transition requires mu. Publish only durable transitions, in commit order.
-func (m *diskSpaceMonitor) transition(ctx context.Context, next diskspace.DiskSpaceStatus) error {
-	next.Revision++
+// persist requires mu.
+func (m *diskSpaceMonitor) persist(ctx context.Context, status diskspace.DiskSpaceStatus) error {
 	value, err := json.Marshal(diskSpaceEpisode{
-		EpisodeID: next.EpisodeID,
-		Revision:  next.Revision,
-		Active:    next.Active,
-		Critical:  next.Critical,
-		Dismissed: next.Dismissed,
+		EpisodeID: status.EpisodeID,
+		Revision:  status.Revision,
+		Active:    status.Active,
+		Critical:  status.Critical,
+		Dismissed: status.Dismissed,
 	})
 	if err != nil {
 		return err
@@ -125,20 +171,23 @@ func (m *diskSpaceMonitor) transition(ctx context.Context, next diskspace.DiskSp
 	if err := m.server.db.SetSetting(ctx, diskSpaceSettingKey, string(value)); err != nil {
 		return fmt.Errorf("persist disk space episode: %w", err)
 	}
-	m.status = next
-	m.server.streamPub.Broadcast(StreamResponse{DiskSpaceStatus: &next})
 	return nil
 }
 
+// dismiss is durable or fails: the user is told when it did not stick.
 func (m *diskSpaceMonitor) dismiss(ctx context.Context, episodeID uint64) (diskspace.DiskSpaceStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.status.Active && !m.status.Dismissed && m.status.EpisodeID == episodeID {
 		next := m.status
 		next.Dismissed = true
-		if err := m.transition(ctx, next); err != nil {
+		next.Revision++
+		if err := m.persist(ctx, next); err != nil {
 			return m.status, err
 		}
+		m.status = next
+		m.unsaved = false
+		m.server.streamPub.Broadcast(StreamResponse{DiskSpaceStatus: &next})
 	}
 	return m.status, nil
 }
@@ -148,10 +197,11 @@ func (m *diskSpaceMonitor) dismiss(ctx context.Context, episodeID uint64) (disks
 // sampling; one statfs, no DB write or broadcast unless the threshold was
 // crossed.
 func (s *Server) refreshDiskSpace(ctx context.Context) {
-	if s.diskSpace == nil {
+	m := s.diskSpace.Load()
+	if m == nil {
 		return
 	}
-	if err := s.diskSpace.check(ctx); err != nil {
+	if err := m.check(ctx); err != nil {
 		s.logger.Error("Disk space check failed", "error", err)
 	}
 }
@@ -164,10 +214,10 @@ func (s *Server) refreshDiskSpace(ctx context.Context) {
 func (s *Server) subscribeStream(ctx context.Context) (func() (StreamResponse, bool), *subpub.SubscriptionStatus, *diskspace.DiskSpaceStatus) {
 	s.refreshDiskSpace(ctx)
 	var snapshot *diskspace.DiskSpaceStatus
-	if s.diskSpace != nil {
-		s.diskSpace.mu.Lock()
-		defer s.diskSpace.mu.Unlock()
-		current := s.diskSpace.status
+	if m := s.diskSpace.Load(); m != nil {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		current := m.status
 		snapshot = &current
 	}
 	next, status := s.streamPub.SubscribeWithStatus(ctx, -1)
@@ -182,14 +232,14 @@ func (s *Server) handleDismissDiskSpace(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "A positive episode_id is required", http.StatusBadRequest)
 		return
 	}
-	if s.diskSpace == nil {
+	m := s.diskSpace.Load()
+	if m == nil {
 		http.Error(w, "Disk space monitor not initialized", http.StatusServiceUnavailable)
 		return
 	}
-	status, err := s.diskSpace.dismiss(r.Context(), req.EpisodeID)
+	status, err := m.dismiss(r.Context(), req.EpisodeID)
 	if err != nil {
-		s.logger.Error("Failed to dismiss disk space notice", "error", err)
-		http.Error(w, "Failed to dismiss disk space notice", http.StatusInternalServerError)
+		s.internalError(w, "Failed to dismiss disk space notice", err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

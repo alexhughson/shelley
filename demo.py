@@ -23,6 +23,7 @@ Usage:
 """
 import hashlib
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -123,18 +124,18 @@ def cmd_start(port: int, custom_db: Path | None = None, banner: str | None = Non
         tmux_kill_session(sess)
         time.sleep(0.3)
 
-    # Start bash in tmux, then run shelley inside it
-    # --socket none disables the local CLI-client Unix socket. With many
-    # demo instances around we'd otherwise exhaust the 10 fallback slots
-    # under ~/.config/shelley/ and the server would refuse to start.
-    cmd = f"{binary} --config {CONFIG} --db {db} serve --port {port} --socket none"
+    # Start bash in tmux, then run shelley inside it.
+    # The demo gets its own CLI socket ($SHELLEY_SOCKET in its conversations)
+    # and its own binary first on PATH, so `shelley mcp` run by a demo
+    # conversation reaches the demo, not the installed Shelley.
+    sock = db_path(port).with_suffix(".sock")
+    cmd = f"PATH={shlex.quote(str(binary.parent))}:$PATH {binary} --config {CONFIG} --db {db} serve --port {port} --socket {shlex.quote(str(sock))}"
     if banner is None:
         banner = default_banner()
         if banner:
             print(f"Using default banner: {banner!r} (override with --banner)")
     if banner:
         # Shell-quote via shlex to handle spaces/punctuation in the banner text.
-        import shlex
         cmd += f" --banner {shlex.quote(banner)}"
     print(f"Starting demo server on port {port} (tmux session '{sess}') ...")
     subprocess.run(

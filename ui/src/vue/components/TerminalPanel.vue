@@ -6,7 +6,7 @@
      The EphemeralTerminal type is re-exported here (from terminalTypes.ts) so
      other code can `import type { EphemeralTerminal } from
      "./components/TerminalPanel.vue"` exactly as it imported from the React
-     module. The actual xterm.js + websocket lifecycle lives in the
+     module. The terminal view + websocket lifecycle lives in the
      TerminalInstance.vue child (one per terminal).
 
      React callback props are mapped to emits:
@@ -16,7 +16,7 @@
        onActiveTerminalExited -> emit("active-terminal-exited")
        onAttached             -> emit("attached", id, termId)
      The presence of an onInsertIntoInput handler in React (which gates the
-     insert buttons) is mirrored by the required `canInsertIntoInput` prop. -->
+     insert actions) is mirrored by the required `canInsertIntoInput` prop. -->
 <template>
   <div
     v-show="visible.length > 0"
@@ -50,8 +50,9 @@
             class="terminal-panel-tabs-divider"
           />
           <div
+            :ref="(el) => setTabEl(t.id, el)"
             :class="`terminal-panel-tab${t.id === activeTabId ? ' terminal-panel-tab-active' : ''}`"
-            :title="t.command"
+            :title="titles.get(t.id) ?? t.command"
             @click="onTabClick(t.id)"
           >
             <!-- Per-tab scope toggle. Terminals start pinned to their
@@ -95,7 +96,13 @@
               class="terminal-panel-tab-indicator terminal-panel-tab-error"
               >✗</span
             >
-            <span class="terminal-panel-tab-label">{{ tabLabel(t.command) }}</span>
+            <!-- Long titles lose their middle: the head gets a CSS ellipsis and
+                 the tail always shows, since either end can be the part that
+                 tells tabs apart (user@vm: ~/src/app). -->
+            <span class="terminal-panel-tab-label" dir="auto"
+              ><span class="terminal-panel-tab-label-head">{{ tabLabel(t).head }}</span
+              ><span class="terminal-panel-tab-label-tail">{{ tabLabel(t).tail }}</span></span
+            >
             <button
               v-tooltip.top="'Close terminal'"
               class="terminal-panel-tab-close"
@@ -107,47 +114,73 @@
           </div>
         </template>
       </div>
+      <!-- Outside the scrolling strip, so it stays reachable with many tabs. -->
+      <button
+        v-tooltip.top="'New terminal'"
+        class="terminal-panel-action-btn terminal-panel-new-btn"
+        aria-label="New terminal"
+        @click="emit('new-terminal')"
+      >
+        <PlusIcon />
+      </button>
 
       <!-- Action buttons — hidden when minimized -->
       <div v-if="!minimized" class="terminal-panel-actions">
         <button
-          v-tooltip.top="'Copy visible screen'"
-          :class="`terminal-panel-action-btn${copyFeedback === 'copyScreen' ? ' terminal-panel-action-btn-feedback' : ''}`"
-          aria-label="Copy visible screen"
-          @click="copyScreen"
+          ref="menuTriggerRef"
+          v-tooltip.top="'Terminal menu'"
+          :class="`terminal-panel-action-btn${copyFeedback ? ' terminal-panel-action-btn-feedback' : ''}`"
+          aria-label="Terminal menu"
+          aria-haspopup="true"
+          :aria-expanded="menuOpen"
+          @click="(event) => menuRef?.toggle(event)"
         >
-          <CheckIcon v-if="copyFeedback === 'copyScreen'" />
-          <CopyIcon v-else />
+          <CheckIcon v-if="copyFeedback" />
+          <MenuIcon v-else />
         </button>
-        <button
-          v-tooltip.top="'Copy all output'"
-          :class="`terminal-panel-action-btn${copyFeedback === 'copyAll' ? ' terminal-panel-action-btn-feedback' : ''}`"
-          aria-label="Copy all output"
-          @click="copyAll"
+        <Popover
+          ref="menuRef"
+          :pt="{
+            root: { class: 'chat-overflow-popover' },
+            content: { class: 'overflow-menu-panel' },
+          }"
+          @show="menuOpen = true"
+          @hide="menuOpen = false"
         >
-          <CheckIcon v-if="copyFeedback === 'copyAll'" />
-          <CopyAllIcon v-else />
-        </button>
-        <template v-if="canInsertIntoInput">
-          <button
-            v-tooltip.top="'Insert visible screen into input'"
-            :class="`terminal-panel-action-btn${copyFeedback === 'insertScreen' ? ' terminal-panel-action-btn-feedback' : ''}`"
-            aria-label="Insert visible screen into input"
-            @click="insertScreen"
-          >
-            <CheckIcon v-if="copyFeedback === 'insertScreen'" />
-            <InsertIcon v-else />
+          <!-- autofocus: Popover focuses this on show, so keys reach the menu. -->
+          <button class="overflow-menu-item" autofocus @click="copyScreen">
+            <CopyIcon class="chat-menu-icon" />
+            Copy visible screen
           </button>
-          <button
-            v-tooltip.top="'Insert all output into input'"
-            :class="`terminal-panel-action-btn${copyFeedback === 'insertAll' ? ' terminal-panel-action-btn-feedback' : ''}`"
-            aria-label="Insert all output into input"
-            @click="insertAll"
-          >
-            <CheckIcon v-if="copyFeedback === 'insertAll'" />
-            <InsertAllIcon v-else />
+          <button class="overflow-menu-item" @click="copyAll">
+            <CopyAllIcon class="chat-menu-icon" />
+            Copy all output
           </button>
-        </template>
+          <template v-if="canInsertIntoInput">
+            <button class="overflow-menu-item" @click="insertScreen">
+              <InsertIcon class="chat-menu-icon" />
+              Insert visible screen into input
+            </button>
+            <button class="overflow-menu-item" @click="insertAll">
+              <InsertAllIcon class="chat-menu-icon" />
+              Insert all output into input
+            </button>
+          </template>
+          <div class="overflow-menu-divider" />
+          <button
+            v-for="choice in RENDERERS"
+            :key="choice.renderer"
+            class="overflow-menu-item"
+            :aria-pressed="terminalRenderer === choice.renderer"
+            @click="chooseRenderer(choice.renderer)"
+          >
+            <CheckIcon
+              class="chat-menu-icon"
+              :style="{ visibility: terminalRenderer === choice.renderer ? 'visible' : 'hidden' }"
+            />
+            {{ choice.label }}
+          </button>
+        </Popover>
         <div class="terminal-panel-actions-divider" />
         <button
           v-tooltip.top="'Close active terminal'"
@@ -168,11 +201,13 @@
         :term="t"
         :is-visible="t.id === activeTabId"
         :is-dark="isDark"
+        :renderer="terminalRenderer"
         :model="model ?? null"
         @status-change="handleStatusChange"
-        @register="registerXterm"
-        @unregister="unregisterXterm"
-        @attached="(id, termId) => emit('attached', id, termId)"
+        @register="registerView"
+        @unregister="unregisterView"
+        @attached="(id, termId, closeOnExit) => emit('attached', id, termId, closeOnExit)"
+        @title-change="setTitle"
       />
     </div>
   </div>
@@ -180,11 +215,14 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
-import type { Terminal } from "@xterm/xterm";
+import Popover from "primevue/popover";
+import type { TerminalHandle, TerminalRenderer } from "./terminalBackend";
+import { useTerminalRendererPreference } from "../composables/terminalRendererPreference";
 import { isDarkModeActive } from "../../services/theme";
 import TerminalInstance from "./TerminalInstance.vue";
 import type { TermStatus } from "./terminalHelpers";
-import { nextActiveTab, visibleTerminals } from "./terminalHelpers";
+import { nextActiveTab, terminalFallbackLabel, visibleTerminals } from "./terminalHelpers";
+import { splitTitleTail } from "./terminalTitle";
 import type { EphemeralTerminal } from "./terminalTypes";
 import CopyIcon from "./terminalIcons/CopyIcon.vue";
 import CopyAllIcon from "./terminalIcons/CopyAllIcon.vue";
@@ -195,6 +233,8 @@ import CloseIcon from "./terminalIcons/CloseIcon.vue";
 import ChevronUpIcon from "./terminalIcons/ChevronUpIcon.vue";
 import ChevronDownIcon from "./terminalIcons/ChevronDownIcon.vue";
 import PinIcon from "./terminalIcons/PinIcon.vue";
+import PlusIcon from "./terminalIcons/PlusIcon.vue";
+import MenuIcon from "./terminalIcons/MenuIcon.vue";
 
 // Re-export EphemeralTerminal so importers can keep importing it from this
 // module (the canonical definition lives in terminalTypes.ts).
@@ -204,7 +244,7 @@ const props = defineProps<{
   terminals: EphemeralTerminal[];
   autoFocusId?: string | null;
   // Mirrors the presence of React's onInsertIntoInput callback, which gates
-  // the insert buttons. When false the insert actions are not rendered.
+  // the insert actions. When false they are not rendered.
   canInsertIntoInput?: boolean;
   // Context surfaced to spawned sessions via SHELLEY_* env vars. Only used on
   // initial spawn; reattaches use the env baked in when the session was
@@ -218,22 +258,39 @@ const emit = defineEmits<{
   (e: "insert-into-input", text: string): void;
   (e: "auto-focus-consumed"): void;
   (e: "active-terminal-exited"): void;
-  (e: "attached", id: string, termId: string): void;
+  (e: "attached", id: string, termId: string, closeOnExit: boolean): void;
   // scope-change: terminal id, new owner (null for global). Emitted only after
   // the server has accepted the change.
   (e: "scope-change", id: string, conversationId: string | null): void;
   (e: "scope-error", message: string): void;
+  (e: "new-terminal"): void;
 }>();
 
 const activeTabId = ref<string | null>(null);
 const height = ref(300);
 const minimized = ref(false);
-const copyFeedback = ref<string | null>(null);
+// The menu's trigger shows a check for a moment after a copy or insert.
+const copyFeedback = ref(false);
+const menuRef = ref<InstanceType<typeof Popover> | null>(null);
+const menuTriggerRef = ref<HTMLButtonElement | null>(null);
+const menuOpen = ref(false);
+function closeMenu() {
+  // Hiding removes the focused item. Give focus back to the menu's button,
+  // where a keyboard user can carry on; Insert then moves it to the composer.
+  const inMenu = document.activeElement?.closest(".overflow-menu-panel");
+  menuRef.value?.hide();
+  if (inMenu) menuTriggerRef.value?.focus();
+}
 const statusMap = ref<Map<string, { status: TermStatus; exitCode: number | null }>>(new Map());
 // Terminals to offer as tabs here: this conversation's own, then the global
 // ones. Every terminal stays mounted regardless; this only drives what is
 // reachable from the tab bar.
 const visible = computed(() => visibleTerminals(props.terminals, props.conversationId ?? null));
+// The menu is teleported out of the panel, so it doesn't hide with it.
+watch(
+  () => visible.value.length === 0,
+  (hidden) => hidden && menuRef.value?.hide(),
+);
 
 // Terminal ids with a scope request in flight, so a pin cannot be
 // double-submitted while its previous request is pending.
@@ -352,6 +409,11 @@ function handleStatusChange(id: string, status: TermStatus, exitCode: number | n
     exitCode: exitCode ?? existing?.exitCode ?? null,
   });
   statusMap.value = next;
+  const term = props.terminals.find((t) => t.id === id);
+  if (status === "exited" && exitCode !== null && term?.closeOnExit) {
+    // Let the exit watcher restore chat focus before removing the active tab.
+    void nextTick(() => emit("close", id));
+  }
 }
 
 // Resize drag
@@ -378,62 +440,53 @@ function handleResizeMouseDown(e: MouseEvent) {
   document.addEventListener("mouseup", handleMouseUp);
 }
 
-function showFeedback(type: string) {
-  copyFeedback.value = type;
-  setTimeout(() => (copyFeedback.value = null), 1500);
+const { terminalRenderer, setTerminalRenderer } = useTerminalRendererPreference();
+const RENDERERS: { renderer: TerminalRenderer; label: string }[] = [
+  { renderer: "ghostty", label: "Render with ghostty" },
+  { renderer: "xterm", label: "Render with xterm.js" },
+];
+function chooseRenderer(renderer: TerminalRenderer) {
+  closeMenu();
+  setTerminalRenderer(renderer);
 }
 
-// Registry of xterm instances and fit callbacks by terminal id.
-const xtermRegistry = new Map<string, Terminal>();
+function showFeedback() {
+  closeMenu();
+  copyFeedback.value = true;
+  setTimeout(() => (copyFeedback.value = false), 1500);
+}
+
+// Terminal views and fit callbacks by terminal id.
+const viewRegistry = new Map<string, TerminalHandle>();
 const fitRegistry = new Map<string, () => void>();
-function registerXterm(id: string, xterm: Terminal, fit: () => void) {
-  xtermRegistry.set(id, xterm);
+function registerView(id: string, view: TerminalHandle, fit: () => void) {
+  viewRegistry.set(id, view);
   fitRegistry.set(id, fit);
+  tryAutoFocus();
 }
-function unregisterXterm(id: string) {
-  xtermRegistry.delete(id);
+function unregisterView(id: string) {
+  viewRegistry.delete(id);
   fitRegistry.delete(id);
+  setTitle(id, null);
 }
 
-// Auto-focus terminal when autoFocusId is set (React effect on
-// [autoFocusId, onAutoFocusConsumed]).
+// Focus the terminal named by autoFocusId once its view has registered;
+// opening one is asynchronous (ghostty-web loads on first use).
+function tryAutoFocus() {
+  const id = props.autoFocusId;
+  const view = id ? viewRegistry.get(id) : undefined;
+  if (!id || !view) return;
+  activeTabId.value = id;
+  minimized.value = false; // expand when focusing a terminal
+  // Double-rAF to ensure we're past any keyup/form events that might steal focus
+  requestAnimationFrame(() => requestAnimationFrame(() => view.focus()));
+  emit("auto-focus-consumed");
+}
 watch(
   () => props.autoFocusId,
-  (autoFocusId) => {
-    if (!autoFocusId) return;
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout>;
-    let attempt = 0;
-    const tryFocus = () => {
-      if (cancelled) return;
-      const xterm = xtermRegistry.get(autoFocusId);
-      if (xterm) {
-        activeTabId.value = autoFocusId;
-        minimized.value = false; // expand when focusing a terminal
-        // Double-rAF to ensure we're past any keyup/form events that might steal focus
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => {
-            xterm.focus();
-          });
-        });
-        emit("auto-focus-consumed");
-        return;
-      }
-      if (++attempt < 10) {
-        timer = setTimeout(tryFocus, 50);
-      }
-    };
-    // Small initial delay to let the form submit / keyup events settle
-    timer = setTimeout(tryFocus, 50);
-    // Cleanup when autoFocusId changes again.
-    const stop = watch(
-      () => props.autoFocusId,
-      () => {
-        cancelled = true;
-        clearTimeout(timer);
-        stop();
-      },
-    );
+  (id) => {
+    // Small delay to let the form submit / keyup events settle
+    if (id) setTimeout(tryAutoFocus, 50);
   },
 );
 
@@ -458,46 +511,28 @@ watch(
 );
 
 function getBufferText(mode: "screen" | "all"): string {
-  if (!activeTabId.value) return "";
-  const xterm = xtermRegistry.get(activeTabId.value);
-  if (!xterm) return "";
-
-  const lines: string[] = [];
-  const buffer = xterm.buffer.active;
-
-  if (mode === "screen") {
-    const startRow = buffer.viewportY;
-    for (let i = 0; i < xterm.rows; i++) {
-      const line = buffer.getLine(startRow + i);
-      if (line) lines.push(line.translateToString(true));
-    }
-  } else {
-    for (let i = 0; i < buffer.length; i++) {
-      const line = buffer.getLine(i);
-      if (line) lines.push(line.translateToString(true));
-    }
-  }
-  return lines.join("\n").trimEnd();
+  const view = activeTabId.value ? viewRegistry.get(activeTabId.value) : undefined;
+  return view ? view.lines(mode).join("\n").trimEnd() : "";
 }
 
 function copyScreen() {
   navigator.clipboard.writeText(getBufferText("screen"));
-  showFeedback("copyScreen");
+  showFeedback();
 }
 function copyAll() {
   navigator.clipboard.writeText(getBufferText("all"));
-  showFeedback("copyAll");
+  showFeedback();
 }
 function insertScreen() {
   if (props.canInsertIntoInput) {
     emit("insert-into-input", getBufferText("screen"));
-    showFeedback("insertScreen");
+    showFeedback();
   }
 }
 function insertAll() {
   if (props.canInsertIntoInput) {
     emit("insert-into-input", getBufferText("all"));
-    showFeedback("insertAll");
+    showFeedback();
   }
 }
 
@@ -532,11 +567,30 @@ watch(
   },
 );
 
-// Truncate command for tab label
-function tabLabel(cmd: string): string {
-  // Show first word or first 30 chars
-  const firstWord = cmd.split(/\s+/)[0];
-  if (firstWord.length > 30) return firstWord.substring(0, 27) + "...";
-  return firstWord;
+// Keep the selected tab in view in the scrolling tab strip.
+const tabEls = new Map<string, Element>();
+function setTabEl(id: string, el: unknown) {
+  if (el instanceof Element) tabEls.set(id, el);
+  else tabEls.delete(id);
+}
+watch(activeTabId, (id) => {
+  if (id)
+    void nextTick(() => tabEls.get(id)?.scrollIntoView({ block: "nearest", inline: "nearest" }));
+});
+
+// Window titles set by the program in each terminal, by terminal id.
+const titles = ref<Map<string, string>>(new Map());
+function setTitle(id: string, title: string | null) {
+  if ((titles.value.get(id) ?? null) === title) return;
+  const next = new Map(titles.value);
+  if (title === null) next.delete(id);
+  else next.set(id, title);
+  titles.value = next;
+}
+
+// The last few cells of a label always show; see the template.
+const TAB_LABEL_TAIL = 8;
+function tabLabel(t: EphemeralTerminal) {
+  return splitTitleTail(titles.value.get(t.id) ?? terminalFallbackLabel(t.command), TAB_LABEL_TAIL);
 }
 </script>

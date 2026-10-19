@@ -40,7 +40,6 @@ func TestConversationListPatchStreamInitialResetAndNewConversation(t *testing.T)
 	if _, err := database.CreateConversation(t.Context(), &slug, true, nil, nil, db.ConversationOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	server.publishConversationListUpdate(ConversationListUpdate{Type: "update"})
 
 	update := waitForPatchEventAfter(t, rec, initial.NewHash)
 	if update.OldHash == nil || *update.OldHash != initial.NewHash || update.NewHash == initial.NewHash {
@@ -80,7 +79,6 @@ func TestConversationListPatchStreamReplaysHistoryFromOldHash(t *testing.T) {
 		if _, err := database.CreateConversation(t.Context(), &slug, true, nil, nil, db.ConversationOptions{}); err != nil {
 			t.Fatal(err)
 		}
-		server.publishConversationListUpdate(ConversationListUpdate{Type: "update"})
 		lastHash = waitForPatchEventAfter(t, rec, lastHash).NewHash
 	}
 	cancel()
@@ -231,7 +229,6 @@ func TestConversationListPatchStreamRemovesAndReorders(t *testing.T) {
 	if err := database.DeleteConversation(t.Context(), a.ConversationID); err != nil {
 		t.Fatal(err)
 	}
-	server.publishConversationListUpdate(ConversationListUpdate{Type: "delete"})
 	ev := waitForPatchEventAfter(t, rec, initial.NewHash)
 	if ev.Reset {
 		t.Fatalf("expected granular patch, got reset")
@@ -285,7 +282,6 @@ func TestConversationListPatchStreamRapidReordersApplyCleanly(t *testing.T) {
 	if err := database.UpdateConversationCwd(ctx, convA.ConversationID, "/tmp/a"); err != nil {
 		t.Fatal(err)
 	}
-	server.publishConversationListUpdate(ConversationListUpdate{Type: "update"})
 	first := waitForPatchEventAfter(t, rec, initial.NewHash)
 	state = mustApplyPatch(t, state, first.Patch)
 	verifyHash(t, state, first.NewHash)
@@ -293,7 +289,6 @@ func TestConversationListPatchStreamRapidReordersApplyCleanly(t *testing.T) {
 	if err := database.UpdateConversationCwd(ctx, convB.ConversationID, "/tmp/b"); err != nil {
 		t.Fatal(err)
 	}
-	server.publishConversationListUpdate(ConversationListUpdate{Type: "update"})
 	second := waitForPatchEventAfter(t, rec, first.NewHash)
 	state = mustApplyPatch(t, state, second.Patch)
 	verifyHash(t, state, second.NewHash)
@@ -348,7 +343,6 @@ func TestConversationListPatchStreamHistoryEndpoint(t *testing.T) {
 	if _, err := database.CreateConversation(t.Context(), nil, true, nil, nil, db.ConversationOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	server.publishConversationListUpdate(ConversationListUpdate{Type: "update"})
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/debug/conversation-stream/history", nil)

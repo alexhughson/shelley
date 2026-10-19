@@ -29,6 +29,7 @@ const (
 )
 
 const (
+	Claude55Haiku  = "claude-haiku-5-5"
 	Claude45Haiku  = "claude-haiku-4-5-20251001"
 	Claude4Sonnet  = "claude-sonnet-4-20250514"
 	Claude45Sonnet = "claude-sonnet-4-5-20250929"
@@ -74,6 +75,10 @@ func (s *Service) Provider() string { return "anthropic" }
 // SetReasoningOverride configures endpoint controls before the service is used.
 func (s *Service) SetReasoningOverride(caps *modelsdev.ReasoningCapabilities) {
 	s.ReasoningOverride = caps
+}
+
+func (s *Service) PatchProfile() string {
+	return llm.ModelPatchProfile(s.Model)
 }
 
 func (s *Service) SupportsReasoning() bool {
@@ -1365,12 +1370,7 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			return nil, errors.Join(errs, err)
 		}
 
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-API-Key", s.APIKey)
-		req.Header.Set("Anthropic-Version", "2023-06-01")
-		if request.Thinking != nil && request.Thinking.BlockBinding != nil {
-			req.Header.Set("Anthropic-Beta", thinkingBindingBeta)
-		}
+		s.setHeaders(req, request)
 
 		resp, err := httpc.Do(req)
 		if err != nil {
@@ -1459,6 +1459,68 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			}
 		}
 	}
+}
+
+func (s *Service) setHeaders(req *http.Request, request *request) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", s.APIKey)
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	if request.Thinking != nil && request.Thinking.BlockBinding != nil {
+		req.Header.Set("Anthropic-Beta", thinkingBindingBeta)
+	}
+}
+
+// CacheTTL is the lifetime of the default "ephemeral" cache_control.
+func (s *Service) CacheTTL() time.Duration { return 5 * time.Minute }
+
+// WarmCache replays ir with max_tokens 0: Anthropic prefills and refreshes the
+// cached prefix without generating output. Budget thinking requires
+// max_tokens above its budget, and changing thinking would change the cache
+// key, so such requests are not warmed. It makes one attempt: a late retry
+// would pay for a fresh cache write rather than refresh one.
+func (s *Service) WarmCache(ctx context.Context, ir *llm.Request) (llm.Usage, error) {
+	ir, err := llm.PrepareRequestCitations(ctx, ir, "anthropic", adaptCitation)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	request := s.fromLLMRequest(ir)
+	if request.Thinking != nil && request.Thinking.Type == "enabled" {
+		return llm.Usage{}, fmt.Errorf("%w: budget thinking needs output tokens", llm.ErrCacheWarmUnsupported)
+	}
+	request.MaxTokens = 0
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	url := cmp.Or(s.URL, DefaultURL)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	s.setHeaders(req, request)
+	resp, err := cmp.Or(s.HTTPC, http.DefaultClient).Do(req)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return llm.Usage{}, fmt.Errorf("anthropic cache warm: status %v (url=%s, model=%s): %s", resp.Status, url, request.Model, body)
+	}
+	var out response
+	if err := json.Unmarshal(body, &out); err != nil {
+		return llm.Usage{}, fmt.Errorf("anthropic cache warm: %w", err)
+	}
+	if len(out.Content) > 0 || out.StopReason != "max_tokens" {
+		return llm.Usage{}, fmt.Errorf("anthropic cache warm generated output: stop_reason %q, %d content blocks", out.StopReason, len(out.Content))
+	}
+	usage := toLLMUsage(out.Usage)
+	usage.CostUSD = llm.CostUSDFromResponse(resp.Header)
+	usage.Model = out.Model
+	return usage, nil
 }
 
 // ConfigDetails returns configuration information for logging

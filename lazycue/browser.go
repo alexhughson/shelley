@@ -2,6 +2,7 @@ package lazycue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"slices"
@@ -10,9 +11,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 	"github.com/chromedp/chromedp/kb"
 )
@@ -30,7 +33,11 @@ type Browser struct {
 	allocCancel context.CancelFunc
 	ctxCancel   context.CancelFunc
 	ctx         context.Context
-	closeOnce   sync.Once
+	// tabs holds the extra tabs opened by steps naming a tab, by name. The
+	// unnamed tab the browser started with is ctx.
+	tabs       map[string]tab
+	initScript string
+	closeOnce  sync.Once
 
 	// screenshotSink, when non-nil, is invoked after every executed step with
 	// the step index and a PNG screenshot of the page. Used to capture a
@@ -44,6 +51,18 @@ func (b *Browser) SetScreenshotSink(sink func(stepIndex int, action string, png 
 	b.screenshotSink = sink
 }
 
+type tab struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// Pixel 5 viewport.
+const (
+	viewportWidth  = 393
+	viewportHeight = 851
+	viewportScale  = 2.75
+)
+
 // NewBrowser launches a headless Chrome instance with Pixel 5 viewport (393x851).
 // initScript runs before every page's own scripts when non-empty.
 func NewBrowser(parentCtx context.Context, initScript string) (*Browser, error) {
@@ -53,37 +72,132 @@ func NewBrowser(parentCtx context.Context, initScript string) (*Browser, error) 
 		chromedp.Flag("disable-dbus", true),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.WindowSize(393, 851),
+		chromedp.WindowSize(viewportWidth, viewportHeight),
 	)
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(parentCtx, opts...)
 	ctx, ctxCancel := chromedp.NewContext(allocCtx)
 
-	// Set device metrics for Pixel 5 viewport.
-	if err := chromedp.Run(
-		ctx,
-		emulation.SetDeviceMetricsOverride(393, 851, 2.75, true),
-	); err != nil {
+	if err := chromedp.Run(ctx, setUpTab(initScript)); err != nil {
 		ctxCancel()
 		allocCancel()
-		return nil, fmt.Errorf("set viewport: %w", err)
-	}
-	if initScript != "" {
-		if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-			_, err := page.AddScriptToEvaluateOnNewDocument(initScript).Do(ctx)
-			return err
-		})); err != nil {
-			ctxCancel()
-			allocCancel()
-			return nil, fmt.Errorf("install init script: %w", err)
-		}
+		return nil, err
 	}
 
 	return &Browser{
 		allocCancel: allocCancel,
 		ctxCancel:   ctxCancel,
 		ctx:         ctx,
+		initScript:  initScript,
+		tabs:        map[string]tab{},
 	}, nil
+}
+
+// setUpTab gives a tab the viewport and init script every tab gets; both are
+// per tab in Chrome, so a tab opened later needs them as much as the first.
+func setUpTab(initScript string) chromedp.Action {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		if err := emulation.SetDeviceMetricsOverride(viewportWidth, viewportHeight, viewportScale, true).Do(ctx); err != nil {
+			return fmt.Errorf("set viewport: %w", err)
+		}
+		if initScript == "" {
+			return nil
+		}
+		if _, err := page.AddScriptToEvaluateOnNewDocument(initScript).Do(ctx); err != nil {
+			return fmt.Errorf("install init script: %w", err)
+		}
+		return nil
+	})
+}
+
+// tabCtx returns the chromedp context of the tab a step acts on. Only navigate
+// opens a tab, so any other step naming an unopened tab is a script mistake
+// and fails at once.
+func (b *Browser) tabCtx(step Step) (context.Context, error) {
+	if step.Tab == "" {
+		return b.ctx, nil
+	}
+	if t, ok := b.tabs[step.Tab]; ok {
+		return t.ctx, nil
+	}
+	if step.Action == ActionNavigate {
+		return b.openTab(step.Tab, parseTimeout(step.Timeout, defaultStepTimeout))
+	}
+	return nil, fmt.Errorf("tab %q is not open; open it with a navigate step", step.Tab)
+}
+
+// openTab opens another tab of the same browser profile, which shares
+// localStorage, cookies and IndexedDB with the others the way a user's second
+// tab does. It asks for its own window rather than a tab in the first one:
+// full Chrome treats the inactive tab of a window as hidden and stops painting
+// it, which no side-by-side user sees (headless-shell has no windows and
+// ignores the request; its tabs all stay visible).
+//
+// timeout bounds the browser round trips, as the opening step's own timeout:
+// the tab contexts have no deadline, and a stalled browser must fail the step
+// rather than consume the whole-test budget.
+func (b *Browser) openTab(name string, timeout time.Duration) (context.Context, error) {
+	openCtx, cancelOpen := context.WithTimeout(b.ctx, timeout)
+	defer cancelOpen()
+	var id target.ID
+	if err := chromedp.Run(openCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+		var err error
+		id, err = target.CreateTarget("about:blank").
+			WithNewWindow(true).
+			WithWidth(viewportWidth).
+			WithHeight(viewportHeight).
+			Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Browser))
+		return err
+	})); err != nil {
+		return nil, fmt.Errorf("open tab %q: %w", name, err)
+	}
+	ctx, cancel := chromedp.NewContext(b.ctx, chromedp.WithTargetID(id))
+	// The first Run on a context attaches its target for as long as that Run's
+	// context lives, so it must be ctx itself, not a bounded child; bound it
+	// from outside instead (cancelling ctx unblocks a stalled Run).
+	errc := make(chan error, 1)
+	go func() { errc <- chromedp.Run(ctx, setUpTab(b.initScript)) }()
+	var err error
+	select {
+	case err = <-errc:
+	case <-time.After(timeout):
+		err = fmt.Errorf("timeout after %s", timeout)
+	}
+	if err != nil {
+		// Cancelling a context that never attached does not close its target.
+		// openCtx may have expired by now, so close on a fresh one.
+		cancel()
+		closeCtx, cancelClose := context.WithTimeout(b.ctx, time.Second)
+		defer cancelClose()
+		_ = chromedp.Run(closeCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+			return target.CloseTarget(id).Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Browser))
+		}))
+		return nil, fmt.Errorf("open tab %q: %w", name, err)
+	}
+	b.tabs[name] = tab{ctx: ctx, cancel: cancel}
+	return ctx, nil
+}
+
+// closeTab closes a tab opened by a step, as a user closing it would.
+func (b *Browser) closeTab(name string) error {
+	if name == "" {
+		return errors.New("close_tab needs a tab name; the tab the browser started with stays open")
+	}
+	t, ok := b.tabs[name]
+	if !ok {
+		return fmt.Errorf("tab %q is not open", name)
+	}
+	delete(b.tabs, name)
+	err := chromedp.Cancel(t.ctx)
+	t.cancel()
+	return err
+}
+
+// closeTabs closes every tab a script opened, leaving the first.
+func (b *Browser) closeTabs() {
+	for name := range b.tabs {
+		_ = b.closeTab(name)
+	}
 }
 
 // Close shuts down the browser and waits for the Chrome process to exit.
@@ -126,7 +240,8 @@ func (b *Browser) Context() context.Context {
 	return b.ctx
 }
 
-// Screenshot captures a full-page PNG screenshot.
+// Screenshot captures a PNG screenshot of the named tab ("" is the tab the
+// browser started with).
 //
 // The capture is bounded by a short timeout: it runs after every step
 // (including while the predictable agent is mid-turn on a long `delay:`), and a
@@ -134,8 +249,16 @@ func (b *Browser) Context() context.Context {
 // indefinitely on b.ctx, which has no deadline. A diagnostic screenshot is
 // never worth hanging the whole test, so we cap it and let callers ignore the
 // error.
-func (b *Browser) Screenshot(ctx context.Context) ([]byte, error) {
-	shotCtx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
+func (b *Browser) Screenshot(ctx context.Context, tabName string) ([]byte, error) {
+	tabCtx, err := b.tabCtx(Step{Tab: tabName})
+	if err != nil {
+		return nil, err
+	}
+	return b.screenshot(tabCtx)
+}
+
+func (b *Browser) screenshot(tabCtx context.Context) ([]byte, error) {
+	shotCtx, cancel := context.WithTimeout(tabCtx, 5*time.Second)
 	defer cancel()
 	var buf []byte
 	if err := chromedp.Run(shotCtx, chromedp.ActionFunc(func(ctx context.Context) error {
@@ -153,7 +276,13 @@ func (b *Browser) Screenshot(ctx context.Context) ([]byte, error) {
 
 // ExecuteSteps runs a sequence of DSL steps against the browser.
 // It stops on the first failure and returns results for all attempted steps.
+//
+// A script starts with only the first tab open. The generating agent runs
+// several scripts in one browser while it explores; tabs left open by one
+// must not let the next pass without opening them itself, as it will have to
+// in the fresh browser of a cached run.
 func (b *Browser) ExecuteSteps(ctx context.Context, baseURL string, steps []Step) ([]StepResult, error) {
+	b.closeTabs()
 	var results []StepResult
 	for i, step := range steps {
 		start := time.Now()
@@ -170,7 +299,13 @@ func (b *Browser) ExecuteSteps(ctx context.Context, baseURL string, steps []Step
 			sr.Error = err.Error()
 		}
 		if b.screenshotSink != nil {
-			if png, sErr := b.Screenshot(ctx); sErr == nil {
+			// Show the tab the step acted on; after close_tab (or a step on
+			// a tab that is not open) fall back to the first tab.
+			shotCtx, tErr := b.tabCtx(Step{Tab: step.Tab})
+			if tErr != nil {
+				shotCtx = b.ctx
+			}
+			if png, sErr := b.screenshot(shotCtx); sErr == nil {
 				b.screenshotSink(i, step.Action, png)
 			}
 		}
@@ -187,12 +322,19 @@ func (b *Browser) ExecuteSteps(ctx context.Context, baseURL string, steps []Step
 // an error if the step failed. The eval result is surfaced so the generating
 // agent can read the value it probed for instead of flying blind.
 func (b *Browser) executeStep(ctx context.Context, baseURL string, step Step) (string, error) {
+	if step.Action == ActionCloseTab {
+		return "", b.closeTab(step.Tab)
+	}
+	tabCtx, err := b.tabCtx(step)
+	if err != nil {
+		return "", err
+	}
 	if step.Action == ActionEval {
 		timeout := parseTimeout(step.Timeout, defaultStepTimeout)
-		// Bound evaluation on the browser context, which has no deadline of its
+		// Bound evaluation on the tab context, which has no deadline of its
 		// own: a wedged renderer would otherwise stall here until the whole-test
 		// budget expired instead of failing this step.
-		runCtx, cancel := context.WithTimeout(b.ctx, timeout)
+		runCtx, cancel := context.WithTimeout(tabCtx, timeout)
 		defer cancel()
 		// An eval WITHOUT an expectation is a one-shot probe: run once and
 		// return whatever it yields.
@@ -234,20 +376,20 @@ func (b *Browser) executeStep(ctx context.Context, baseURL string, step Step) (s
 			}
 		}
 	}
-	return "", b.executeStepErr(ctx, baseURL, step)
+	return "", b.executeStepErr(ctx, tabCtx, baseURL, step)
 }
 
-func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step) error {
+func (b *Browser) executeStepErr(ctx, tabCtx context.Context, baseURL string, step Step) error {
 	timeout := parseTimeout(step.Timeout, defaultStepTimeout)
 
 	// runBounded runs actions against the browser context bounded by this step's
 	// timeout. Many chromedp actions block until their selector matches (Click
-	// waits for a clickable node, Navigate for the load event), and b.ctx has no
-	// deadline, so running them directly lets one unsatisfiable step consume the
-	// entire per-test budget instead of failing its own step. See
+	// waits for a clickable node, Navigate for the load event), and tabCtx has
+	// no deadline, so running them directly lets one unsatisfiable step consume
+	// the entire per-test budget instead of failing its own step. See
 	// TestBlockingStepsHonorTheirTimeout.
 	runBounded := func(actions ...chromedp.Action) error {
-		runCtx, cancel := context.WithTimeout(b.ctx, timeout)
+		runCtx, cancel := context.WithTimeout(tabCtx, timeout)
 		defer cancel()
 		err := chromedp.Run(runCtx, actions...)
 		if err != nil && runCtx.Err() != nil && ctx.Err() == nil {
@@ -262,13 +404,25 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 	switch step.Action {
 	case ActionNavigate:
 		url := step.URL
-		if !strings.HasPrefix(url, "http") {
+		if url == "" && step.Tab != "" {
+			// Another tab opened "on the same page": the first tab's current
+			// URL, which a script cannot spell out when the app assigned it
+			// (a conversation's /c/<slug>, say).
+			locCtx, cancel := context.WithTimeout(b.ctx, timeout)
+			defer cancel()
+			if err := chromedp.Run(locCtx, chromedp.Location(&url)); err != nil {
+				return fmt.Errorf("navigate: read first tab's URL: %w", err)
+			}
+			if url == "about:blank" {
+				return errors.New("navigate: the first tab has not been navigated yet, so there is no page to open this tab on")
+			}
+		} else if !strings.HasPrefix(url, "http") {
 			url = strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(url, "/")
 		}
 		return runBounded(chromedp.Navigate(url))
 
 	case ActionWaitVisible:
-		return b.pollJS(ctx, timeout, fmt.Sprintf(
+		return b.pollJS(ctx, tabCtx, timeout, fmt.Sprintf(
 			`(function() {
 				const el = document.querySelector(%q);
 				if (!el) return false;
@@ -278,7 +432,7 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 		))
 
 	case ActionWaitHidden:
-		return b.pollJS(ctx, timeout, fmt.Sprintf(
+		return b.pollJS(ctx, tabCtx, timeout, fmt.Sprintf(
 			`(function() {
 				const el = document.querySelector(%q);
 				if (!el) return true;
@@ -288,17 +442,17 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 		))
 
 	case ActionWaitText:
-		return b.pollJS(ctx, timeout, fmt.Sprintf(
+		return b.pollJS(ctx, tabCtx, timeout, fmt.Sprintf(
 			`(document.body.textContent || '').includes(%q)`, step.Text,
 		))
 
 	case ActionWaitTextGone:
-		return b.pollJS(ctx, timeout, fmt.Sprintf(
+		return b.pollJS(ctx, tabCtx, timeout, fmt.Sprintf(
 			`!(document.body.textContent || '').includes(%q)`, step.Text,
 		))
 
 	case ActionFill:
-		return b.fill(ctx, step.Selector, step.Value, timeout)
+		return b.fill(tabCtx, step.Selector, step.Value, timeout)
 
 	case ActionClick:
 		return runBounded(chromedp.Click(step.Selector, chromedp.ByQuery))
@@ -312,11 +466,11 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 
 	case ActionScreenshot:
 		// Just take a screenshot, ignore the bytes (used for side effects in agent)
-		_, err := b.Screenshot(ctx)
+		_, err := b.screenshot(tabCtx)
 		return err
 
 	case ActionAssertVisible:
-		return b.pollCheck(ctx, timeout, func(runCtx context.Context) error {
+		return b.pollCheck(ctx, tabCtx, timeout, func(runCtx context.Context) error {
 			var visible bool
 			if err := chromedp.Run(runCtx, chromedp.Evaluate(fmt.Sprintf(
 				`(function() {
@@ -335,7 +489,7 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 		})
 
 	case ActionAssertNotVisible:
-		return b.pollCheck(ctx, timeout, func(runCtx context.Context) error {
+		return b.pollCheck(ctx, tabCtx, timeout, func(runCtx context.Context) error {
 			var visible bool
 			if err := chromedp.Run(runCtx, chromedp.Evaluate(fmt.Sprintf(
 				`(function() {
@@ -354,7 +508,7 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 		})
 
 	case ActionAssertText:
-		return b.pollCheck(ctx, timeout, func(runCtx context.Context) error {
+		return b.pollCheck(ctx, tabCtx, timeout, func(runCtx context.Context) error {
 			var got string
 			if err := chromedp.Run(runCtx, chromedp.TextContent(step.Selector, &got, chromedp.ByQuery)); err != nil {
 				return fmt.Errorf("assert_text: %w", err)
@@ -367,7 +521,7 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 		})
 
 	case ActionAssertTextContains:
-		return b.pollCheck(ctx, timeout, func(runCtx context.Context) error {
+		return b.pollCheck(ctx, tabCtx, timeout, func(runCtx context.Context) error {
 			var got string
 			if err := chromedp.Run(runCtx, chromedp.TextContent(step.Selector, &got, chromedp.ByQuery)); err != nil {
 				return fmt.Errorf("assert_text_contains: %w", err)
@@ -379,7 +533,7 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 		})
 
 	case ActionAssertAttribute:
-		return b.pollCheck(ctx, timeout, func(runCtx context.Context) error {
+		return b.pollCheck(ctx, tabCtx, timeout, func(runCtx context.Context) error {
 			var got string
 			if err := chromedp.Run(runCtx, chromedp.AttributeValue(step.Selector, step.Attribute, &got, nil, chromedp.ByQuery)); err != nil {
 				return fmt.Errorf("assert_attribute: %w", err)
@@ -395,17 +549,17 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 		// changes (e.g. /new -> /c/<slug>) that happen asynchronously after a
 		// click and can't be caught by the instantaneous assert_url.
 		if step.Value != "" {
-			return b.pollJS(ctx, timeout, fmt.Sprintf(
+			return b.pollJS(ctx, tabCtx, timeout, fmt.Sprintf(
 				`window.location.href === %q || (window.location.pathname + window.location.search + window.location.hash) === %q`,
 				step.Value, step.Value,
 			))
 		}
-		return b.pollJS(ctx, timeout, fmt.Sprintf(
+		return b.pollJS(ctx, tabCtx, timeout, fmt.Sprintf(
 			`window.location.href.includes(%q)`, step.Text,
 		))
 
 	case ActionAssertURL:
-		return b.pollCheck(ctx, timeout, func(runCtx context.Context) error {
+		return b.pollCheck(ctx, tabCtx, timeout, func(runCtx context.Context) error {
 			var got string
 			if err := chromedp.Run(runCtx, chromedp.Location(&got)); err != nil {
 				return err
@@ -420,7 +574,7 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 		})
 
 	case ActionAssertTitle:
-		return b.pollCheck(ctx, timeout, func(runCtx context.Context) error {
+		return b.pollCheck(ctx, tabCtx, timeout, func(runCtx context.Context) error {
 			var got string
 			if err := chromedp.Run(runCtx, chromedp.Title(&got)); err != nil {
 				return err
@@ -432,7 +586,7 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 		})
 
 	case ActionAssertCount:
-		return b.pollCheck(ctx, timeout, func(runCtx context.Context) error {
+		return b.pollCheck(ctx, tabCtx, timeout, func(runCtx context.Context) error {
 			var count int
 			if err := chromedp.Run(runCtx, chromedp.Evaluate(fmt.Sprintf(
 				`document.querySelectorAll(%q).length`, step.Selector,
@@ -457,8 +611,8 @@ func (b *Browser) executeStepErr(ctx context.Context, baseURL string, step Step)
 
 // fill sets a value on an input/textarea with React-compatible event dispatching.
 // timeout bounds the evaluation so a wedged renderer fails this step rather than
-// hanging on the browser's deadline-free context.
-func (b *Browser) fill(ctx context.Context, selector, value string, timeout time.Duration) error {
+// hanging on the tab's deadline-free context.
+func (b *Browser) fill(tabCtx context.Context, selector, value string, timeout time.Duration) error {
 	// Determine if this is a textarea or input.
 	js := fmt.Sprintf(`(function() {
 		const el = document.querySelector(%q);
@@ -473,7 +627,7 @@ func (b *Browser) fill(ctx context.Context, selector, value string, timeout time
 	})()`, selector, selector, value)
 
 	var result bool
-	runCtx, cancel := context.WithTimeout(b.ctx, timeout)
+	runCtx, cancel := context.WithTimeout(tabCtx, timeout)
 	defer cancel()
 	return chromedp.Run(runCtx, chromedp.Evaluate(js, &result))
 }
@@ -487,14 +641,14 @@ func (b *Browser) fill(ctx context.Context, selector, value string, timeout time
 // that never passes (a genuine mismatch, e.g. a forever-spinner regression)
 // still fails after the timeout. Polling only tolerates late settling; it never
 // turns a currently-passing assert into a failure.
-func (b *Browser) pollCheck(ctx context.Context, timeout time.Duration, check func(runCtx context.Context) error) error {
-	// One browser context bounded by the whole polling window, handed to each
+func (b *Browser) pollCheck(ctx, tabCtx context.Context, timeout time.Duration, check func(runCtx context.Context) error) error {
+	// One tab context bounded by the whole polling window, handed to each
 	// check. Several chromedp actions (TextContent, AttributeValue, Click, …)
 	// block until their selector matches, so a check run against the unbounded
-	// browser context could hang forever *inside* an iteration and the deadline
+	// tab context could hang forever *inside* an iteration and the deadline
 	// below would never be consulted. Bounding it here means a stuck check
 	// unblocks when the step's own timeout expires.
-	runCtx, cancel := context.WithTimeout(b.ctx, timeout)
+	runCtx, cancel := context.WithTimeout(tabCtx, timeout)
 	defer cancel()
 	deadline := time.Now().Add(timeout)
 	for {
@@ -514,8 +668,8 @@ func (b *Browser) pollCheck(ctx context.Context, timeout time.Duration, check fu
 }
 
 // pollJS polls a JS expression until it returns true or the timeout expires.
-func (b *Browser) pollJS(ctx context.Context, timeout time.Duration, expr string) error {
-	runCtx, cancel := context.WithTimeout(b.ctx, timeout)
+func (b *Browser) pollJS(ctx, tabCtx context.Context, timeout time.Duration, expr string) error {
+	runCtx, cancel := context.WithTimeout(tabCtx, timeout)
 	defer cancel()
 	deadline := time.Now().Add(timeout)
 	interval := 200 * time.Millisecond

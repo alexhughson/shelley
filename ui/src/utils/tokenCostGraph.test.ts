@@ -6,6 +6,8 @@ import {
   buildTokenCostStack,
   callXLayout,
   countConfirmedUnpricedCalls,
+  deltaBars,
+  generationBoundary,
   formatDuration,
   formatTokenCount,
   formatUsd,
@@ -13,6 +15,7 @@ import {
   ModelUsage,
   OtherUsageRow,
   segmentColor,
+  stackedAreaPaths,
   timeXLayout,
   TOKEN_BANDS,
   UsageEntry,
@@ -188,6 +191,14 @@ function modelUsage(
   assert(approx(outRow.cost, 7.5), "output cost total");
   assert(outRow.unitUsdPerMtok === 25, "output unit price");
   assert(approx(s.perModel[0].totalCost, 13.5), "model total cost");
+  // Per-call (delta) stacking: each call's own cost, not the running total.
+  assert(s.deltaLayers.length === s.segments.length, "one delta layer per segment");
+  assert(approx(s.deltaLayers[2][0], 5), "delta input boundary at call 1");
+  assert(approx(s.deltaLayers[3][0], 7.5), "delta top at call 1");
+  assert(approx(s.deltaLayers[0][1], 1), "delta cacheRead boundary at call 2");
+  assert(approx(s.deltaLayers[2][1], 1), "delta input adds nothing at call 2");
+  assert(approx(s.deltaLayers[3][1], 6), "delta top at call 2 is that call's cost");
+  assert(approx(s.maxDelta, 7.5), "maxDelta = most expensive call");
 }
 
 // Unweighted fallback: no pricing for any model -> raw token counts.
@@ -196,6 +207,7 @@ function modelUsage(
   const s = buildTokenCostStack(entries, { mystery: null });
   assert(!s.weighted, "unweighted when nothing priced");
   assert(approx(s.maxY, 150), "maxY is raw tokens");
+  assert(approx(s.maxDelta, 150), "maxDelta is raw tokens");
   assert(s.perModel.length === 1 && !s.perModel[0].priced, "unpriced model recorded");
 }
 
@@ -393,7 +405,7 @@ function modelUsage(
 // Empty input.
 {
   const s = buildTokenCostStack([], {});
-  assert(s.n === 0 && s.maxY === 0, "empty stack");
+  assert(s.n === 0 && s.maxY === 0 && s.maxDelta === 0, "empty stack");
 }
 
 // Generation delineators.
@@ -418,6 +430,116 @@ function modelUsage(
   );
   assert(callXLayout(0).xs.length === 0, "call layout empty");
   assert(callXLayout(1).xs.length === 1, "call layout single point");
+}
+
+// Per-call bars are the cells of a fixed grid, about a pixel or more wide:
+// every call sits inside its own bar, bars never overlap, and calls sharing
+// a cell share a bar that draws (and hovers as) the most expensive of them.
+{
+  const check = (xs: number[], hs: number[]) => {
+    const bars = deltaBars(xs, hs);
+    const width = bars.length ? bars[0].right - bars[0].left : 0;
+    return (
+      bars.every((b, k) => k === 0 || bars[k - 1].right <= b.left + 1e-12) &&
+      bars.every((b) => approx(b.right - b.left, width) && b.left >= 0 && b.right <= 1 + 1e-12) &&
+      bars.every(
+        (b, k) => b.count > 0 && b.first === (k ? bars[k - 1].first + bars[k - 1].count : 0),
+      ) &&
+      bars.reduce((sum, b) => sum + b.count, 0) === xs.length &&
+      bars.every((b) =>
+        xs
+          .slice(b.first, b.first + b.count)
+          .every((x) => b.left - 1e-12 <= x && x <= b.right + 1e-12),
+      ) &&
+      bars.every((b) => hs[b.call] === Math.max(...hs.slice(b.first, b.first + b.count)))
+    );
+  };
+
+  // Sparse: a separate capped-width bar per call, containing it.
+  const sparse = deltaBars(callXLayout(5).xs, [1, 2, 3, 4, 5]);
+  assert(sparse.length === 5 && check(callXLayout(5).xs, [1, 2, 3, 4, 5]), "sparse: bar per call");
+  assert(sparse[0].right - sparse[0].left < 0.04, "sparse bars are capped");
+  assert(sparse[1].left - sparse[0].right > 0.1, "sparse bars stay separate");
+  assert(approx(sparse[0].left, 0) && approx(sparse[4].right, 1), "edge bars stay in the plot");
+
+  // Bar count tracks what fits, with no sudden halving.
+  for (const count of [2, 33, 34, 200, 333, 334, 400, 667, 1000, 2000]) {
+    const xs = callXLayout(count).xs;
+    const got = deltaBars(xs, new Array(count).fill(1)).length;
+    assert(got === Math.min(count, 333), `${count} calls draw ${Math.min(count, 333)} bars`);
+    assert(check(xs, new Array(count).fill(1)), `${count} calls keep bar invariants`);
+  }
+  const mid = deltaBars(callXLayout(200).xs, new Array(200).fill(1));
+  assert(approx(mid[1].left, mid[0].right), "moderate bars are contiguous");
+
+  // Dense: the most expensive call wins its bar.
+  const heights = Array.from({ length: 2000 }, (_, i) => (i % 7) + (i === 1001 ? 100 : 0));
+  assert(
+    deltaBars(callXLayout(2000).xs, heights).some((b) => b.call === 1001),
+    "the most expensive call wins its bar",
+  );
+
+  // Time layouts: clustered and tied calls never push a bar off its call.
+  const clustered = [0.029, 0.031, 0.061, 1];
+  assert(check(clustered, [1, 1, 1, 1]), "clustered calls sit inside their bars");
+  const tied = deltaBars([0, 0, 1], [1, 3, 2]);
+  assert(tied.length === 2 && tied[0].call === 1 && tied[0].count === 2, "tied calls share a bar");
+  // Generation boundaries fall strictly between the old generation's last
+  // call and the new one's first: on a bar edge when they're in separate
+  // bars, else midway (inside the bar they share).
+  for (const [xs, gens] of [
+    [callXLayout(5).xs, [1, 1, 2, 2, 2]],
+    [callXLayout(200).xs, Array.from({ length: 200 }, (_, i) => (i < 77 ? 1 : 2))],
+    [
+      [0, 0.99, 1],
+      [1, 2, 3],
+    ],
+    [
+      [0, 0.98, 1],
+      [1, 1, 2],
+    ],
+  ] as [number[], number[]][]) {
+    const bars = deltaBars(
+      xs,
+      xs.map(() => 1),
+    );
+    const lines = gens.flatMap((g, i) => (i > 0 && g !== gens[i - 1] ? [i] : []));
+    const xsAt = lines.map((i) => generationBoundary(bars, xs, i));
+    assert(
+      lines.every((i, k) => xs[i - 1] < xsAt[k] && xsAt[k] <= xs[i]),
+      `generation lines between their calls (${xs.length} calls)`,
+    );
+    assert(new Set(xsAt).size === xsAt.length, "distinct generation lines stay distinct");
+    assert(
+      lines.every(
+        (i, k) =>
+          bars.some((b) => b.first <= i - 1 && i < b.first + b.count) ||
+          bars.some((b) => approx(b.left, xsAt[k])),
+      ),
+      "lines between separate bars sit on a bar edge",
+    );
+  }
+  assert(deltaBars([], []).length === 0, "no bars for no calls");
+  const one = deltaBars([0.5], [1]);
+  assert(one.length === 1 && one[0].left <= 0.5 && one[0].right >= 0.5, "single call bar");
+
+  // Seeded property check over random time-like layouts.
+  let seed = 7;
+  const rand = () => ((seed = (seed * 16807) % 2147483647) - 1) / 2147483646;
+  for (let trial = 0; trial < 500; trial++) {
+    const count = 1 + Math.floor(rand() * (trial % 2 ? 40 : 1500));
+    const xs = Array.from({ length: count }, () => (rand() < 0.2 ? 1 : rand() < 0.1 ? 0 : rand()));
+    xs.sort((a, b) => a - b);
+    if (
+      !check(
+        xs,
+        xs.map(() => Math.floor(rand() * 5)),
+      )
+    ) {
+      assert(false, `random layout ${trial} keeps bar invariants`);
+      break;
+    }
+  }
 }
 
 // Time x layout: x advances with wall-clock time within turns; turn breaks
@@ -520,6 +642,48 @@ function modelUsage(
 assert(formatDuration(42_000) === "42s", "formatDuration seconds");
 assert(formatDuration(720_000) === "12m", "formatDuration minutes");
 assert(formatDuration(11_100_000) === "3h 05m", "formatDuration hours");
+
+// stackedAreaPaths: one path per layer, a subpath per turn, slabs for
+// zero-width turns, all within the plot's pixel bounds.
+{
+  const geom = { left: 10, right: 110, yAt: (v: number) => 100 - v };
+  const layers = [
+    [0, 10, 20],
+    [5, 30, 60],
+  ];
+  const paths = stackedAreaPaths(layers, callXLayout(3), geom);
+  assert(paths.length === 2, "stackedAreaPaths: a path per layer");
+  assert(
+    paths[0] === "M10.0,100.0L60.0,90.0L110.0,80.0L110.0,100.0L60.0,100.0L10.0,100.0Z",
+    `stackedAreaPaths: bottom layer rests on zero (${paths[0]})`,
+  );
+  assert(
+    paths[1] === "M10.0,95.0L60.0,70.0L110.0,40.0L110.0,80.0L60.0,90.0L10.0,100.0Z",
+    `stackedAreaPaths: upper layer rests on the one below (${paths[1]})`,
+  );
+
+  const turns = {
+    xs: [0, 0.4, 0.6, 1],
+    turns: [
+      [0, 1],
+      [2, 3],
+    ] as [number, number][],
+    activeMs: 0,
+  };
+  const gapped = stackedAreaPaths([[1, 2, 3, 4]], turns, geom)[0];
+  assert((gapped.match(/M/g) || []).length === 2, "stackedAreaPaths: a subpath per turn");
+
+  const single = stackedAreaPaths([[7]], callXLayout(1), geom)[0];
+  assert(
+    single === "M59.0,93.0L61.0,93.0L61.0,100.0L59.0,100.0Z",
+    `stackedAreaPaths: a lone call is a narrow slab (${single})`,
+  );
+  const edge = stackedAreaPaths([[7, 7]], { xs: [0, 0], turns: [[0, 1]], activeMs: 0 }, geom)[0];
+  assert(
+    edge.startsWith("M10.0,") && !edge.includes("M9"),
+    "stackedAreaPaths: slabs stay in the plot",
+  );
+}
 
 // Formatting.
 assert(formatUsd(0) === "$0", "formatUsd 0");

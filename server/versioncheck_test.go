@@ -1,15 +1,20 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -230,194 +235,153 @@ func TestCustomCommits(t *testing.T) {
 }
 
 func TestVersionCheckerCache(t *testing.T) {
-	t.Parallel()
-	// Create a mock server
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		release := ReleaseInfo{
-			TagName:     "v0.10.0",
-			Version:     "0.10.0",
-			PublishedAt: time.Now().Add(-10 * 24 * time.Hour).Format(time.RFC3339),
-			DownloadURLs: map[string]string{
-				"linux_amd64":  "https://example.com/linux_amd64",
-				"darwin_arm64": "https://example.com/darwin_arm64",
-			},
+	synctest.Test(t, func(t *testing.T) {
+		// Keep this test serial: the metadata requests use http.DefaultClient.
+		oldClient := http.DefaultClient
+		t.Cleanup(func() { http.DefaultClient = oldClient })
+
+		requests := 0
+		latestTag := "v0.10.0"
+		platform := runtime.GOOS + "_" + runtime.GOARCH
+		const downloadURL = "https://example.com/shelley"
+		http.DefaultClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodGet || req.URL.String() != staticMetadataURL+"/release.json" {
+				return nil, fmt.Errorf("unexpected metadata request: %s %s", req.Method, req.URL)
+			}
+			requests++
+			body, err := json.Marshal(ReleaseInfo{
+				TagName:      latestTag,
+				DownloadURLs: map[string]string{platform: downloadURL},
+			})
+			if err != nil {
+				return nil, err
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body))}, nil
+		})}
+
+		vc := &VersionChecker{}
+		check := func(force bool, wantTag string, wantRequests int) {
+			t.Helper()
+			info, err := vc.Check(t.Context(), force)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Error != "" {
+				t.Fatalf("Check returned error: %s", info.Error)
+			}
+			if info.LatestTag != wantTag || info.DownloadURL != downloadURL {
+				t.Fatalf("Check = tag %q, download %q; want %q, %q", info.LatestTag, info.DownloadURL, wantTag, downloadURL)
+			}
+			if requests != wantRequests {
+				t.Fatalf("metadata requests = %d, want %d", requests, wantRequests)
+			}
 		}
-		json.NewEncoder(w).Encode(release)
-	}))
-	defer server.Close()
 
-	// Create version checker without skip
-	vc := &VersionChecker{
-		skipCheck:   false,
-		githubOwner: "test",
-		githubRepo:  "test",
-	}
-
-	// Override the fetch function by checking the cache behavior
-	ctx := t.Context()
-
-	// First call - should not use cache
-	_, err := vc.Check(ctx, false)
-	// Will fail because we're not actually calling the static site, but that's OK for this test
-	// The important thing is that it tried to fetch
-
-	// Second call immediately after - should use cache if first succeeded
-	_, err = vc.Check(ctx, false)
-	_ = err // Ignore error, we're just testing the cache logic
-
-	// Force refresh should bypass cache
-	_, err = vc.Check(ctx, true)
-	_ = err
+		check(false, "v0.10.0", 1)
+		latestTag = "v0.11.0"
+		check(false, "v0.10.0", 1) // A fresh cache must not fetch the newer release.
+		check(true, "v0.11.0", 2)  // A forced check must fetch and replace the cache.
+		latestTag = "v0.12.0"
+		check(false, "v0.11.0", 2)
+		time.Sleep(6 * time.Hour)  // synctest advances fake time, not wall time.
+		check(false, "v0.12.0", 3) // An expired cache must fetch without forcing.
+	})
 }
 
 func TestFindDownloadURL(t *testing.T) {
 	t.Parallel()
-	vc := &VersionChecker{}
-
-	release := &ReleaseInfo{
-		TagName: "v0.1.0",
-		DownloadURLs: map[string]string{
-			"linux_amd64":  "https://example.com/linux_amd64",
-			"linux_arm64":  "https://example.com/linux_arm64",
-			"darwin_amd64": "https://example.com/darwin_amd64",
-			"darwin_arm64": "https://example.com/darwin_arm64",
+	platform := runtime.GOOS + "_" + runtime.GOARCH
+	tests := []struct {
+		name string
+		urls map[string]string
+		want string
+	}{
+		{
+			name: "current platform",
+			urls: map[string]string{
+				platform:                  "https://example.com/current",
+				runtime.GOOS + "_other":   "https://example.com/other-arch",
+				"other_" + runtime.GOARCH: "https://example.com/other-os",
+			},
+			want: "https://example.com/current",
 		},
+		{name: "different architecture", urls: map[string]string{runtime.GOOS + "_other": "https://example.com/other-arch"}},
+		{name: "different OS", urls: map[string]string{"other_" + runtime.GOARCH: "https://example.com/other-os"}},
+		{name: "no downloads"},
 	}
-
-	url := vc.findDownloadURL(release)
-	// The result depends on runtime.GOOS and runtime.GOARCH
-	// Just verify it doesn't panic and returns something for known platforms
-	if url == "" {
-		t.Log("No matching download URL found for current platform - this is expected on some platforms")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vc := &VersionChecker{}
+			got := vc.findDownloadURL(&ReleaseInfo{DownloadURLs: tt.urls})
+			if got != tt.want {
+				t.Errorf("findDownloadURL = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
 func TestFetchChangelogPrefixMatching(t *testing.T) {
-	t.Parallel()
-	// v0.212.925024401 -> extractSHAFromTag returns "542901" (6 chars)
-	// v0.213.950002063 -> extractSHAFromTag returns "a00433" (6 chars)
-	// commits.json has "542901e" and "a004332" (7 chars)
-	// This test verifies the prefix matching logic handles the length mismatch.
-	commits := []StaticCommitInfo{
+	// The February 12 regression: tags encode six hex digits, but the
+	// published commits use seven. Only the latest commit is after current.
+	got := fetchChangelogForTest(t, []StaticCommitInfo{
+		{SHA: "bbbbbbb", Subject: "newer than latest"},
 		{SHA: "a004332", Subject: "fix: latest commit"},
-		{SHA: "542901e", Subject: "shelley/ui: middle commit"},
-		{SHA: "e3ed88a", Subject: "shelley: another commit"},
-		{SHA: "60ee3ab", Subject: "shelley/ui: old commit"},
-	}
-
-	currentSHA := extractSHAFromTag("v0.212.925024401")
-	latestSHA := extractSHAFromTag("v0.213.950002063")
-
-	if currentSHA != "542901" {
-		t.Fatalf("expected currentSHA=542901, got %s", currentSHA)
-	}
-	if latestSHA != "a00433" {
-		t.Fatalf("expected latestSHA=a00433, got %s", latestSHA)
-	}
-
-	// Verify prefix matching works: "a004332" starts with "a00433"
-	if len("a004332") <= len(latestSHA) {
-		t.Fatal("test setup wrong: commit SHA should be longer than tag SHA")
-	}
-
-	// Simulate the matching logic from FetchChangelog
-	var result []CommitInfo
-	var foundLatest, foundCurrent bool
-	for _, c := range commits {
-		if hasPrefix(c.SHA, latestSHA) {
-			foundLatest = true
-		}
-		if foundLatest && !foundCurrent {
-			result = append(result, CommitInfo{SHA: c.SHA, Message: c.Subject})
-		}
-		if hasPrefix(c.SHA, currentSHA) {
-			foundCurrent = true
-			break
-		}
-	}
-
-	if !foundLatest {
-		t.Error("did not find latest SHA via prefix matching")
-	}
-	if !foundCurrent {
-		t.Error("did not find current SHA via prefix matching")
-	}
-
-	// Remove current commit from list
-	if len(result) > 0 {
-		last := result[len(result)-1].SHA
-		if hasPrefix(last, currentSHA) {
-			result = result[:len(result)-1]
-		}
-	}
-
-	// Should have 1 commit: a004332 (the latest). 542901e is the current and
-	// was removed. They are adjacent in the list so there's nothing in between.
-	if len(result) != 1 {
-		t.Errorf("expected 1 commit, got %d: %+v", len(result), result)
-	}
-	if len(result) > 0 && result[0].SHA != "a004332" {
-		t.Errorf("expected first commit SHA=a004332, got %s", result[0].SHA)
+		{SHA: "542901e", Subject: "current commit"},
+		{SHA: "e3ed88a", Subject: "older commit"},
+	})
+	want := []CommitInfo{{SHA: "a004332", Message: "fix: latest commit"}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("FetchChangelog = %+v, want %+v", got, want)
 	}
 }
 
 func TestFetchChangelogPrefixMatchingMultipleCommits(t *testing.T) {
-	t.Parallel()
-	// Same as above but with commits between current and latest
-	commits := []StaticCommitInfo{
+	got := fetchChangelogForTest(t, []StaticCommitInfo{
+		{SHA: "bbbbbbb", Subject: "newer than latest"},
 		{SHA: "a004332", Subject: "fix: latest commit"},
 		{SHA: "1111111", Subject: "middle commit 1"},
 		{SHA: "2222222", Subject: "middle commit 2"},
 		{SHA: "542901e", Subject: "current commit"},
 		{SHA: "60ee3ab", Subject: "old commit"},
+	})
+	want := []CommitInfo{
+		{SHA: "a004332", Message: "fix: latest commit"},
+		{SHA: "1111111", Message: "middle commit 1"},
+		{SHA: "2222222", Message: "middle commit 2"},
 	}
-
-	currentSHA := "542901" // 6-char from tag extraction
-	latestSHA := "a00433"  // 6-char from tag extraction
-
-	var result []CommitInfo
-	var foundLatest, foundCurrent bool
-	for _, c := range commits {
-		if hasPrefix(c.SHA, latestSHA) {
-			foundLatest = true
-		}
-		if foundLatest && !foundCurrent {
-			result = append(result, CommitInfo{SHA: c.SHA, Message: c.Subject})
-		}
-		if hasPrefix(c.SHA, currentSHA) {
-			foundCurrent = true
-			break
-		}
-	}
-
-	if !foundLatest || !foundCurrent {
-		t.Fatal("did not find both SHAs")
-	}
-
-	// Remove current
-	if len(result) > 0 {
-		last := result[len(result)-1].SHA
-		if hasPrefix(last, currentSHA) {
-			result = result[:len(result)-1]
-		}
-	}
-
-	// Should have 3 commits: a004332, 1111111, 2222222
-	if len(result) != 3 {
-		t.Fatalf("expected 3 commits, got %d: %+v", len(result), result)
-	}
-	expected := []string{"a004332", "1111111", "2222222"}
-	for i, exp := range expected {
-		if result[i].SHA != exp {
-			t.Errorf("commit[%d]: expected SHA=%s, got %s", i, exp, result[i].SHA)
-		}
+	if !slices.Equal(got, want) {
+		t.Fatalf("FetchChangelog = %+v, want %+v", got, want)
 	}
 }
 
-func hasPrefix(a, b string) bool {
-	return len(a) >= len(b) && a[:len(b)] == b || len(b) >= len(a) && b[:len(a)] == a
+func fetchChangelogForTest(t *testing.T, commits []StaticCommitInfo) []CommitInfo {
+	t.Helper()
+	// Callers must stay serial because FetchChangelog uses http.DefaultClient.
+	oldClient := http.DefaultClient
+	t.Cleanup(func() { http.DefaultClient = oldClient })
+	body, err := json.Marshal(commits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const currentTag = "v0.212.925024401" // 542901, in octal
+	const latestTag = "v0.213.950002063"  // a00433, in octal
+	requests := 0
+	http.DefaultClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodGet || req.URL.String() != staticMetadataURL+"/commits.json?v="+latestTag {
+			return nil, fmt.Errorf("unexpected changelog request: %s %s", req.Method, req.URL)
+		}
+		requests++
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}
+	vc := &VersionChecker{}
+	got, err := vc.FetchChangelog(t.Context(), currentTag, latestTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("changelog requests = %d, want 1", requests)
+	}
+	return got
 }
 
 func TestHeadlessShellHasUpdate(t *testing.T) {

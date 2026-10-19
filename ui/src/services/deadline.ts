@@ -16,6 +16,58 @@
 // clears", so an unbounded wait there is an unbounded spinner. The cache is
 // only ever an optimization, so the right response to a slow cache is to give
 // up and use the network — never to wait.
+//
+// A deadline mostly ignores time the event loop was blocked. An answer can only
+// be observed when the loop gets to deliver it, and once a stall ends the
+// browser may run the overdue timer before the already-finished operation:
+// Safari 26.4 does exactly that for an IndexedDB read after a 300ms or 1s
+// block. A single wall-clock timer therefore turned a busy tab (a big render,
+// a tab resuming from suspension) into "IndexedDB contention", aborted a read
+// that had taken 3ms, and fetched from the network instead.
+//
+// So the deadline runs as short ticks (at most 50ms). A tick that fires more
+// than 20ms late is charged only its scheduled length and the excess is
+// recorded as stalledMs, which keeps the stall itself visible. If the tick
+// that exhausts the budget was a late one, the wait gets one more on-time
+// tick, because the answer may be queued right behind it. Two bounds keep this
+// from waiting forever: a tab that stays busy still spends a tick's worth of
+// budget per stall, and a wait gives up regardless once it has been visible
+// for its deadline plus MAX_FORGIVEN_STALL_MS. In a background tab whose
+// timers are throttled the budget runs slowly; it runs at full speed again
+// once the tab is visible, so the wait a user can see stays bounded.
+
+/** Longest single tick. Stalls longer than this are not charged. */
+const MAX_TICK_MS = 50;
+/** Ticks per deadline when the deadline is short, so short budgets still tick. */
+const MIN_TICKS = 5;
+/**
+ * Lateness per tick that is ordinary timer jitter, charged in full. Without
+ * it, a 5s deadline's hundred ticks would add up a phantom "stall".
+ */
+const TICK_SLACK_MS = 20;
+
+/**
+ * Most stall time a wait forgives while the tab is visible. Enough to absorb
+ * a big render or a resume (the Safari stalls behind the false alerts were
+ * about 1s); past it, a tab that stays busy goes to the network anyway.
+ */
+export const MAX_FORGIVEN_STALL_MS = 3_000;
+
+const now = () => performance.now();
+const isVisible = () => typeof document === "undefined" || document.visibilityState === "visible";
+
+/**
+ * Bumped on every visibilitychange. A tick whose interval saw a change may
+ * have spent most of it hidden even if it began and ended visible (a tab
+ * suspended mid-wait delivers its next tick only once it is shown again).
+ */
+let visibilityEpoch = 0;
+let watchingVisibility: unknown = null;
+function watchVisibility(): void {
+  if (typeof document === "undefined" || watchingVisibility === document) return;
+  watchingVisibility = document;
+  document.addEventListener("visibilitychange", () => visibilityEpoch++);
+}
 
 /** Thrown when a bounded wait misses its deadline. */
 export class DeadlineExceededError extends Error {
@@ -41,6 +93,8 @@ export interface DeadlineOptions<T> {
    * kill, a cache that quietly stopped working with nothing to say why.
    */
   onLateError?: (err: unknown) => void;
+  /** Override MAX_FORGIVEN_STALL_MS; tests use it to keep the backstop short. */
+  maxStallMs?: number;
 }
 
 /**
@@ -62,8 +116,12 @@ export interface PendingWait {
   what: string;
   /** Deadline it was given, in ms. */
   deadlineMs: number;
-  /** How long it has been waiting so far, in ms. */
+  /** How long it has been waiting so far, in ms (wall clock). */
   elapsedMs: number;
+  /** Of elapsedMs, the part charged against the deadline. */
+  chargedMs: number;
+  /** Of elapsedMs, the part the event loop was blocked or throttled. */
+  stalledMs: number;
 }
 
 interface WaitRecord {
@@ -71,19 +129,23 @@ interface WaitRecord {
   what: string;
   deadlineMs: number;
   startedAt: number;
+  chargedMs: number;
+  stalledMs: number;
 }
 
 let nextWaitId = 1;
 
 /** Snapshot of the waits currently outstanding, longest-waiting first. */
 export function pendingWaits(): PendingWait[] {
-  const now = Date.now();
+  const t = now();
   return [...inFlight]
     .map((w) => ({
       id: w.id,
       what: w.what,
       deadlineMs: w.deadlineMs,
-      elapsedMs: now - w.startedAt,
+      elapsedMs: t - w.startedAt,
+      chargedMs: w.chargedMs,
+      stalledMs: w.stalledMs,
     }))
     .sort((a, b) => b.elapsedMs - a.elapsedMs);
 }
@@ -118,6 +180,12 @@ export interface MissedDeadline {
   outcome: "pending" | "completed" | "failed" | "abandoned";
   /** Time from the start of the wait until the operation settled. */
   settledAfterMs?: number;
+  /**
+   * Time before giving up that the event loop was blocked or throttled, and
+   * so not charged to the deadline. Large values mean the tab itself was
+   * busy, whatever the operation was doing.
+   */
+  stalledMs: number;
   /** The late error, when outcome is "failed". */
   error?: string;
 }
@@ -150,6 +218,7 @@ function recordMiss(entry: WaitRecord): MissedDeadline {
     deadlineMs: entry.deadlineMs,
     at: Date.now(),
     outcome: "pending",
+    stalledMs: Math.round(entry.stalledMs),
   };
   missed.push(rec);
   if (missed.length > MISSED_DEADLINE_BUFFER) missed.shift();
@@ -163,18 +232,25 @@ export function isAbortError(err: unknown): boolean {
 }
 
 /**
- * Await `p`, rejecting with DeadlineExceededError after `ms`.
+ * Await `p`, rejecting with DeadlineExceededError once `ms` of event-loop time
+ * has passed without an answer. Most time the loop was blocked or throttled
+ * is not charged (see the file header), so the wall-clock wait can be longer,
+ * by at most MAX_FORGIVEN_STALL_MS while the tab is visible.
  *
  * `p` keeps running; see DeadlineOptions.onLate.
  */
 export function withDeadline<T>(p: Promise<T>, ms: number, opts: DeadlineOptions<T>): Promise<T> {
+  // Infinity, NaN and negative budgets give up at once, as setTimeout did.
+  if (!Number.isFinite(ms) || ms < 0) ms = 0;
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const entry: WaitRecord = {
       id: nextWaitId++,
       what: opts.what,
       deadlineMs: ms,
-      startedAt: Date.now(),
+      startedAt: now(),
+      chargedMs: 0,
+      stalledMs: 0,
     };
     inFlight.add(entry);
     // Every exit path must deregister, or the diagnostic becomes a liar that
@@ -185,18 +261,59 @@ export function withDeadline<T>(p: Promise<T>, ms: number, opts: DeadlineOptions
     };
     // Set once the deadline fires; the late handlers fill in its outcome.
     let miss: MissedDeadline | undefined;
-    const timer = setTimeout(() => {
+    const tickMs = Math.min(MAX_TICK_MS, ms / MIN_TICKS);
+    let timer: ReturnType<typeof setTimeout>;
+    let scheduled = 0;
+    let scheduledAt = 0;
+    watchVisibility();
+    const maxStallMs = opts.maxStallMs ?? MAX_FORGIVEN_STALL_MS;
+    let armedVisible = true;
+    let armedEpoch = 0;
+    // Wall time spent visible, for the MAX_FORGIVEN_STALL_MS backstop. A tick
+    // that started or ended hidden, or saw the tab hidden in between, counts
+    // none of its time, so a tab coming back from the background is not cut
+    // off for having been throttled or suspended.
+    let visibleMs = 0;
+    const schedule = (delay: number) => {
+      scheduled = delay;
+      scheduledAt = now();
+      armedVisible = isVisible();
+      armedEpoch = visibilityEpoch;
+      timer = setTimeout(tick, delay);
+    };
+    let graced = false;
+    const tick = () => {
       if (settled) return;
+      const ran = now() - scheduledAt;
+      if (armedVisible && armedEpoch === visibilityEpoch && isVisible()) visibleMs += ran;
+      const stalled = ran - scheduled > TICK_SLACK_MS;
+      const charged = stalled ? scheduled : ran;
+      entry.chargedMs = Math.min(ms, entry.chargedMs + charged);
+      entry.stalledMs += ran - charged;
+      if (entry.chargedMs < ms && visibleMs < ms + maxStallMs) {
+        schedule(Math.min(tickMs, ms - entry.chargedMs));
+        return;
+      }
+      // The budget ran out on a tick the stall made overdue, and an answer
+      // that arrived during the stall may be queued behind it. Give it one
+      // more on-time tick before giving up. Only one, so a tab that is always
+      // busy still gives up.
+      if (stalled && !graced) {
+        graced = true;
+        schedule(tickMs);
+        return;
+      }
       done();
       miss = recordMiss(entry);
       reject(new DeadlineExceededError(opts.what, ms));
-    }, ms);
+    };
+    schedule(Math.min(tickMs, ms));
     p.then(
       (v) => {
         if (settled) {
           if (miss) {
             miss.outcome = "completed";
-            miss.settledAfterMs = Date.now() - entry.startedAt;
+            miss.settledAfterMs = now() - entry.startedAt;
           }
           // Guarded: this runs in a promise chain nobody awaits, so a throwing
           // callback would surface as an unhandled rejection.
@@ -214,7 +331,7 @@ export function withDeadline<T>(p: Promise<T>, ms: number, opts: DeadlineOptions
       (err) => {
         if (settled) {
           if (miss) {
-            miss.settledAfterMs = Date.now() - entry.startedAt;
+            miss.settledAfterMs = now() - entry.startedAt;
             if (isAbortError(err)) {
               miss.outcome = "abandoned";
             } else {

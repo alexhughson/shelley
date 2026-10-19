@@ -34,8 +34,10 @@ const (
 	changeDirName        = "change_dir"
 	changeDirDescription = `Change the working directory for subsequent tool calls.
 The directory must exist; relative paths resolve against the current directory.
-Use this instead of 'cd <path> && ...' in shell commands. Omit redundant cd
-when already in the target directory.
+Within one response, change_dir separates sequential groups of parallel calls.
+If it fails, dependent calls are skipped until an absolute change_dir succeeds.
+Call this before inspecting, testing, or editing in another directory.
+Omit redundant cd when already in the target directory.
 `
 	changeDirInputSchema = `{
   "type": "object",

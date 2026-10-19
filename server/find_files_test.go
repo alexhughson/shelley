@@ -528,15 +528,6 @@ func TestFindFilesBadRequests(t *testing.T) {
 			t.Errorf("expected 400, got %d", w.Code)
 		}
 	})
-
-	t.Run("method_not_allowed", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/api/find-files?dir=/tmp", nil)
-		w := httptest.NewRecorder()
-		h.server.handleFindFiles(w, req)
-		if w.Code != http.StatusMethodNotAllowed {
-			t.Errorf("expected 405, got %d", w.Code)
-		}
-	})
 }
 
 // TestFindFilesPathQuery verifies that a query which is itself a path escapes

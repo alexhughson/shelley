@@ -81,20 +81,6 @@ func TestUploadEndpoint(t *testing.T) {
 	os.Remove(path)
 }
 
-func TestUploadEndpointMethodNotAllowed(t *testing.T) {
-	t.Parallel()
-	server, _, _ := newTestServer(t)
-
-	req := httptest.NewRequest("GET", "/api/upload", nil)
-	w := httptest.NewRecorder()
-
-	server.handleUpload(w, req)
-
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("expected status 405, got %d", w.Code)
-	}
-}
-
 func TestUploadEndpointNoFile(t *testing.T) {
 	t.Parallel()
 	server, _, _ := newTestServer(t)

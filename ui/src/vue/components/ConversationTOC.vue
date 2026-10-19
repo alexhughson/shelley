@@ -60,6 +60,7 @@
           <template v-if="entry.kind === 'bottom'">↓</template>
           <template v-if="entry.kind === 'user'">•</template>
           <template v-if="entry.kind === 'eot'">✓</template>
+          <template v-if="entry.kind === 'compaction'">🗜️</template>
         </span>
         <span v-if="entry.thumbnails?.length" class="toc-entry-thumbnail-wrap" aria-hidden="true">
           <img
@@ -82,7 +83,13 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, onUnmounted, ref, watch } from "vue";
 import Popover from "primevue/popover";
-import { isCompactionCarried, type Message, type LLMMessage, type LLMContent } from "../../types";
+import {
+  contextNudge,
+  isCompactionCarried,
+  type Message,
+  type LLMMessage,
+  type LLMContent,
+} from "../../types";
 import { perfCount, perfWrap } from "../../utils/perf";
 import { replaceLocationFragment } from "../../utils/locationFragment";
 import { chunkMountKey } from "./chunkMount";
@@ -94,7 +101,7 @@ interface TOCThumbnail {
 
 interface TOCEntry {
   id: string;
-  kind: "top" | "user" | "eot" | "image" | "gen" | "bottom";
+  kind: "top" | "user" | "eot" | "image" | "gen" | "compaction" | "bottom";
   label: string;
   messageId?: string;
   toolUseId?: string;
@@ -296,6 +303,18 @@ function buildEntries(
       }
       prevGen = m.generation;
     }
+
+    if (m.type === "inplacecompaction") {
+      entries.push({
+        id: fragmentForMessage(m.message_id),
+        kind: "compaction",
+        label: "Compacted context",
+        messageId: m.message_id,
+        sourceMessageId: m.message_id,
+      });
+      continue;
+    }
+    if (contextNudge(m)) continue;
 
     const llm = parseLLMMessage(m);
     const content = (llm?.Content || []) as LLMContent[];

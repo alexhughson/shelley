@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"testing/synctest"
 
+	"shelley.exe.dev/claudetool"
 	"shelley.exe.dev/db"
 	"shelley.exe.dev/db/generated"
 	"shelley.exe.dev/llm"
@@ -65,14 +67,14 @@ func TestFindPiCutPointKeepsAllWhenSmall(t *testing.T) {
 	}
 }
 
-func TestEstimatePiMessageTokensCountsImageData(t *testing.T) {
+func TestEstimatePiMessageTokensCountsImages(t *testing.T) {
 	msg := llm.Message{
 		Role: llm.MessageRoleUser,
 		Content: []llm.Content{
 			{
 				Type:      llm.ContentTypeText,
 				MediaType: "image/png",
-				Data:      strings.Repeat("a", 400),
+				Data:      strings.Repeat("a", 400_000),
 			},
 			{
 				Type: llm.ContentTypeToolResult,
@@ -85,40 +87,57 @@ func TestEstimatePiMessageTokensCountsImageData(t *testing.T) {
 		},
 	}
 
-	if got := estimatePiMessageTokens(msg); got != 200 {
-		t.Fatalf("estimated tokens = %d, want 200", got)
+	// An image costs about the same however big its data is.
+	if got := estimatePiMessageTokens(msg); got != 2*piImageTokens {
+		t.Fatalf("estimated tokens = %d, want %d", got, 2*piImageTokens)
+	}
+}
+
+func TestFindPiCutPointKeepsHugeLastToolResultWithItsCall(t *testing.T) {
+	msgs := []llm.Message{
+		textMsg(llm.MessageRoleUser, "first"),
+		textMsg(llm.MessageRoleAssistant, "ok"),
+		textMsg(llm.MessageRoleUser, "second"),
+		{Role: llm.MessageRoleAssistant, Content: []llm.Content{{ID: "t1", Type: llm.ContentTypeToolUse, ToolName: "bash", ToolInput: json.RawMessage(`{}`)}}},
+		toolResultMsg(strings.Repeat("x", 100_000)),
+	}
+	// The result alone fills the budget and no cut point follows it: the
+	// call stays with it and everything before is summarized.
+	if cut := findPiCutPoint(msgs, 20_000); cut != 3 {
+		t.Fatalf("cut = %d, want 3", cut)
 	}
 }
 
 func TestFindPiCutPointExcludesImageHeavyHistory(t *testing.T) {
-	msgs := []llm.Message{
-		textMsg(llm.MessageRoleUser, "inspect the page"),
-		{
+	msgs := []llm.Message{textMsg(llm.MessageRoleUser, "inspect the pages")}
+	for i := range 20 {
+		id := fmt.Sprintf("screenshot-%d", i)
+		msgs = append(msgs, llm.Message{
 			Role: llm.MessageRoleAssistant,
 			Content: []llm.Content{{
-				ID:        "screenshot-1",
+				ID:        id,
 				Type:      llm.ContentTypeToolUse,
 				ToolName:  "browser",
 				ToolInput: json.RawMessage(`{"action":"screenshot"}`),
 			}},
-		},
-		{
+		}, llm.Message{
 			Role: llm.MessageRoleUser,
 			Content: []llm.Content{{
 				Type:      llm.ContentTypeToolResult,
-				ToolUseID: "screenshot-1",
+				ToolUseID: id,
 				ToolResult: []llm.Content{{
 					Type:      llm.ContentTypeText,
 					MediaType: "image/png",
 					Data:      strings.Repeat("a", 100_000),
 				}},
 			}},
-		},
-		textMsg(llm.MessageRoleAssistant, "The page looks correct."),
+		})
 	}
+	msgs = append(msgs, textMsg(llm.MessageRoleAssistant, "The pages look correct."))
 
-	if cut := findPiCutPoint(msgs, 20_000); cut != 3 {
-		t.Fatalf("cut = %d, want 3 so the oversized screenshot is summarized instead of carried", cut)
+	// 20k tokens hold 16 screenshots: the oldest are summarized.
+	if cut := findPiCutPoint(msgs, 20_000); cut != 9 {
+		t.Fatalf("cut = %d, want 9", cut)
 	}
 }
 
@@ -194,6 +213,9 @@ func TestPiDistillCopiesRecentMessagesIntoNewGeneration(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := NewTestHarness(t)
 		defer stopActiveConversationLoops(h.server)
+		// Like a channel conversation, which the external message below
+		// stands for, this one offers message_user.
+		h.convOpts = &db.ConversationOptions{ToolOverrides: map[string]string{claudetool.MessageUserName: "on"}}
 
 		h.NewConversation("echo: first thing", "")
 		h.WaitResponse()
@@ -203,6 +225,16 @@ func TestPiDistillCopiesRecentMessagesIntoNewGeneration(t *testing.T) {
 		synctest.Wait()
 		convID := h.convID
 		ctx := t.Context()
+		const externalID = "ext-carried"
+		external, err := h.db.CreateMessage(ctx, db.CreateMessageParams{
+			ConversationID:    convID,
+			Type:              db.MessageTypeUser,
+			LLMData:           llm.UserStringMessage("external tail"),
+			ExternalMessageID: externalID,
+		})
+		if err != nil {
+			t.Fatalf("record external message: %v", err)
+		}
 		const imageData = "small-image-data-that-fits-the-retention-budget"
 		if err := h.server.recordMessage(ctx, convID, llm.Message{
 			Role: llm.MessageRoleUser,
@@ -251,7 +283,7 @@ func TestPiDistillCopiesRecentMessagesIntoNewGeneration(t *testing.T) {
 		}
 		// New generation context should contain the system prompt plus the
 		// verbatim-copied recent messages (the original user/agent turns).
-		var sawUserEcho, sawCarriedFlag, sawCarriedImage bool
+		var sawUserEcho, sawCarriedFlag, sawCarriedImage, sawCarriedExternalID bool
 		for _, m := range ctxMsgs {
 			if m.Generation != after.CurrentGeneration {
 				t.Fatalf("context message from stale generation %d", m.Generation)
@@ -262,6 +294,9 @@ func TestPiDistillCopiesRecentMessagesIntoNewGeneration(t *testing.T) {
 			}
 			if m.LlmData != nil && strings.Contains(*m.LlmData, imageData) {
 				sawCarriedImage = true
+			}
+			if m.ExternalMessageID != nil && *m.ExternalMessageID == externalID {
+				sawCarriedExternalID = true
 			}
 			// Copied messages are stamped compaction_carried=true so the UI can
 			// collapse the replayed tail behind a single band.
@@ -280,6 +315,21 @@ func TestPiDistillCopiesRecentMessagesIntoNewGeneration(t *testing.T) {
 		}
 		if !sawCarriedImage {
 			t.Fatal("expected an image within the retention budget to be copied verbatim")
+		}
+		if !sawCarriedExternalID {
+			t.Fatal("external message ID was lost when carrying the user message forward")
+		}
+		manager, err := h.server.getOrCreateConversationManager(ctx, convID, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		history, _, err := manager.partitionMessages(ctxMsgs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wrapped := fmt.Sprintf("<external_message sequence_id=\"%d\">\nexternal tail\n</external_message>", external.SequenceID)
+		if !strings.Contains(serializePiConversation(history), wrapped) {
+			t.Fatalf("carried external message not wrapped for the LLM: %q", serializePiConversation(history))
 		}
 	})
 }
@@ -458,16 +508,16 @@ func TestResolvePiSummarizationTextSubstitutesPlaceholder(t *testing.T) {
 		"distillation_content": "REAL SUMMARY TEXT",
 	})
 	udStr := string(ud)
-	entry := piContextMessage{
-		llm:    textMsg(llm.MessageRoleUser, "Distillation written to /tmp/x.md"),
-		source: generated.Message{MessageID: "m1", UserData: &udStr},
+	entry := contextItem{
+		message: textMsg(llm.MessageRoleUser, "Distillation written to /tmp/x.md"),
+		source:  &generated.Message{MessageID: "m1", UserData: &udStr},
 	}
 	got := resolvePiSummarizationText(logger, entry)
 	if len(got.Content) == 0 || got.Content[0].Text != "REAL SUMMARY TEXT" {
 		t.Fatalf("expected placeholder replaced with real summary, got %+v", got.Content)
 	}
 	// The original entry must be untouched (no shared-slice mutation).
-	if entry.llm.Content[0].Text != "Distillation written to /tmp/x.md" {
+	if entry.message.Content[0].Text != "Distillation written to /tmp/x.md" {
 		t.Fatalf("resolvePiSummarizationText mutated the source message")
 	}
 }

@@ -13,8 +13,10 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -120,19 +122,24 @@ func fitResponsesContentToPatchLimit(contents []llm.Content, patchSize, maxPatch
 // Responses API request/response types
 
 type responsesRequest struct {
-	Model             string               `json:"model"`
-	Instructions      string               `json:"instructions,omitempty"`
-	Store             bool                 `json:"store"`
-	Stream            bool                 `json:"stream"`
-	Input             []responsesInputItem `json:"input"`
-	Tools             []responsesTool      `json:"tools,omitempty"`
-	ToolChoice        any                  `json:"tool_choice,omitempty"`
-	ParallelToolCalls bool                 `json:"parallel_tool_calls,omitempty"`
-	MaxOutputTokens   int                  `json:"max_output_tokens,omitempty"`
-	Reasoning         *responsesReasoning  `json:"reasoning,omitempty"`
-	Include           []string             `json:"include,omitempty"`
-	PromptCacheKey    string               `json:"prompt_cache_key,omitempty"`
-	Text              *responsesText       `json:"text,omitempty"`
+	Model              string                       `json:"model"`
+	Instructions       string                       `json:"instructions,omitempty"`
+	Store              bool                         `json:"store"`
+	Stream             bool                         `json:"stream"`
+	Input              []responsesInputItem         `json:"input"`
+	Tools              []responsesTool              `json:"tools,omitempty"`
+	ToolChoice         any                          `json:"tool_choice,omitempty"`
+	ParallelToolCalls  bool                         `json:"parallel_tool_calls,omitempty"`
+	MaxOutputTokens    int                          `json:"max_output_tokens,omitempty"`
+	Reasoning          *responsesReasoning          `json:"reasoning,omitempty"`
+	Include            []string                     `json:"include,omitempty"`
+	PromptCacheKey     string                       `json:"prompt_cache_key,omitempty"`
+	PromptCacheOptions *responsesPromptCacheOptions `json:"prompt_cache_options,omitempty"`
+	Text               *responsesText               `json:"text,omitempty"`
+}
+
+type responsesPromptCacheOptions struct {
+	Prewarm bool `json:"prewarm,omitempty"`
 }
 
 type responsesReasoning struct {
@@ -678,13 +685,13 @@ func (s *ResponsesService) MaxImageBytes() int {
 }
 
 // Do sends a request to OpenAI using the Responses API.
-func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error) {
+// buildRequest converts ir into a streaming Responses API request.
+func (s *ResponsesService) buildRequest(ctx context.Context, ir *llm.Request) (responsesRequest, string, llm.MessageOrigin, error) {
 	var err error
 	ir, err = llm.PrepareRequestCitations(ctx, ir, "openai-responses", s.adaptCitation)
 	if err != nil {
-		return nil, err
+		return responsesRequest{}, "", llm.MessageOrigin{}, err
 	}
-	httpc := cmp.Or(s.HTTPC, http.DefaultClient)
 	model := cmp.Or(s.Model, DefaultModel)
 	openAIResponses := s.isOpenAIResponses()
 	reasoningReplay := responsesReasoningReplayNone
@@ -703,7 +710,7 @@ func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Respon
 	if openAIResponses {
 		fittedMessages, err := fitResponsesImagesToPatchLimit(messages, responsesImagePatchSize, responsesMaxImagePatchCount)
 		if err != nil {
-			return nil, fmt.Errorf("prepare Responses API images: %w", err)
+			return responsesRequest{}, "", llm.MessageOrigin{}, fmt.Errorf("prepare Responses API images: %w", err)
 		}
 		messages = fittedMessages
 	}
@@ -712,7 +719,7 @@ func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Respon
 		msg = filterReasoningForOrigin(msg, origin)
 		for j, c := range msg.Content {
 			if len(c.Citations) > 0 && c.Text == "" {
-				return nil, fmt.Errorf("openai-responses messages[%d].content[%d]: cannot replay citations on empty assistant text", i, j)
+				return responsesRequest{}, "", llm.MessageOrigin{}, fmt.Errorf("openai-responses messages[%d].content[%d]: cannot replay citations on empty assistant text", i, j)
 			}
 		}
 		items := fromLLMMessageResponses(msg, reasoningReplay)
@@ -810,6 +817,17 @@ func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Respon
 	if ir.ToolChoice != nil {
 		req.ToolChoice = fromLLMToolChoice(ir.ToolChoice)
 	}
+
+	return req, fullURL, origin, nil
+}
+
+func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error) {
+	req, fullURL, origin, err := s.buildRequest(ctx, ir)
+	if err != nil {
+		return nil, err
+	}
+	httpc := cmp.Or(s.HTTPC, http.DefaultClient)
+	model := cmp.Or(s.Model, DefaultModel)
 
 	// Marshal the request
 	reqJSON, err := json.Marshal(req)
@@ -1046,8 +1064,92 @@ func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Respon
 		result := s.toLLMResponseFromResponses(&resp, httpResp.Header)
 		result.URL = fullURL
 		result.Origin = &origin
+		endTime := time.Now()
+		result.StartTime = &retryStart
+		result.EndTime = &endTime
 		return result, nil
 	}
+}
+
+// prewarmModel matches GPT-5.6 and later: the models with a 30-minute prompt
+// cache and prompt_cache_options.prewarm.
+var prewarmModel = regexp.MustCompile(`^gpt-(\d+)(?:\.(\d+))?(?:$|-)`)
+
+func (s *ResponsesService) supportsPrewarm() bool {
+	m := prewarmModel.FindStringSubmatch(cmp.Or(s.Model, DefaultModel).ModelName)
+	if !s.isOpenAIResponses() || m == nil {
+		return false
+	}
+	major, _ := strconv.Atoi(m[1])
+	minor, _ := strconv.Atoi(m[2])
+	return major > 5 || major == 5 && minor >= 6
+}
+
+// CacheTTL is OpenAI's minimum cache lifetime after the last write or read on
+// models that can prewarm; others cannot warm, so they report 0.
+func (s *ResponsesService) CacheTTL() time.Duration {
+	if !s.supportsPrewarm() {
+		return 0
+	}
+	return 30 * time.Minute
+}
+
+// prewarmOutputCap bounds output in case prewarm is ignored (e.g. dropped by
+// a gateway); OpenAI's minimum max_output_tokens. It is not part of the cache key.
+const prewarmOutputCap = 16
+
+// WarmCache sends ir as Do would, with prompt_cache_options.prewarm, which
+// refreshes the cached prefix without generating output. It makes one
+// non-streaming attempt; any output is an error.
+func (s *ResponsesService) WarmCache(ctx context.Context, ir *llm.Request) (llm.Usage, error) {
+	if !s.supportsPrewarm() {
+		return llm.Usage{}, fmt.Errorf("%w: %s cannot prewarm", llm.ErrCacheWarmUnsupported, cmp.Or(s.Model, DefaultModel).ModelName)
+	}
+	req, url, _, err := s.buildRequest(ctx, ir)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	req.Stream = false
+	req.MaxOutputTokens = prewarmOutputCap
+	req.PromptCacheOptions = &responsesPromptCacheOptions{Prewarm: true}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+s.APIKey)
+	if s.Org != "" {
+		httpReq.Header.Set("OpenAI-Organization", s.Org)
+	}
+	httpResp, err := cmp.Or(s.HTTPC, http.DefaultClient).Do(httpReq)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	defer httpResp.Body.Close()
+	body, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	if httpResp.StatusCode != http.StatusOK {
+		return llm.Usage{}, fmt.Errorf("openai prewarm: status %v (url=%s, model=%s): %s", httpResp.Status, url, req.Model, body)
+	}
+	var resp responsesResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return llm.Usage{}, fmt.Errorf("openai prewarm: %w", err)
+	}
+	if resp.Error != nil {
+		return llm.Usage{}, fmt.Errorf("openai prewarm: %s", resp.Error.Message)
+	}
+	if len(resp.Output) > 0 || resp.Usage.OutputTokens > 0 {
+		return llm.Usage{}, fmt.Errorf("openai prewarm generated output: status %q, %d output items, %d tokens", resp.Status, len(resp.Output), resp.Usage.OutputTokens)
+	}
+	usage := s.toLLMUsageFromResponses(resp.Usage, httpResp.Header)
+	usage.Model = resp.Model
+	return usage, nil
 }
 
 func (s *ResponsesService) isOpenAIResponses() bool {
@@ -1310,7 +1412,7 @@ func (s *ResponsesService) PatchProfile() string {
 	if s.isOpenAIResponses() && s.Model.SupportsApplyPatch {
 		return "codex_apply_patch"
 	}
-	return "flat"
+	return llm.ModelPatchProfile(s.Model.ModelName)
 }
 
 // ConfigDetails returns configuration information for logging

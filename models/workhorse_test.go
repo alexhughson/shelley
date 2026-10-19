@@ -50,6 +50,7 @@ func TestWorkhorseModel(t *testing.T) {
 		Built{ID: "claude-opus-5", Provider: ProviderAnthropic},
 		Built{ID: "claude-haiku-4-5", Provider: ProviderAnthropic, ReleaseDate: "2025-10-15"},
 		Built{ID: "claude-haiku-4-6", Provider: ProviderAnthropic, ReleaseDate: "2026-08-15"},
+		Built{ID: "claude-haiku-5.5", Provider: ProviderAnthropic, ReleaseDate: "2026-10-07"},
 		Built{ID: "gpt-5.6-luna", Provider: ProviderOpenAI, ReleaseDate: "2026-07-09"},
 		Built{ID: "gpt-5.7-luna", Provider: ProviderOpenAI, ReleaseDate: "2026-08-15"},
 		Built{ID: "gpt-5.4-nano", Provider: ProviderOpenAI},
@@ -71,8 +72,8 @@ func TestWorkhorseModel(t *testing.T) {
 		conversationModel string
 		want              string
 	}{
-		{"claude-opus-5", "claude-haiku-4-6"},
-		{"claude-haiku-4-5", "claude-haiku-4-6"},
+		{"claude-opus-5", "claude-haiku-5.5"},
+		{"claude-haiku-4-5", "claude-haiku-5.5"},
 		{"gpt-5.4-nano", "gpt-5.7-luna"},
 		{"gemini-3-flash", "gemini-3.6-flash"},
 		{"nemotron-lightning-3p5", "deepseek-v4.1-flash-fireworks"},

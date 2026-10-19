@@ -2,6 +2,7 @@ package lazycue
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -144,5 +145,14 @@ func TestCallAnthropicStopsOnContextCancel(t *testing.T) {
 	// exhaustion under a cancelled context.
 	if got := atomic.LoadInt32(&calls); got >= anthropicMaxAttempts {
 		t.Errorf("expected fewer than %d attempts under cancellation, got %d", anthropicMaxAttempts, got)
+	}
+}
+
+func TestToolSchemasAreJSON(t *testing.T) {
+	for _, tool := range buildTools() {
+		var v map[string]any
+		if err := json.Unmarshal(tool.InputSchema, &v); err != nil {
+			t.Errorf("%s: %v", tool.Name, err)
+		}
 	}
 }

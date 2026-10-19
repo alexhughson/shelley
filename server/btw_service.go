@@ -23,7 +23,7 @@ type btwService struct {
 	frozenReference string
 }
 
-func newBtwService(ctx context.Context, database *db.DB, parentID string, pointer db.BtwParentPointer, recentLimit int, service llm.Service) (llm.Service, error) {
+func newBtwService(ctx context.Context, logger logWarner, database *db.DB, parentID string, pointer db.BtwParentPointer, recentLimit int, service llm.Service) (llm.Service, error) {
 	if recentLimit < 1 {
 		return nil, fmt.Errorf("recent parent message limit must be positive")
 	}
@@ -31,7 +31,7 @@ func newBtwService(ctx context.Context, database *db.DB, parentID string, pointe
 	if err != nil {
 		return nil, fmt.Errorf("load frozen parent messages: %w", err)
 	}
-	frozenReference, err := formatBtwFrozenReference(messages, recentLimit)
+	frozenReference, err := formatBtwFrozenReference(logger, messages, recentLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -69,34 +69,30 @@ func (s *btwService) SupportsServerSideWebSearch() bool {
 }
 
 type btwFrozenMessage struct {
-	row     generated.Message
+	system  bool
 	message llm.Message
 }
 
-func formatBtwFrozenReference(rows []generated.Message, recentLimit int) (string, error) {
+// formatBtwFrozenReference renders the parent's context as of the frozen
+// pointer — the same compacted view the parent's model had — as reference text.
+func formatBtwFrozenReference(logger logWarner, rows []generated.Message, recentLimit int) (string, error) {
+	items, systemMessages, err := compactedContext(logger, rows)
+	if err != nil {
+		return "", fmt.Errorf("build frozen parent context: %w", err)
+	}
 	var system, history []btwFrozenMessage
-	for _, row := range rows {
-		switch db.MessageType(row.Type) {
-		case db.MessageTypeGitInfo, db.MessageTypeModelChange, db.MessageTypeSlug,
-			db.MessageTypeError, db.MessageTypeWarning:
-			continue
-		}
-		message, err := convertToLLMMessage(row)
-		if err != nil {
-			return "", fmt.Errorf("decode frozen parent message %s: %w", row.MessageID, err)
-		}
-		if row.Type == string(db.MessageTypeUser) && row.UserData != nil {
-			message, err = messageWithSenderProvenance(message, []byte(*row.UserData))
+	for _, m := range systemMessages {
+		system = append(system, btwFrozenMessage{system: true, message: m})
+	}
+	for _, it := range items {
+		message := it.message
+		if it.source != nil && it.source.Type == string(db.MessageTypeUser) && it.source.UserData != nil {
+			message, err = messageWithSenderProvenance(message, []byte(*it.source.UserData))
 			if err != nil {
-				return "", fmt.Errorf("apply frozen parent message provenance %s: %w", row.MessageID, err)
+				return "", fmt.Errorf("apply frozen parent message provenance %s: %w", it.source.MessageID, err)
 			}
 		}
-		item := btwFrozenMessage{row: row, message: message}
-		if row.Type == string(db.MessageTypeSystem) {
-			system = append(system, item)
-		} else {
-			history = append(history, item)
-		}
+		history = append(history, btwFrozenMessage{message: message})
 	}
 	history = limitBtwFrozenHistory(history, recentLimit)
 
@@ -109,7 +105,7 @@ func formatBtwFrozenReference(rows []generated.Message, recentLimit int) (string
 		out.WriteString(" ---\n")
 		content, err := json.Marshal(stableBtwContent(item.message.Content))
 		if err != nil {
-			return "", fmt.Errorf("format frozen parent message %s: %w", item.row.MessageID, err)
+			return "", fmt.Errorf("format frozen parent message: %w", err)
 		}
 		out.Write(content)
 		out.WriteByte('\n')
@@ -120,7 +116,7 @@ func formatBtwFrozenReference(rows []generated.Message, recentLimit int) (string
 }
 
 func btwFrozenLabel(item btwFrozenMessage) string {
-	if item.row.Type == string(db.MessageTypeSystem) {
+	if item.system {
 		return "SYSTEM"
 	}
 	switch item.message.Role {

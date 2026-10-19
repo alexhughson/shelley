@@ -29,7 +29,12 @@
           <div v-else-if="isDraft" class="conversation-title conversation-title-draft">
             {{ ctx.draftLabels.value[conversation.conversation_id] || "draft" }}
           </div>
-          <div v-else class="conversation-title" :title="conversation.slug || undefined">
+          <div
+            v-else
+            class="conversation-title"
+            :title="conversation.slug || undefined"
+            @dblclick="ctx.handleStartRename($event, conversation)"
+          >
             <em v-if="!conversation.slug">untitled</em>
             <template v-else>
               <template
@@ -230,6 +235,16 @@
           </svg>
           {{ terminalCount }}
         </span>
+        <span
+          v-if="!isDraft && !itemArchived && convState.running_background_jobs > 0"
+          class="conversation-running-work"
+          data-testid="conversation-running-work"
+          :aria-label="taskTooltip(convState.running_background_jobs)"
+          :title="taskTooltip(convState.running_background_jobs)"
+        >
+          <GearIcon class="conversation-running-work-gear" />
+          {{ convState.running_background_jobs }}
+        </span>
         <button
           v-if="showParticipantBadge"
           type="button"
@@ -280,7 +295,10 @@
             data-testid="subagent-badge-running"
             aria-hidden="true"
           />
-          <span class="drawer-subagent-count-badge-text">{{ subagentBadgeText }}</span>
+          <span class="drawer-subagent-count-badge-text">
+            <template v-if="runningSubagentCount > 0">{{ runningSubagentCount }}/</template
+            >{{ subagentCount }}
+          </span>
           <svg
             fill="none"
             stroke="currentColor"
@@ -304,19 +322,32 @@
         v-if="convState.git_commit"
         :class="`conversation-git drawer-git-info ${isActive ? 'drawer-git-info-active' : ''}`"
       >
-        <span
-          v-tooltip.top="`Click to copy ${convState.git_commit}`"
-          :class="`drawer-git-hash ${ctx.copiedConvId.value === conversation.conversation_id ? 'drawer-git-hash-copied' : ''}`"
+        <button
+          type="button"
+          v-tooltip.top="
+            ctx.copiedConvId.value === conversation.conversation_id
+              ? 'Copied!'
+              : `Click to copy ${convState.git_commit}`
+          "
+          :aria-label="`Copy commit hash ${convState.git_commit}`"
+          :class="`drawer-git-copy ${ctx.copiedConvId.value === conversation.conversation_id ? 'drawer-git-copy-copied' : ''}`"
           @click="
             ctx.handleCopyGitHash($event, convState.git_commit!, conversation.conversation_id)
           "
+          @auxclick.stop
         >
-          {{
-            ctx.copiedConvId.value === conversation.conversation_id
-              ? "copied!".padEnd(convState.git_commit!.length, "\u00a0")
-              : convState.git_commit
-          }}
-        </span>
+          <svg
+            v-if="ctx.copiedConvId.value === conversation.conversation_id"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+          >
+            <path stroke-linecap="round" stroke-linejoin="round" d="M5 12l4 4L19 6" />
+          </svg>
+          <WorkspaceActionIcon v-else action="gitGraph" />
+        </button>
         <span
           v-if="convState.git_subject"
           :title="convState.git_subject"
@@ -355,33 +386,47 @@
     v-if="!itemArchived && isExpanded && conversationSubagents.length > 0"
     class="subagent-list drawer-subagent-list"
   >
-    <div
-      v-for="sub in conversationSubagents"
-      :key="sub.conversation_id"
-      :class="`conversation-item subagent-item drawer-subagent-item-style ${sub.conversation_id === ctx.currentConversationId.value ? 'active' : ''}${ctx.seenIds.value !== null && !ctx.seenIds.value.has(sub.conversation_id) ? ' conversation-item-enter' : ''}`"
-      @click="onSubClick($event, sub)"
-      @auxclick="ctx.handleAuxClick($event, sub)"
-    >
-      <div class="drawer-conversation-item-flex-container">
-        <div class="drawer-conversation-header-row">
-          <div class="drawer-conversation-item-flex-container">
-            <div class="conversation-title" :title="sub.slug || undefined">
-              <em v-if="!sub.slug">untitled</em>
-              <template v-else>{{ sub.slug }}</template>
+    <template v-for="sub in conversationSubagents" :key="sub.conversation_id">
+      <div
+        :class="`conversation-item subagent-item drawer-subagent-item-style ${sub.conversation_id === ctx.currentConversationId.value ? 'active' : ''}${ctx.seenIds.value !== null && !ctx.seenIds.value.has(sub.conversation_id) ? ' conversation-item-enter' : ''}`"
+        @click="onSubClick($event, sub)"
+        @auxclick="ctx.handleAuxClick($event, sub)"
+      >
+        <div class="drawer-conversation-item-flex-container">
+          <div class="drawer-conversation-header-row">
+            <div class="drawer-conversation-item-flex-container">
+              <div class="conversation-title" :title="sub.slug || undefined">
+                <em v-if="!sub.slug">untitled</em>
+                <template v-else>{{ sub.slug }}</template>
+              </div>
             </div>
+            <span
+              v-if="sub.working"
+              class="working-indicator"
+              :title="ctx.t('subagentIsWorking')"
+            />
           </div>
-          <span v-if="sub.working" class="working-indicator" :title="ctx.t('subagentIsWorking')" />
-        </div>
-        <div class="conversation-preview" :title="sub.preview || undefined">
-          {{ sub.preview || "\u00a0" }}
-        </div>
-        <div class="conversation-meta">
-          <span class="conversation-date drawer-subagent-date">{{
-            ctx.formatDate(sub.updated_at)
-          }}</span>
+          <div class="conversation-preview" :title="sub.preview || undefined">
+            {{ sub.preview || "\u00a0" }}
+          </div>
+          <div class="conversation-meta">
+            <span class="conversation-date drawer-subagent-date">{{
+              ctx.formatDate(sub.updated_at)
+            }}</span>
+            <span
+              v-if="sub.running_background_jobs > 0"
+              class="conversation-running-work"
+              data-testid="conversation-running-work"
+              :aria-label="taskTooltip(sub.running_background_jobs)"
+              :title="taskTooltip(sub.running_background_jobs)"
+            >
+              <GearIcon class="conversation-running-work-gear" />
+              {{ sub.running_background_jobs }}
+            </span>
+          </div>
         </div>
       </div>
-    </div>
+    </template>
   </div>
 </template>
 
@@ -401,6 +446,7 @@ import Button from "primevue/button";
 import Menu from "primevue/menu";
 import type { MenuItem } from "primevue/menuitem";
 import OverflowDotsIcon from "./OverflowDotsIcon.vue";
+import WorkspaceActionIcon from "./WorkspaceActionIcon.vue";
 import type { Conversation, ConversationWithState } from "../../types";
 import { isImeComposing } from "../../utils/imeComposing";
 import { highlightSearchMatches } from "../../utils/searchHighlight";
@@ -412,6 +458,7 @@ import {
 } from "./conversationDrawerShared";
 import { isTagSelected } from "../../utils/tagFilter";
 import { perfCount } from "../../utils/perf";
+import GearIcon from "./GearIcon.vue";
 
 const props = defineProps<{
   conversation: Conversation | ConversationWithState;
@@ -510,6 +557,7 @@ const participantTooltipHtml = computed(() => {
   return `<span class="conversation-participant-tooltip-list">${rows}</span>`;
 });
 const isDraft = computed(() => !!props.conversation.is_draft);
+
 const isActive = computed(
   () => props.conversation.conversation_id === ctx.currentConversationId.value,
 );
@@ -524,21 +572,20 @@ const hasSubagents = computed(() => subagentCount.value > 0);
 const terminalCount = computed(
   () => ctx.terminalCounts.value[props.conversation.conversation_id] ?? 0,
 );
-// How many of this conversation's subagents are currently working. Drives
-// the working ring + "running/total" split on the count badge.
 const runningSubagentCount = computed(
-  () => conversationSubagents.value.filter((s) => s.working).length,
+  () =>
+    conversationSubagents.value.filter(
+      (agent) => agent.working || agent.running_background_jobs > 0,
+    ).length,
 );
-const subagentBadgeText = computed(() =>
-  runningSubagentCount.value > 0
-    ? `${runningSubagentCount.value}/${subagentCount.value}`
-    : `${subagentCount.value}`,
-);
+function taskTooltip(count: number): string {
+  return `${count} task${count === 1 ? "" : "s"} running`;
+}
 const subagentBadgeTooltip = computed(() => {
-  const base = isExpanded.value ? ctx.t("hideSubagents") : ctx.t("showSubagents");
+  const action = isExpanded.value ? ctx.t("hideSubagents") : ctx.t("showSubagents");
   return runningSubagentCount.value > 0
-    ? `${base} (${runningSubagentCount.value} ${ctx.t("running")})`
-    : base;
+    ? `${action} (${runningSubagentCount.value}/${subagentCount.value} ${ctx.t("running")})`
+    : action;
 });
 const isExpanded = computed(() =>
   ctx.expandedSubagents.value.has(props.conversation.conversation_id),
@@ -818,3 +865,37 @@ const DeleteButton = defineComponent({
   },
 });
 </script>
+
+<style scoped>
+.conversation-running-work {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 0 0.25rem;
+  border-radius: 0.25rem;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: var(--font-size-12);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.conversation-running-work-gear {
+  width: 9px;
+  height: 9px;
+  flex-shrink: 0;
+}
+
+.conversation-terminal-count + .conversation-running-work,
+.conversation-running-work + .conversation-participant-badge,
+.conversation-running-work + .subagent-count-badge {
+  margin-left: 0;
+}
+
+.conversation-item.active .conversation-running-work {
+  background: rgba(255, 255, 255, 0.15);
+  color: white;
+}
+</style>

@@ -4,6 +4,8 @@
 
 import { execFileSync, execSync, spawn, type ChildProcess } from 'child_process';
 import { mkdirSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { createServer, type Server } from 'http';
+import type { AddressInfo } from 'net';
 import { tmpdir } from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -16,6 +18,21 @@ const binPath = path.join(shelleyDir, 'bin', 'shelley');
 
 let serverProcess: ChildProcess | null = null;
 let tempDir: string | null = null;
+let liveProvider: Server | null = null;
+
+// GPT-Live's session endpoint, as far as Shelley sees it: each call gets a
+// new session id. Media and events never reach it; the specs fake the
+// browser's WebRTC side.
+async function startLiveProvider(): Promise<string> {
+  let sessions = 0;
+  liveProvider = createServer((req, res) => {
+    req.resume();
+    res.writeHead(201, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ session: { id: `live_${++sessions}` }, transport: { type: 'webrtc', sdp: 'v=0' } }));
+  });
+  await new Promise<void>((resolve) => liveProvider!.listen(0, '127.0.0.1', resolve));
+  return `http://127.0.0.1:${(liveProvider.address() as AddressInfo).port}/v1/live/sessions`;
+}
 
 // Terminal sessions outlive the server by design, so end the ones the tests
 // left behind, along with every process group in each owned PTY session.
@@ -23,7 +40,11 @@ let tempDir: string | null = null;
 // killing only the forkpty child's group leaves those jobs running forever.
 function killTerminalSessions(dir: string) {
   const prefix = `exe-scroll: session ${dir}/`;
-  const procs = execFileSync('ps', ['-axo', 'pid=,ppid=,pgid=,sess=,command='], { encoding: 'utf8' })
+  // Shared CI hosts can have process tables larger than Node's 1 MiB default.
+  const procs = execFileSync('ps', ['-axo', 'pid=,ppid=,pgid=,sess=,command='], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  })
     .split('\n')
     .flatMap((line) => {
       const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
@@ -66,6 +87,8 @@ export default async function globalSetup() {
         rmSync(dir, { recursive: true, force: true });
       }
     } finally {
+      liveProvider?.close();
+      liveProvider = null;
       delete process.env.SHELLEY_TEST_CWD;
       restoreGitEnvironment();
     }
@@ -130,6 +153,7 @@ async function startTestEnvironment(cleanup: () => void, originalEnvironment: No
   const socketPath = path.join(tempDir, 'client.sock');
   process.env.TEST_SERVER_SOCKET = socketPath;
 
+  const liveSessionURL = await startLiveProvider();
   console.log(`Starting shelley (db=${testDb}, port-file=${portFile})`);
 
   let earlyExit = false;
@@ -150,6 +174,7 @@ async function startTestEnvironment(cleanup: () => void, originalEnvironment: No
       HOME: home,
       PWD: cwd,
       PREDICTABLE_DELAY_MS: process.env.PREDICTABLE_DELAY_MS || '20',
+      SHELLEY_LIVE_SESSION_URL: liveSessionURL,
     }),
   });
 

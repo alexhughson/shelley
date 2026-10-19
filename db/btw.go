@@ -203,7 +203,7 @@ func (db *DB) ListFrozenParentMessages(ctx context.Context, conversationID strin
 		rows, err := rx.Query(
 			`SELECT message_id, conversation_id, sequence_id, type, llm_data, user_data, usage_data,
 				created_at, display_data, excluded_from_context, generation, llm_api_url, model_name,
-				forked_from_message_id, user_email, other_usage_data
+				forked_from_message_id, user_email, other_usage_data, external_message_id
 			FROM messages
 			WHERE conversation_id = ? AND generation = ? AND sequence_id <= ? AND excluded_from_context = FALSE
 			ORDER BY sequence_id ASC`,
@@ -219,6 +219,7 @@ func (db *DB) ListFrozenParentMessages(ctx context.Context, conversationID strin
 				&m.MessageID, &m.ConversationID, &m.SequenceID, &m.Type, &m.LlmData, &m.UserData,
 				&m.UsageData, &m.CreatedAt, &m.DisplayData, &m.ExcludedFromContext, &m.Generation,
 				&m.LlmApiUrl, &m.ModelName, &m.ForkedFromMessageID, &m.UserEmail, &m.OtherUsageData,
+				&m.ExternalMessageID,
 			); err != nil {
 				return err
 			}

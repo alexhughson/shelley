@@ -501,59 +501,6 @@ func (h *ClaudeTestHarness) WaitResponse() string {
 	return ""
 }
 
-// WaitToolResult waits for a tool result and returns its text content
-func (h *ClaudeTestHarness) WaitToolResult() string {
-	h.t.Helper()
-
-	if h.convID == "" {
-		h.t.Fatal("WaitToolResult: no conversation started")
-	}
-
-	deadline := time.Now().Add(h.timeout)
-	for time.Now().Before(deadline) {
-		var messages []generated.Message
-		err := h.db.Queries(context.Background(), func(q *generated.Queries) error {
-			var qerr error
-			messages, qerr = q.ListMessages(context.Background(), h.convID)
-			return qerr
-		})
-		if err != nil {
-			h.t.Fatalf("WaitToolResult: failed to get messages: %v", err)
-		}
-
-		for _, msg := range messages {
-			if msg.Type != string(db.MessageTypeUser) || msg.LlmData == nil {
-				continue
-			}
-
-			var llmMsg llm.Message
-			if err := json.Unmarshal([]byte(*msg.LlmData), &llmMsg); err != nil {
-				continue
-			}
-
-			for _, content := range llmMsg.Content {
-				if content.Type == llm.ContentTypeToolResult {
-					for _, result := range content.ToolResult {
-						if result.Type == llm.ContentTypeText && result.Text != "" {
-							return result.Text
-						}
-					}
-				}
-			}
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	h.t.Fatalf("WaitToolResult: timed out waiting for tool result")
-	return ""
-}
-
-// ConversationID returns the current conversation ID
-func (h *ClaudeTestHarness) ConversationID() string {
-	return h.convID
-}
-
 // GetMessages returns all messages in the conversation
 func (h *ClaudeTestHarness) GetMessages() []generated.Message {
 	var messages []generated.Message
@@ -639,7 +586,7 @@ func (m *claudeLLMManager) HasModel(modelID string) bool {
 
 func (m *claudeLLMManager) GetModelInfo(modelID string) *models.ModelInfo {
 	if modelID == "claude-haiku-4.5" {
-		return &models.ModelInfo{DisplayName: "Claude Haiku", Tags: "slug"}
+		return &models.ModelInfo{DisplayName: "Claude Haiku"}
 	}
 	return nil
 }

@@ -21,6 +21,8 @@ export interface Conversation {
   draft: string;
   queued_messages: string;
   turn_interrupted: boolean;
+  external_conversation_id: string | null;
+  external_endpoint: string | null;
 }
 
 export interface Usage {
@@ -33,6 +35,24 @@ export interface Usage {
   url?: string;
   start_time?: string | null;
   end_time?: string | null;
+}
+
+export interface CompactionSquish {
+  from_sequence_id: number;
+  to_sequence_id: number;
+  summary: string;
+}
+
+export interface CompactionTrim {
+  sequence_id: number;
+  tool_use_id: string;
+}
+
+export interface InPlaceCompaction {
+  squishes?: CompactionSquish[] | null;
+  trims?: CompactionTrim[] | null;
+  hidden_sequence_ids?: number[] | null;
+  hidden_tool_use_ids?: string[] | null;
 }
 
 export interface ApiMessageForTS {
@@ -111,12 +131,15 @@ export interface ConversationWithStateForTS {
   draft: string;
   queued_messages: string;
   turn_interrupted: boolean;
+  external_conversation_id: string | null;
+  external_endpoint: string | null;
   working: boolean;
   git_repo_root?: string;
   git_worktree_root?: string;
   git_commit?: string;
   git_subject?: string;
   subagent_count: number;
+  running_background_jobs: number;
   preview?: string;
   preview_updated_at?: string;
   search_snippet?: string;
@@ -133,6 +156,8 @@ export type MessageType =
   | "gitinfo"
   | "warning"
   | "modelchange"
-  | "slug";
+  | "slug"
+  | "inplacecompaction"
+  | "livetranscript";
 
 export type EventType = string;

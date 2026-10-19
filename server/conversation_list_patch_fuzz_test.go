@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"shelley.exe.dev/db"
 	"shelley.exe.dev/db/generated"
 )
 
@@ -64,13 +65,15 @@ func mkRandConv(rng *rand.Rand) ConversationWithState {
 	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	slug := "s"
 	c := ConversationWithState{
-		Conversation: generated.Conversation{
-			ConversationID:      randID(rng),
-			Slug:                &slug,
-			UserInitiated:       true,
-			CreatedAt:           now,
-			UpdatedAt:           now,
-			ConversationOptions: "{}",
+		ConversationListItem: db.ConversationListItem{
+			Conversation: generated.Conversation{
+				ConversationID:      randID(rng),
+				Slug:                &slug,
+				UserInitiated:       true,
+				CreatedAt:           now,
+				UpdatedAt:           now,
+				ConversationOptions: "{}",
+			},
 		},
 		Working: rng.Intn(2) == 0,
 	}

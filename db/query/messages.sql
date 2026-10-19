@@ -1,8 +1,8 @@
 -- name: CreateMessage :one
 -- created_at is normally left NULL to default to CURRENT_TIMESTAMP; see
 -- db.CreateMessageParams.CreatedAt for who overrides it and why.
-INSERT INTO messages (message_id, conversation_id, sequence_id, generation, type, llm_data, user_data, usage_data, display_data, excluded_from_context, llm_api_url, model_name, user_email, other_usage_data, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(sqlc.narg('created_at'), CURRENT_TIMESTAMP))
+INSERT INTO messages (message_id, conversation_id, sequence_id, generation, type, llm_data, user_data, usage_data, display_data, excluded_from_context, llm_api_url, model_name, user_email, other_usage_data, external_message_id, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(sqlc.narg('created_at'), CURRENT_TIMESTAMP))
 RETURNING *;
 
 -- name: GetNextSequenceID :one
@@ -78,13 +78,10 @@ WHERE conversation_id = ? AND type = ?
 ORDER BY sequence_id ASC;
 
 -- name: GetLatestActionableMessage :one
--- The latest message a user could act on. Slug markers are excluded: they hold
--- only the slug LLM call's usage, render as nothing, and land at an arbitrary
--- point (the call races the first turn). Callers gate the Retry/Continue
--- affordances on this row's type being 'error', so a trailing slug marker would
--- otherwise silently disable them.
+-- The latest actionable row. Invisible slug/call-transcript bookkeeping can
+-- arrive after a turn's error; it must not disable Retry/Continue affordances.
 SELECT * FROM messages
-WHERE conversation_id = ? AND type != 'slug'
+WHERE conversation_id = ? AND type NOT IN ('slug', 'livetranscript')
 ORDER BY sequence_id DESC
 LIMIT 1;
 
@@ -108,11 +105,8 @@ WHERE conversation_id = ? AND type = ?;
 -- Counts the trailing run of messages of the given type, i.e. those after the
 -- last message of any OTHER type. Used to cap consecutive retry warnings.
 --
--- Slug markers don't break a run: they are bookkeeping rows carrying only the
--- cost of the LLM call that named the conversation, they render as nothing, and
--- slug generation races the first turn, so a marker landing in the middle of a
--- retry-warning storm would reset the counter and let a fresh batch of warnings
--- through.
+-- Invisible slug/call-transcript bookkeeping doesn't break a run. Otherwise
+-- an asynchronous metadata append could reset the retry-warning storm cap.
 SELECT COUNT(*) FROM messages m
 WHERE m.conversation_id = sqlc.arg('conversation_id')
   AND m.generation = sqlc.arg('generation')
@@ -122,15 +116,15 @@ WHERE m.conversation_id = sqlc.arg('conversation_id')
      WHERE prev.conversation_id = sqlc.arg('conversation_id')
        AND prev.generation = sqlc.arg('generation')
        AND prev.type != sqlc.arg('type')
-       AND prev.type != 'slug'),
+       AND prev.type NOT IN ('slug', 'livetranscript')),
     0);
 
 -- name: ListMessagesTail :many
 -- Returns the last N messages in ascending order. If fewer than N
 -- exist, returns all of them.
 --
--- N counts VISIBLE messages, but slug markers inside the resulting window are
--- still returned. Two reasons to do it this way rather than just excluding them:
+-- N counts VISIBLE messages, but invisible slug/call-transcript bookkeeping
+-- inside the resulting window is still returned. Two reasons to do it this way rather than just excluding them:
 -- an invisible bookkeeping row must not eat the window (?tail=1 would hand back
 -- nothing displayable), yet dropping markers from the middle would punch holes
 -- in the sequence space, and clients that detect lost messages by sequence
@@ -142,7 +136,7 @@ WHERE m.conversation_id = sqlc.arg('conversation_id')
     SELECT MIN(v.sequence_id) FROM (
       SELECT vis.sequence_id FROM messages vis
       WHERE vis.conversation_id = sqlc.arg('conversation_id')
-        AND vis.type != 'slug'
+        AND vis.type NOT IN ('slug', 'livetranscript')
       ORDER BY vis.sequence_id DESC
       LIMIT sqlc.arg('limit')
     ) v
@@ -177,7 +171,7 @@ SELECT m.message_id, m.conversation_id, m.sequence_id, m.type,
        m.llm_data, m.user_data, m.usage_data, m.created_at,
        m.display_data, m.excluded_from_context, m.generation,
        m.llm_api_url, m.model_name, m.forked_from_message_id, m.user_email,
-       m.other_usage_data
+       m.other_usage_data, m.external_message_id
 FROM messages m
 WHERE m.conversation_id = ? AND m.type = 'agent'
   AND m.sequence_id > COALESCE(
@@ -185,3 +179,37 @@ WHERE m.conversation_id = ? AND m.type = 'agent'
      WHERE u.conversation_id = ? AND u.type = 'user'),
     0)
 ORDER BY m.sequence_id DESC;
+
+-- name: ListTypedUserMessages :many
+-- Messages the user typed: user messages that carry neither a tool result nor
+-- machine metadata, other than the stamps of a copy that a compaction carried
+-- into a later generation. Originals come first, newest first, then copies: a
+-- copy's original, when the conversation has it, is the message the UI shows;
+-- a fork of a compacted generation has only the copies.
+SELECT * FROM messages
+WHERE conversation_id = ? AND type = 'user'
+  AND (user_data IS NULL OR user_data IN ('', 'null') OR (
+    json_valid(user_data) AND NOT EXISTS (
+      SELECT 1 FROM json_each(messages.user_data) u
+      WHERE u.key NOT IN ('compaction_carried', 'carried_from_sequence_id', 'live_delivery_id')
+    )
+  ))
+  AND NOT EXISTS (
+    SELECT 1 FROM json_each(messages.llm_data, '$.Content') c
+    WHERE json_extract(c.value, '$.Type') = 6
+  )
+ORDER BY user_data LIKE '%compaction_carried%', sequence_id DESC;
+
+-- name: GetAgentMessageBefore :one
+-- The newest agent message before sequence_id: for a tool-result message,
+-- the message whose tool calls it answers.
+SELECT * FROM messages
+WHERE conversation_id = ? AND type = 'agent' AND sequence_id < ?
+ORDER BY sequence_id DESC
+LIMIT 1;
+
+-- name: HasExternalMessage :one
+-- Whether a channel message was already recorded in the conversation.
+SELECT EXISTS (
+  SELECT 1 FROM messages WHERE conversation_id = ? AND external_message_id = ?
+);

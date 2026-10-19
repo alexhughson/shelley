@@ -31,7 +31,7 @@ func newScopeTestSessions(t *testing.T) *TerminalSessions {
 // alive for the duration of the test.
 func spawnScoped(t *testing.T, ts *TerminalSessions, conversationID string) *TerminalSession {
 	t.Helper()
-	sess, dc, err := ts.Spawn("sleep 60", t.TempDir(), conversationID, 80, 24, nil)
+	sess, dc, err := ts.Spawn("sleep 60", t.TempDir(), conversationID, false, 80, 24, nil)
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestAttachToDeadSessionDoesNotRespawn(t *testing.T) {
 	// A term_id with a command attached is the shape the browser used to send.
 	// Even then, the command must not run.
 	before := len(server.terminals.List())
-	_, _, err := server.attachOrSpawn(sess.ID, "sleep 60", t.TempDir(), "conv-1", 80, 24, nil)
+	_, _, err := server.attachOrSpawn(sess.ID, "sleep 60", t.TempDir(), "conv-1", false, 80, 24, nil)
 	if err == nil {
 		t.Fatal("expected an error attaching to a dead session")
 	}

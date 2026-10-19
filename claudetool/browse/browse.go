@@ -374,21 +374,7 @@ type navigateInput struct {
 	Timeout string `json:"timeout,omitempty"`
 }
 
-// isPort80 reports whether urlStr definitely uses port 80.
-func isPort80(urlStr string) bool {
-	parsedURL, err := url.Parse(urlStr)
-	if err != nil {
-		return false
-	}
-	port := parsedURL.Port()
-	return port == "80" || (port == "" && parsedURL.Scheme == "http")
-}
-
 func (b *BrowseTools) navigateRun(ctx context.Context, input navigateInput) llm.ToolOut {
-	if isPort80(input.URL) {
-		return llm.ErrorToolOut(fmt.Errorf("port 80 is not the port you're looking for--port 80 is the main sketch server"))
-	}
-
 	browserCtx, err := b.GetBrowserContext()
 	if err != nil {
 		return llm.ErrorToolOut(err)
@@ -654,6 +640,15 @@ func (b *BrowseTools) GetTools() []*llm.Tool {
 	}
 }
 
+var combinedBrowserActions = []string{
+	"navigate", "eval", "resize", "screenshot", "console_logs", "clear_console_logs",
+	"screencast_start", "screencast_stop", "screencast_status",
+	"emulate_help", "emulate_device", "emulate_custom", "emulate_reset", "emulate_dark_mode", "emulate_media",
+	"network_help", "network_enable", "network_disable", "network_get_log", "network_clear", "network_cookies", "network_clear_cache",
+	"accessibility_help", "accessibility_tree", "accessibility_query", "accessibility_node",
+	"profile_help", "profile_metrics", "profile_cpu_start", "profile_cpu_stop", "profile_trace_start", "profile_trace_stop", "profile_coverage_start", "profile_coverage_stop",
+}
+
 // CombinedTool returns a single tool that handles all browser actions via an "action" field.
 func (b *BrowseTools) CombinedTool() *llm.Tool {
 	description := `Automate the browser by setting action and its named JSON fields below.
@@ -685,13 +680,17 @@ Device/display emulation, network monitoring, accessibility, and profiling:
 Other actions in these families take no additional parameters. For details and
 examples as needed, use emulate_help, network_help, accessibility_help, or profile_help.`
 
-	schema := `{
+	actions, err := json.Marshal(combinedBrowserActions)
+	if err != nil {
+		panic(err)
+	}
+	schema := fmt.Sprintf(`{
 		"type": "object",
 		"properties": {
 			"action": {
 				"type": "string",
 				"description": "The browser action to perform",
-				"enum": ["navigate", "eval", "resize", "screenshot", "console_logs", "clear_console_logs", "screencast_start", "screencast_stop", "screencast_status", "emulate_help", "emulate_device", "emulate_custom", "emulate_reset", "emulate_dark_mode", "emulate_media", "network_help", "network_enable", "network_disable", "network_get_log", "network_clear", "network_cookies", "network_clear_cache", "accessibility_help", "accessibility_tree", "accessibility_query", "accessibility_node", "profile_help", "profile_metrics", "profile_cpu_start", "profile_cpu_stop", "profile_trace_start", "profile_trace_stop", "profile_coverage_start", "profile_coverage_stop"]
+				"enum": %s
 			},
 			"url": {
 				"type": "string",
@@ -791,15 +790,33 @@ examples as needed, use emulate_help, network_help, accessibility_help, or profi
 			}
 		},
 		"required": ["action"]
-	}`
+	}`, actions)
 
 	return &llm.Tool{
 		Name:        "browser",
 		Description: description,
 		InputSchema: json.RawMessage(schema),
 		Sequential:  true,
-		Run:         llm.RunJSON(b.runCombined),
+		Run:         b.runCombinedJSON,
 	}
+}
+
+func (b *BrowseTools) runCombinedJSON(ctx context.Context, raw json.RawMessage) llm.ToolOut {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return llm.ErrorToolOut(browserShapeError(raw))
+	}
+	if action, ok := object["action"]; ok && !strings.HasPrefix(strings.TrimSpace(string(action)), `"`) {
+		return llm.ErrorfToolOut(`invalid browser call: "action" must be a string, got %s. Resend the same fields with a quoted action name, e.g. "action":"eval". %s`, action, browserExamples)
+	}
+	var input combinedInput
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return llm.ErrorToolOut(browserFieldError(err))
+	}
+	if strings.TrimSpace(input.Action) == "" {
+		return llm.ErrorToolOut(missingActionError())
+	}
+	return b.runCombined(ctx, input)
 }
 
 // ReadImageTool returns a standalone tool for reading image files.
@@ -974,7 +991,7 @@ func (b *BrowseTools) runCombined(ctx context.Context, input combinedInput) llm.
 		return b.profileCoverageStop()
 
 	default:
-		return llm.ErrorfToolOut("unknown action: %q", input.Action)
+		return llm.ErrorToolOut(unknownActionError(input.Action))
 	}
 }
 

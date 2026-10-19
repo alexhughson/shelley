@@ -3,7 +3,11 @@ import {
   reduceConversationListPatch,
   type ConversationListState,
 } from "./conversationListStream";
-import type { ConversationListPatchEvent, ConversationWithState } from "../types";
+import type {
+  ConversationListPatchEvent,
+  ConversationListPatchOp,
+  ConversationWithState,
+} from "../types";
 
 function conv(id: string, slug: string, working = false): ConversationWithState {
   return {
@@ -20,12 +24,15 @@ function conv(id: string, slug: string, working = false): ConversationWithState 
     current_generation: 0,
     agent_working: working,
     turn_interrupted: false,
+    external_conversation_id: null,
+    external_endpoint: null,
     tags: "[]",
     is_draft: false,
     draft: "",
     queued_messages: "[]",
     working,
     subagent_count: 0,
+    running_background_jobs: 0,
     max_sequence_id: 0,
   };
 }
@@ -65,12 +72,50 @@ run("add, replace field, remove", () => {
   assert(state.length === 1 && state[0].conversation_id === "a", "expected removal");
 });
 
-run("move", () => {
-  const state = applyConversationListPatch(
-    [conv("a", "alpha"), conv("b", "beta")],
-    [{ op: "move", from: "/1", path: "/0" }],
-  );
+run("move preserves row identity", () => {
+  const original = [conv("a", "alpha"), conv("b", "beta")];
+  const state = applyConversationListPatch(original, [{ op: "move", from: "/1", path: "/0" }]);
   assert(state.map((c) => c.conversation_id).join(",") === "b,a", "expected moved item");
+  assert(state[0] === original[1], "expected moved row to retain its identity");
+  assert(state[1] === original[0], "expected shifted row to retain its identity");
+  assert(original[0].conversation_id === "a", "expected input order to remain unchanged");
+});
+
+run("field edits copy only the changed row", () => {
+  const original = [conv("a", "alpha"), conv("b", "beta"), conv("c", "gamma")];
+  const snapshot = JSON.stringify(original);
+  const next = applyConversationListPatch(original, [
+    { op: "replace", path: "/1/working", value: true },
+    { op: "replace", path: "/1/slug", value: "updated" },
+  ]);
+  assert(next !== original, "expected a new list");
+  assert(next[0] === original[0] && next[2] === original[2], "expected untouched row identities");
+  assert(next[1] !== original[1], "expected changed row to be copied");
+  assert(next[1].working && next[1].slug === "updated", "expected both edits to survive");
+  assert(JSON.stringify(original) === snapshot, "expected input rows to remain unchanged");
+});
+
+run("editing a moved row copies its nested path without changing shared siblings", () => {
+  const participants = [
+    { email: "a@example.com", message_count: 1 },
+    { email: "b@example.com", message_count: 1 },
+  ];
+  const original = [conv("a", "alpha"), { ...conv("b", "beta"), participants }];
+  const snapshot = JSON.stringify(original);
+  const next = applyConversationListPatch(original, [
+    { op: "move", from: "/1", path: "/0" },
+    { op: "replace", path: "/0/participants/0/message_count", value: 2 },
+    { op: "replace", path: "/0/participants/0/email", value: "updated@example.com" },
+  ]);
+  assert(next[0] !== original[1], "expected the edited, moved row to be copied");
+  assert(next[1] === original[0], "expected the unedited row to retain its identity");
+  const nextParticipants = next[0].participants!;
+  assert(nextParticipants !== participants, "expected participants array to be copied");
+  assert(nextParticipants[0] !== participants[0], "expected edited participant to be copied");
+  assert(nextParticipants[1] === participants[1], "expected untouched participant identity");
+  assert(nextParticipants[0].message_count === 2, "expected nested count edit");
+  assert(nextParticipants[0].email === "updated@example.com", "expected nested email edit");
+  assert(JSON.stringify(original) === snapshot, "expected input tree to remain unchanged");
 });
 
 run("json pointer escaping", () => {
@@ -136,40 +181,62 @@ run("does not mutate the input list", () => {
 });
 
 run("add, move, replace, remove stress sequence", () => {
-  // Deterministic LCG so this isn't flaky and we can extend it later.
+  // Seeded xorshift32 keeps all arithmetic in 32 bits.
   let s = 0x12345;
   const rand = () => {
-    s = (s * 1103515245 + 12345) & 0x7fffffff;
-    return s;
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    return s >>> 0;
   };
   let state: ConversationWithState[] = [];
+  const expected: ConversationWithState[] = [];
+  const counts = { add: 0, remove: 0, replace: 0, move: 0 };
   let nextId = 0;
   const id = () => `id-${nextId++}`;
-  for (let step = 0; step < 500; step++) {
-    const op = rand() % 4;
-    if (op === 0 || state.length === 0) {
-      const at = state.length === 0 ? 0 : rand() % (state.length + 1);
-      state = applyConversationListPatch(state, [
-        { op: "add", path: `/${at}`, value: conv(id(), "x") },
-      ]);
-    } else if (op === 1) {
-      const at = rand() % state.length;
-      state = applyConversationListPatch(state, [{ op: "remove", path: `/${at}` }]);
-    } else if (op === 2) {
-      const at = rand() % state.length;
-      state = applyConversationListPatch(state, [
-        { op: "replace", path: `/${at}/working`, value: state[at].working ? false : true },
-      ]);
-    } else {
-      if (state.length < 2) continue;
-      const from = rand() % state.length;
-      let to = rand() % state.length;
-      if (to === from) to = (to + 1) % state.length;
-      state = applyConversationListPatch(state, [{ op: "move", from: `/${from}`, path: `/${to}` }]);
+  for (let batch = 0; batch < 100; batch++) {
+    const original = state;
+    const snapshot = JSON.stringify(original);
+    const patch: ConversationListPatchOp[] = [];
+    for (let step = 0; step < 5; step++) {
+      const op = rand() % 4;
+      if (op === 0 || expected.length === 0) {
+        const at = rand() % (expected.length + 1);
+        const value = conv(id(), "x");
+        patch.push({ op: "add", path: `/${at}`, value });
+        expected.splice(at, 0, { ...value });
+        counts.add++;
+      } else if (op === 1) {
+        const at = rand() % expected.length;
+        patch.push({ op: "remove", path: `/${at}` });
+        expected.splice(at, 1);
+        counts.remove++;
+      } else if (op === 2) {
+        const at = rand() % expected.length;
+        const working = !expected[at].working;
+        patch.push({ op: "replace", path: `/${at}/working`, value: working });
+        expected[at] = { ...expected[at], working };
+        counts.replace++;
+      } else {
+        if (expected.length < 2) continue;
+        const from = rand() % expected.length;
+        const to = (from + 1 + (rand() % (expected.length - 1))) % expected.length;
+        patch.push({ op: "move", from: `/${from}`, path: `/${to}` });
+        const [moved] = expected.splice(from, 1);
+        expected.splice(to, 0, moved);
+        counts.move++;
+      }
     }
+    state = applyConversationListPatch(original, patch);
+    assert(
+      JSON.stringify(state) === JSON.stringify(expected),
+      `expected correct contents after batch ${batch}`,
+    );
+    assert(JSON.stringify(original) === snapshot, `batch ${batch} mutated its input`);
   }
-  // Reach the end without throwing.
-  assert(Array.isArray(state), "expected final state to be an array");
+  for (const [op, count] of Object.entries(counts)) {
+    assert(count > 0, `expected stress sequence to exercise ${op}`);
+  }
 });
 
 run("reduce: applies a chain of patches and advances hash atomically", () => {
@@ -262,6 +329,42 @@ run("reduce: reports apply-failed without mutating state", () => {
   assert(!res.ok, "expected failure");
   if (!res.ok) assert(res.reason === "apply-failed", "expected apply-failed reason");
   assert(state.hash === "h0" && state.list.length === 1, "expected state untouched");
+});
+
+run("reduce: failure after edits and a move leaves the prior state intact", () => {
+  const list = [
+    {
+      ...conv("a", "alpha"),
+      participants: [{ email: "a@example.com", message_count: 1 }],
+    },
+    conv("b", "beta"),
+  ];
+  const state: ConversationListState = { list, hash: "h0" };
+  const snapshot = JSON.stringify(state);
+  const res = reduceConversationListPatch(state, {
+    old_hash: "h0",
+    new_hash: "h1",
+    at: "",
+    patch: [
+      { op: "replace", path: "/0/working", value: true },
+      { op: "replace", path: "/0/participants/0/message_count", value: 2 },
+      { op: "move", from: "/0", path: "/1" },
+      { op: "remove", path: "/5" },
+    ],
+  });
+  assert(!res.ok, "expected failure");
+  if (!res.ok) {
+    assert(res.reason === "apply-failed", "expected apply-failed reason");
+    if (res.reason === "apply-failed") {
+      assert(
+        res.error instanceof Error &&
+          res.error.message.includes("bad array index in patch path: /5"),
+        "expected failure at the final operation, after the valid edits",
+      );
+    }
+  }
+  assert(state.list === list, "expected the original list reference");
+  assert(JSON.stringify(state) === snapshot, "expected all original contents and hash unchanged");
 });
 
 console.log("\nConversationListStream tests passed");

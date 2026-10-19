@@ -25,11 +25,7 @@
     >
       <span
         >Unsent recording · {{ formatDuration(session.durationMs) }} · {{ startedLabel(session)
-        }}{{
-          conversationId && session.conversationId !== conversationId
-            ? " · from another conversation"
-            : ""
-        }}</span
+        }}{{ destinationLabel(session) }}</span
       >
       <button
         type="button"
@@ -48,7 +44,7 @@
         class="btn btn-secondary"
         data-testid="review-recording-discard"
         :disabled="busy"
-        @click="confirmDiscard(session)"
+        @click="confirmDiscard(session.id, () => emit('discard', session))"
       >
         {{ discarding === session.id ? "Discard for good?" : "Discard" }}
       </button>
@@ -65,11 +61,11 @@
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, ref } from "vue";
+import { useConfirmTwice } from "../composables/confirmTwice";
 import type { ReviewSession } from "./reviewRecordingStore";
 import { formatDuration } from "./reviewRecordingFormat";
 
-defineProps<{
+const props = defineProps<{
   // A recording is live or being sent; unsent ones wait their turn.
   busy: boolean;
   error: string;
@@ -84,20 +80,11 @@ const emit = defineEmits<{
   (e: "dismiss"): void;
 }>();
 
-const discarding = ref<string | null>(null);
-let discardTimer: number | null = null;
-onBeforeUnmount(() => {
-  if (discardTimer !== null) window.clearTimeout(discardTimer);
-});
-function confirmDiscard(session: ReviewSession) {
-  if (discardTimer !== null) window.clearTimeout(discardTimer);
-  if (discarding.value === session.id) {
-    discarding.value = null;
-    emit("discard", session);
-    return;
-  }
-  discarding.value = session.id;
-  discardTimer = window.setTimeout(() => (discarding.value = null), 4000);
+const { armed: discarding, click: confirmDiscard } = useConfirmTwice<string>();
+
+function destinationLabel(session: ReviewSession): string {
+  if (session.newConversation) return " · for a new conversation";
+  return session.conversationId !== props.conversationId ? " · from another conversation" : "";
 }
 
 function startedLabel(session: ReviewSession): string {

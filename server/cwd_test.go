@@ -695,62 +695,6 @@ func TestSystemPromptUsesCwdFromConversation(t *testing.T) {
 	}
 }
 
-func TestGitInfoForCwd(t *testing.T) {
-	t.Parallel()
-	// Create a git repo
-	tmpDir := t.TempDir()
-	runGit := func(dir string, args ...string) {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@test.com",
-			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@test.com")
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v failed: %v\n%s", args, err, out)
-		}
-	}
-	runGit(tmpDir, "init")
-	runGit(tmpDir, "commit", "--allow-empty", "-m", "initial\n\nPrompt: test")
-
-	resolved, _ := filepath.EvalSymlinks(tmpDir)
-
-	t.Run("regular_repo", func(t *testing.T) {
-		repoRoot, worktreeRoot := gitInfoForCwd(tmpDir)
-		if repoRoot != resolved {
-			t.Errorf("expected repo_root=%q, got %q", resolved, repoRoot)
-		}
-		if worktreeRoot != "" {
-			t.Errorf("expected empty worktree_root, got %q", worktreeRoot)
-		}
-	})
-
-	t.Run("not_a_repo", func(t *testing.T) {
-		notRepo := t.TempDir()
-		repoRoot, worktreeRoot := gitInfoForCwd(notRepo)
-		if repoRoot != "" {
-			t.Errorf("expected empty repo_root, got %q", repoRoot)
-		}
-		if worktreeRoot != "" {
-			t.Errorf("expected empty worktree_root, got %q", worktreeRoot)
-		}
-	})
-
-	t.Run("worktree", func(t *testing.T) {
-		worktreePath := filepath.Join(t.TempDir(), "wt")
-		runGit(tmpDir, "worktree", "add", "-b", "test-wt", worktreePath)
-
-		repoRoot, worktreeRoot := gitInfoForCwd(worktreePath)
-		resolvedWt, _ := filepath.EvalSymlinks(worktreePath)
-		if repoRoot != resolvedWt {
-			t.Errorf("expected repo_root=%q, got %q", resolvedWt, repoRoot)
-		}
-		if worktreeRoot != resolved {
-			t.Errorf("expected worktree_root=%q, got %q", resolved, worktreeRoot)
-		}
-	})
-}
-
 func TestGitCreateWorktree(t *testing.T) {
 	t.Parallel()
 	h := NewTestHarness(t)

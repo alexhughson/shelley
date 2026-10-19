@@ -17,8 +17,14 @@ export interface UsageEntry {
   snippet?: string;
   /** Conversation generation this call belongs to (increments on compaction). */
   generation?: number;
+  /** An in-place compaction rewrote the context since the previous call. */
+  afterCompaction?: boolean;
   /** ms since epoch of the message, for the time x-axis. */
   timestamp?: number;
+  /** When the call was sent and when it finished (RFC 3339), as recorded in
+   *  its usage; they measure idle time between calls. */
+  start_time?: string | null;
+  end_time?: string | null;
   /** True when this call begins a new turn (first call, or first call after a
    *  user message / end-of-turn). Idle time before it is collapsed into a
    *  fixed-width gap on the time x-axis. */
@@ -185,6 +191,11 @@ export interface TokenCostStack {
   layers: number[][];
   /** Top of the stack at the last point (total weighted value). */
   maxY: number;
+  /** Per-segment per-call upper boundary, stacked bottom-to-top:
+   *  deltaLayers[s][i] = sum over segments 0..s of call i's own value. */
+  deltaLayers: number[][];
+  /** Tallest per-call stack (the most expensive single call). */
+  maxDelta: number;
   /** True when values are dollars; false when raw token counts. */
   weighted: boolean;
   /** Per-model band breakdowns, in first-seen order. */
@@ -231,7 +242,10 @@ export function buildTokenCostStack(
   }
 
   const layers: number[][] = segments.map(() => new Array(entries.length).fill(0));
+  const deltaLayers: number[][] = segments.map(() => new Array(entries.length).fill(0));
   const running = new Array(segments.length).fill(0);
+  const call = new Array(segments.length).fill(0);
+  let maxDelta = 0;
   let reportedCostUsd = 0;
 
   entries.forEach((e, i) => {
@@ -241,24 +255,41 @@ export function buildTokenCostStack(
     const mu = perModel[mi];
     reportedCostUsd += e.cost_usd || 0;
     mu.reportedUsd += e.cost_usd || 0;
+    call.fill(0);
     TOKEN_BANDS.forEach((band, b) => {
       const tokens = e[band.key] || 0;
       const usd = cost ? tokens * (cost[band.costKey] / 1e6) : 0;
       mu.rows[b].tokens += tokens;
       mu.rows[b].cost += usd;
       mu.totalCost += usd;
-      running[mi * TOKEN_BANDS.length + b] += weighted ? usd : tokens;
+      const v = weighted ? usd : tokens;
+      running[mi * TOKEN_BANDS.length + b] += v;
+      call[mi * TOKEN_BANDS.length + b] = v;
     });
     let acc = 0;
+    let dacc = 0;
     for (let s = 0; s < segments.length; s++) {
       acc += running[s];
       layers[s][i] = acc;
+      dacc += call[s];
+      deltaLayers[s][i] = dacc;
     }
+    maxDelta = Math.max(maxDelta, dacc);
   });
 
   const n = entries.length;
   const maxY = n > 0 && segments.length > 0 ? layers[segments.length - 1][n - 1] : 0;
-  return { n, segments, layers, maxY, weighted, perModel, reportedCostUsd };
+  return {
+    n,
+    segments,
+    layers,
+    maxY,
+    deltaLayers,
+    maxDelta,
+    weighted,
+    perModel,
+    reportedCostUsd,
+  };
 }
 
 /** One raw "other" (indirect) LLM usage entry as stored in a message's
@@ -509,6 +540,102 @@ export function callXLayout(n: number): XLayout {
   if (n === 0) return { xs: [], turns: [], activeMs: 0 };
   const xs = n === 1 ? [0.5] : Array.from({ length: n }, (_, i) => i / (n - 1));
   return { xs, turns: [[0, n - 1]], activeMs: 0 };
+}
+
+/** Where a stacked area sits: the plot spans [left, right] pixels, and yAt
+ *  maps a value to its pixel row. */
+export interface AreaGeometry {
+  left: number;
+  right: number;
+  yAt: (v: number) => number;
+}
+
+/** One path per layer of a stacked area (layers[s][i] is the upper boundary
+ *  of band s at point i, bottom-to-top). Each turn is a separate subpath so
+ *  idle time between turns renders as a gap in time mode. Zero-width turns
+ *  (single call, or all calls sharing one second-granularity timestamp)
+ *  become narrow slabs so they stay visible. */
+export function stackedAreaPaths(layers: number[][], lay: XLayout, g: AreaGeometry): string[] {
+  const plotW = g.right - g.left;
+  const px = (i: number) => (g.left + lay.xs[i] * plotW).toFixed(1);
+  const lower = (s: number, i: number) => (s === 0 ? 0 : layers[s - 1][i]);
+  return layers.map((layer, s) => {
+    let d = "";
+    for (const [a, b] of lay.turns) {
+      if (lay.xs[a] === lay.xs[b]) {
+        const x = g.left + lay.xs[a] * plotW;
+        const hw = Math.max(1, plotW * 0.006);
+        const x0 = Math.max(g.left, x - hw).toFixed(1);
+        const x1 = Math.min(g.right, x + hw).toFixed(1);
+        const yT = g.yAt(layer[b]).toFixed(1);
+        const yB = g.yAt(lower(s, b)).toFixed(1);
+        d += `M${x0},${yT}L${x1},${yT}L${x1},${yB}L${x0},${yB}Z`;
+        continue;
+      }
+      const top: string[] = [];
+      for (let i = a; i <= b; i++) top.push(`${px(i)},${g.yAt(layer[i]).toFixed(1)}`);
+      const bottom: string[] = [];
+      for (let i = b; i >= a; i--) bottom.push(`${px(i)},${g.yAt(lower(s, i)).toFixed(1)}`);
+      d += `M${top.join("L")}L${bottom.join("L")}Z`;
+    }
+    return d;
+  });
+}
+
+// Per-call bar width bounds, as fractions of the plot. The cap keeps sparse
+// conversations from drawing a handful of calls as wide blocks; the floor
+// (about a pixel at popup size) keeps long conversations' bars from
+// antialiasing into faint hairlines.
+const MAX_BAR_FRAC = 0.03;
+const MIN_BAR_FRAC = 0.003;
+
+/** One bar of the per-call cost graph, spanning [left, right] plot
+ *  fractions. Calls closer together than a bar's width share one bar, which
+ *  shows its most expensive call so every bar is one real call's stack. */
+export interface DeltaBar {
+  /** The call drawn (and hovered): the group's tallest, first on ties. */
+  call: number;
+  /** First call in the group; the group is calls first..first+count-1. */
+  first: number;
+  count: number;
+  left: number;
+  right: number;
+}
+
+/** Lay out per-call bars over call positions xs (nondecreasing, in [0, 1]).
+ *  The plot is split into equal cells one bar wide (one per call when they
+ *  fit, within the width bounds); each occupied cell is a bar holding the
+ *  calls that fall in it. So bars never overlap and every call lies inside
+ *  its own bar, wherever calls cluster. */
+export function deltaBars(xs: number[], heights: number[]): DeltaBar[] {
+  const n = xs.length;
+  const w = Math.max(MIN_BAR_FRAC, Math.min(1 / Math.max(n, 1), MAX_BAR_FRAC));
+  // The epsilons keep exact multiples (1/(1/n), i/(n-1)·(n-1)) from
+  // flooring one cell low.
+  const cells = Math.floor(1 / w + 1e-9);
+  const bars: DeltaBar[] = [];
+  let lastCell = -1;
+  for (let i = 0; i < n; i++) {
+    const cell = Math.min(cells - 1, Math.max(0, Math.floor(xs[i] * cells + 1e-9)));
+    const bar = bars[bars.length - 1];
+    if (cell === lastCell) {
+      if (heights[i] > heights[bar.call]) bar.call = i;
+      bar.count++;
+    } else {
+      bars.push({ call: i, first: i, count: 1, left: cell / cells, right: (cell + 1) / cells });
+      lastCell = cell;
+    }
+  }
+  return bars;
+}
+
+/** Plot fraction of the boundary drawn before call i (> 0), e.g. where a
+ *  new generation starts. It lies in (xs[i-1], xs[i]]: on the left edge of
+ *  call i's bar when that bar starts with call i, so it doesn't cut a bar;
+ *  otherwise the bar holds both sides and the line goes midway. */
+export function generationBoundary(bars: DeltaBar[], xs: number[], i: number): number {
+  const bar = bars.find((b) => i < b.first + b.count)!;
+  return bar.first === i ? bar.left : (xs[i - 1] + xs[i]) / 2;
 }
 
 // Width of the gap drawn between turns, as a fraction of the plot. Gaps are
