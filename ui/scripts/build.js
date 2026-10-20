@@ -1,10 +1,12 @@
 import * as esbuild from "esbuild";
 import vuePlugin from "esbuild-plugin-vue3";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as zlib from "zlib";
 import * as crypto from "crypto";
 import { execSync } from "child_process";
+import wawoff2 from "wawoff2";
 import { generateShikiLanguageManifest } from "./generate-shiki-language-manifest.mjs";
 
 // Esbuild plugin: rewrite any "monaco-editor*" import (including deep paths
@@ -28,6 +30,39 @@ function monacoExternalPlugin() {
       build.onResolve({ filter: /^monaco-vim$/ }, () => ({ path: monacoVimEsm }));
     },
   };
+}
+
+// Symbols Nerd Font Mono (MIT, https://github.com/ryanoasis/nerd-fonts), the
+// terminal's fallback for icon glyphs; see the @font-face in src/styles.css.
+// Rather than check in a binary, fetch the pinned TTF, convert it to woff2
+// (~7s) and cache that in ~/.cache. wawoff2 is deterministic, so pin its
+// output too: a corrupt cache entry is rebuilt and a changed encoder fails.
+const NERD_FONT_URL =
+  "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.4.0/patched-fonts/NerdFontsSymbolsOnly/SymbolsNerdFontMono-Regular.ttf";
+const NERD_FONT_TTF_SHA256 = "f0f624d9b474bea1662cf7e862d44aebe1ae1f6c7f9cb7a0ca5d0e5ac9561c60";
+const NERD_FONT_WOFF2_SHA256 = "9bccf9aeafc5b854a828abce4ecdd75f95bbc6c030e0182586900360ac02b49d";
+
+const sha256 = (data) => crypto.createHash("sha256").update(data).digest("hex");
+
+function verify(data, want, what) {
+  const got = sha256(data);
+  if (got !== want) throw new Error(`${what}: SHA-256 ${got}, want ${want}`);
+  return data;
+}
+
+// Returns the verified woff2, from the cache or built into it.
+async function symbolsNerdFont() {
+  const cacheDir = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+  const cached = path.join(cacheDir, "shelley", "fonts", "SymbolsNerdFontMono.woff2");
+  const hit = fs.existsSync(cached) && fs.readFileSync(cached);
+  if (hit && sha256(hit) === NERD_FONT_WOFF2_SHA256) return hit;
+  const res = await fetch(NERD_FONT_URL, { signal: AbortSignal.timeout(120_000) });
+  if (!res.ok) throw new Error(`${NERD_FONT_URL}: HTTP ${res.status}`);
+  const ttf = verify(Buffer.from(await res.arrayBuffer()), NERD_FONT_TTF_SHA256, NERD_FONT_URL);
+  const woff2 = verify(Buffer.from(await wawoff2.compress(ttf)), NERD_FONT_WOFF2_SHA256, "wawoff2");
+  fs.mkdirSync(path.dirname(cached), { recursive: true });
+  fs.writeFileSync(cached, woff2);
+  return woff2;
 }
 
 const isWatch = process.argv.includes("--watch");
@@ -116,6 +151,18 @@ async function build() {
       },
     });
 
+    // ghostty-web, the default terminal emulator, with its WebAssembly inlined.
+    // Fetched as /ghostty-web.js when the first terminal opens.
+    log("Building ghostty-web bundle...");
+    await esbuild.build({
+      entryPoints: ["node_modules/ghostty-web/dist/ghostty-web.js"],
+      bundle: true,
+      outfile: "dist/ghostty-web.js",
+      format: "esm",
+      minify: isProd,
+      sourcemap: !noSourceMaps,
+    });
+
     // Build the Vue 3 + PrimeVue app (src/vue/main.ts). It emits dist/main.js +
     // dist/main.css, which index.html links statically (see src/index.html).
     log("Building main application (src/vue/main.ts)...");
@@ -127,7 +174,7 @@ async function build() {
       minify: isProd,
       sourcemap: !noSourceMaps,
       metafile: true,
-      external: ["monaco-editor", "/monaco-editor.js"],
+      external: ["monaco-editor", "/monaco-editor.js", "/ghostty-web.js"],
       loader: {
         ".png": "dataurl",
         ".svg": "text",
@@ -197,6 +244,7 @@ async function build() {
         fs.copyFileSync(`${assetsDir}/${file}`, `dist/${file}`);
       }
     }
+    fs.writeFileSync("dist/SymbolsNerdFontMono.woff2", await symbolsNerdFont());
 
     // Write build info
     // Get the absolute path to the src directory for staleness checking
@@ -235,6 +283,7 @@ async function build() {
     log("\nGenerating gzip compressed files...");
     const filesToCompress = [
       "monaco-editor.js",
+      "ghostty-web.js",
       "editor.worker.js",
       "diffs-worker.js",
       "markdown-highlight-worker.js",
@@ -243,6 +292,7 @@ async function build() {
       "main.js",
       "main.css",
       "static/excalidraw/skill.js",
+      "SymbolsNerdFontMono.woff2",
     ];
     const checksums = {};
     let totalOrigSize = 0;

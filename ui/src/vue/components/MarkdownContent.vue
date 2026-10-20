@@ -24,9 +24,11 @@ import { addCodeBlockHeaders, codeBlockText, setCodeBlockCopied } from "../../ut
 import { applyHighlightTokens } from "../../utils/codeHighlight";
 import { COMMENT_ICON } from "../../utils/icons";
 import { localhostLinkOptionsFromInit } from "../../utils/linkify";
+import * as markdownMath from "../../utils/markdownMath";
 import { renderMarkdownToSafeHTML } from "../../utils/markdownRender";
 import { perfWrap } from "../../utils/perf";
 import { handleImageCommentClick, openImageComment } from "../composables/imageComment";
+import { handleMarkdownDocClick } from "../composables/markdownDoc";
 import { whenNearViewport } from "../composables/nearViewport";
 
 const props = defineProps<{
@@ -90,7 +92,6 @@ const html = computed(
         : undefined,
       props.rewriteLocalhostLinks ? localhostLinkOptionsFromInit() : undefined,
     );
-    if (!props.filePreview) return rendered;
 
     // The shared renderer already strips executable HTML. In file preview,
     // also discard file-authored CSS classes: otherwise a raw div with an
@@ -98,7 +99,8 @@ const html = computed(
     // only fenced code's language class for syntax highlighting.
     const inert = document.createElement("template");
     inert.innerHTML = rendered;
-    for (const el of inert.content.querySelectorAll("*")) {
+    const mathNodes = markdownMath.collectMath(inert.content);
+    for (const el of props.filePreview ? inert.content.querySelectorAll("*") : []) {
       for (const attr of [...el.attributes]) {
         if (attr.name.startsWith("data-") || attr.name.startsWith("aria-")) {
           el.removeAttribute(attr.name);
@@ -113,6 +115,7 @@ const html = computed(
       if (language) el.className = language;
       else el.removeAttribute("class");
     }
+    markdownMath.renderMath(mathNodes);
     return inert.innerHTML;
   }),
 );
@@ -254,6 +257,12 @@ function onActivate(e: MouseEvent | KeyboardEvent) {
     const button = target.closest<HTMLButtonElement>(".shelley-code-copy");
     if (button) {
       void copyCodeBlock(button);
+      return;
+    }
+    // Only the sanitizer sets download, on sandbox: links (utils/markdownRender.ts).
+    const download = target.closest<HTMLAnchorElement>("a[download]");
+    if (download) {
+      handleMarkdownDocClick(e, download);
       return;
     }
   }

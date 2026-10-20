@@ -67,6 +67,9 @@ importers:
       '@xterm/addon-web-links':
         specifier: 0.13.0-beta.213
         version: 0.13.0-beta.213(@xterm/xterm@6.1.0-beta.213)
+      '@xterm/addon-webgl':
+        specifier: 0.20.0-beta.212
+        version: 0.20.0-beta.212(@xterm/xterm@6.1.0-beta.213)
       '@xterm/xterm':
         specifier: 6.1.0-beta.213
         version: 6.1.0-beta.213
@@ -76,12 +79,21 @@ importers:
       dompurify:
         specifier: ^3.3.1
         version: 3.3.1
+      emoji-picker-element:
+        specifier: ^1.29.1
+        version: 1.29.1
+      ghostty-web:
+        specifier: 0.4.0-next.14.g6a1a50d
+        version: 0.4.0-next.14.g6a1a50d
       idb:
         specifier: ^8.0.3
         version: 8.0.3
       jszip:
         specifier: ^3.10.1
         version: 3.10.1
+      katex:
+        specifier: ^0.18.9
+        version: 0.18.9
       marked:
         specifier: ^17.0.3
         version: 17.0.3
@@ -143,6 +155,9 @@ importers:
       jsdom:
         specifier: ^24.1.3
         version: 24.1.3
+      postcss:
+        specifier: ^8.5.15
+        version: 8.5.15
       prettier:
         specifier: ^3.6.2
         version: 3.7.4
@@ -158,6 +173,9 @@ importers:
       vue-tsc:
         specifier: ^2.2.12
         version: 2.2.12(typescript@5.9.3)
+      wawoff2:
+        specifier: 2.0.1
+        version: 2.0.1
 
 packages:
 
@@ -1213,6 +1231,11 @@ packages:
     peerDependencies:
       '@xterm/xterm': ^6.1.0-beta.213
 
+  '@xterm/addon-webgl@0.20.0-beta.212':
+    resolution: {integrity: sha512-RzaTYeukTXTJth+Sl7FzCmb8AqiyDrNWNnqG+/300qJbfHYfCMmBlBVZ0yCTSZIWMdgFbgkhmnmBN7Yzs6xoBA==}
+    peerDependencies:
+      '@xterm/xterm': ^6.1.0-beta.213
+
   '@xterm/xterm@6.1.0-beta.213':
     resolution: {integrity: sha512-bq5nJkgoZDSg6Ma4zgiQ7jlooGNo7U+HDa6vnhx43yXsVEK2laIF7R08bMYAuU0B+C9xX0gwSrcsW18GxjUoJQ==}
 
@@ -1325,6 +1348,10 @@ packages:
 
   comma-separated-tokens@2.0.3:
     resolution: {integrity: sha512-Fu4hJdvzeylCfQPp9SGWidpzrMs7tTrlu6Vb8XGaRGck8QSNZJJp538Wrb60Lax4fPwR64ViY468OIUTbRlGZg==}
+
+  commander@15.0.0:
+    resolution: {integrity: sha512-z67u4ZhzCL/Tydu1lJARtEZYWbWaN7oYLHbsuzocr6y4N6WZAagG3RQ4FW61V1/0+jImpj293XfrcYnd1qxtPg==}
+    engines: {node: '>=22.12.0'}
 
   commander@7.2.0:
     resolution: {integrity: sha512-QrWXB+ZQSVPmIWIhtEO9H+gwHaMGYiF5ChvoJ+K9ZGHG/sVsa6yiesAD1GC/x46sET00Xlwo1u49RVVVzvcSkw==}
@@ -1580,6 +1607,9 @@ packages:
   elkjs@0.9.3:
     resolution: {integrity: sha512-f/ZeWvW/BCXbhGEf1Ujp29EASo/lk1FDnETgNKwJrsVvGZhUWCZyg3xLJjAsxfOmt8KjswHmI5EwCQcPMpOYhQ==}
 
+  emoji-picker-element@1.29.1:
+    resolution: {integrity: sha512-TOiHzu9Dqib3x4MwcAi3wi3RdyT4SoeB4b15AvH1ks4SBwTl7DeebhZ0d3x6dNi4XfNU7IGRZ7NBQllj0RqwrQ==}
+
   entities@6.0.1:
     resolution: {integrity: sha512-aN97NXWF6AWBTahfVOIrB/NShkzi5H7F9r1s9mD3cDj4Ko5f2qhhVoYMibXF7GlLveb/D2ioWay8lxI97Ven3g==}
     engines: {node: '>=0.12'}
@@ -1766,6 +1796,9 @@ packages:
   get-tsconfig@4.13.0:
     resolution: {integrity: sha512-1VKTZJCwBrvbd+Wn3AOgQP/2Av+TfTCOlE4AcRJE72W1ksZXbAx8PPBR9RzgTeSPzlPMHrbANMH3LbltH73wxQ==}
 
+  ghostty-web@0.4.0-next.14.g6a1a50d:
+    resolution: {integrity: sha512-01H59pAKq43Y8ZZiIhH98cu0ahZaoGoPQPtW4KnZPT0JFdQYen2djsXrOnt27JnMv64D4eLeAq8D6h72mo52xQ==}
+
   glob-parent@5.1.2:
     resolution: {integrity: sha512-AOIgSQCepiJYwP3ARnGx+5VnTu2HBYdzbGP45eLw1vr3zB3vZLeyed1sC9hnbcOc9/SrMyM5RPQrkGz4aS9Zow==}
     engines: {node: '>= 6'}
@@ -1944,6 +1977,10 @@ packages:
 
   katex@0.16.45:
     resolution: {integrity: sha512-pQpZbdBu7wCTmQUh7ufPmLr0pFoObnGUoL/yhtwJDgmmQpbkg/0HSVti25Fu4rmd1oCR6NGWe9vqTWuWv3GcNA==}
+    hasBin: true
+
+  katex@0.18.9:
+    resolution: {integrity: sha512-8ad9RyoKsb/g8/yLFE+KAlP+DhbCTRUNi/V9XGsxn0R+trJJltNwzcDNo0q/DEkOy5fQUQTAQyCXCYSE+OakTQ==}
     hasBin: true
 
   keyv@4.5.4:
@@ -2650,6 +2687,10 @@ packages:
   w3c-xmlserializer@5.0.0:
     resolution: {integrity: sha512-o8qghlI8NZHU1lLPrpi2+Uq7abh4GGPpYANlalzWxyWteJOCsr/P+oPBA49TOLu5FTZO4d3F9MnWJfiMo4BkmA==}
     engines: {node: '>=18'}
+
+  wawoff2@2.0.1:
+    resolution: {integrity: sha512-r0CEmvpH63r4T15ebFqeOjGqU4+EgTx4I510NtK35EMciSdcTxCw3Byy3JnBonz7iyIFZ0AbVo0bbFpEVuhCYA==}
+    hasBin: true
 
   web-worker@1.5.0:
     resolution: {integrity: sha512-RiMReJrTAiA+mBjGONMnjVDP2u3p9R1vkcGz6gDIrOMT3oGuYwX2WRMYI9ipkphSuE5XKEhydbhNEJh4NY9mlw==}
@@ -3737,6 +3778,10 @@ snapshots:
     dependencies:
       '@xterm/xterm': 6.1.0-beta.213
 
+  '@xterm/addon-webgl@0.20.0-beta.212(@xterm/xterm@6.1.0-beta.213)':
+    dependencies:
+      '@xterm/xterm': 6.1.0-beta.213
+
   '@xterm/xterm@6.1.0-beta.213': {}
 
   acorn-jsx@5.3.2(acorn@8.15.0):
@@ -3841,6 +3886,8 @@ snapshots:
       delayed-stream: 1.0.0
 
   comma-separated-tokens@2.0.3: {}
+
+  commander@15.0.0: {}
 
   commander@7.2.0: {}
 
@@ -4105,6 +4152,8 @@ snapshots:
 
   elkjs@0.9.3: {}
 
+  emoji-picker-element@1.29.1: {}
+
   entities@6.0.1: {}
 
   entities@7.0.1: {}
@@ -4334,6 +4383,8 @@ snapshots:
     dependencies:
       resolve-pkg-maps: 1.0.0
 
+  ghostty-web@0.4.0-next.14.g6a1a50d: {}
+
   glob-parent@5.1.2:
     dependencies:
       is-glob: 4.0.3
@@ -4511,6 +4562,10 @@ snapshots:
   katex@0.16.45:
     dependencies:
       commander: 8.3.0
+
+  katex@0.18.9:
+    dependencies:
+      commander: 15.0.0
 
   keyv@4.5.4:
     dependencies:
@@ -5336,6 +5391,10 @@ snapshots:
   w3c-xmlserializer@5.0.0:
     dependencies:
       xml-name-validator: 5.0.0
+
+  wawoff2@2.0.1:
+    dependencies:
+      argparse: 2.0.1
 
   web-worker@1.5.0: {}
 

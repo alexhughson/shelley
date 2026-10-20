@@ -15,6 +15,9 @@
        as a status line rather than a chat bubble. -->
   <CwdChangeMessage v-else-if="isCwdChange" :message="message" />
 
+  <!-- A context-size nudge for the agent (auto compaction); same treatment. -->
+  <ContextNudgeMessage v-else-if="isContextNudge" :message="message" />
+
   <!-- system: render nothing. -->
   <template v-else-if="message.type === 'system'" />
 
@@ -28,6 +31,9 @@
 
   <!-- modelchange -->
   <ModelChangeMessage v-else-if="message.type === 'modelchange'" :message="message" />
+
+  <!-- inplacecompaction -->
+  <InPlaceCompactionMessage v-else-if="message.type === 'inplacecompaction'" :message="message" />
 
   <!-- gitinfo -->
   <GitInfoMessage
@@ -132,7 +138,7 @@
     >
       <div class="message-content message-content-entities" data-testid="message-content">
         <div
-          v-if="authorEmail && !conversationSource"
+          v-if="authorEmail && !sender"
           class="message-author-email"
           data-testid="message-author-email"
         >
@@ -159,14 +165,29 @@
             :on-fork="hasForkAction ? handleFork : undefined"
           />
 
-          <ConversationMessageAuthor
-            v-if="conversationSource && entityIndex === 0"
-            :source="conversationSource"
-          />
+          <template v-if="jobNotice">
+            <BackgroundJobNoticeCard
+              v-if="entityIndex === 0"
+              :source="jobNotice"
+              :text="messageText"
+            />
+          </template>
+
+          <template v-else-if="conversationSender">
+            <ConversationMessageCard
+              v-if="entityIndex === 0"
+              :source="conversationSender"
+              :text="messageText"
+            />
+          </template>
+
+          <template v-else-if="mcpNotice">
+            <McpServerNoticeCard v-if="entityIndex === 0" :source="mcpNotice" :text="messageText" />
+          </template>
 
           <!-- Distillation box takes precedence over content blocks. -->
           <div
-            v-if="isDistilledUser"
+            v-else-if="isDistilledUser"
             class="distillation-file-box"
             data-testid="distillation-file-box"
           >
@@ -205,17 +226,27 @@
                 :markdown-text="item.markdownText"
                 :citations="item.citations"
                 :render-markdown="
-                  shouldRenderMarkdown(markdownMode, isUser && !conversationSource, isDistilledUser)
+                  shouldRenderMarkdown(markdownMode, isUser && !sender, isDistilledUser)
                 "
                 :message-id="message.message_id"
                 :cache-owner="message"
                 :run-key="`${entity.key}-${index}`"
-                :rewrite-localhost-links="message.type === 'agent' || !!conversationSource"
+                :rewrite-localhost-links="message.type === 'agent' || !!sender"
               />
               <MessageContentBlock v-else :content="item.content!" />
             </div>
           </template>
         </div>
+      </div>
+      <div v-if="reactions.length" class="message-reactions" data-testid="message-reactions">
+        <span
+          v-for="r in reactions"
+          :key="r.emoji"
+          class="message-reaction"
+          :title="`Agent reacted ${r.emoji}`"
+          >{{ r.emoji
+          }}<span v-if="r.count > 1" class="message-reaction-count">{{ r.count }}</span></span
+        >
       </div>
     </div>
     <UsageDetailModal
@@ -245,6 +276,7 @@ import {
   type LLMContent,
   type Usage,
   cwdChange,
+  contextNudge,
   isDistillStatusMessage,
 } from "../../types";
 import { type MarkdownMode } from "../../services/settings";
@@ -259,18 +291,23 @@ import EditableFileModal from "./EditableFileModal.vue";
 import GitInfoMessage from "./GitInfoMessage.vue";
 import WarningMessage from "./WarningMessage.vue";
 import ModelChangeMessage from "./ModelChangeMessage.vue";
+import InPlaceCompactionMessage from "./InPlaceCompactionMessage.vue";
 import DistillStatusMessage from "./DistillStatusMessage.vue";
 import CwdChangeMessage from "./CwdChangeMessage.vue";
+import ContextNudgeMessage from "./ContextNudgeMessage.vue";
 import ErrorRetryButton from "./ErrorRetryButton.vue";
 import RefusalContinueButton from "./RefusalContinueButton.vue";
 import { RefusalContinueKey } from "./refusalContinue";
+import { messageUserContextKey, type MessageReaction } from "./messageUserContext";
 import { prettyModelLabels, prettyModelName } from "../../utils/modelNames";
 import MessageContentBlock from "./MessageContentBlock.vue";
 import CitedText from "./CitedText.vue";
 import { coalesceContent, splitContentEntities } from "../../utils/coalesceContent";
 import { perfCount } from "../../utils/perf";
-import { conversationMessageSource } from "../../utils/messageSource";
-import ConversationMessageAuthor from "./ConversationMessageAuthor.vue";
+import { messageSource, mcpNoticeSource } from "../../utils/messageSource";
+import ConversationMessageCard from "./ConversationMessageCard.vue";
+import BackgroundJobNoticeCard from "./BackgroundJobNoticeCard.vue";
+import McpServerNoticeCard from "./McpServerNoticeCard.vue";
 import MessageDisplayData from "./MessageDisplayData.vue";
 
 interface ToolDisplay {
@@ -281,7 +318,7 @@ interface ToolDisplay {
 
 const props = defineProps<{
   message: MessageType;
-  onOpenDiffViewer?: (commit: string, cwd?: string) => void;
+  onOpenDiffViewer?: (commit: string, cwd?: string, openOnFiles?: boolean) => void;
   canRequestTour?: boolean;
   onCommentTextChange?: (text: string) => void;
   // onFork forks the conversation, copying messages up to and including this
@@ -312,6 +349,7 @@ function shouldRenderMarkdown(
 
 const isDistill = computed(() => isDistillStatusMessage(props.message));
 const isCwdChange = computed(() => cwdChange(props.message) !== null);
+const isContextNudge = computed(() => contextNudge(props.message) !== null);
 
 // ---- Action bar state (show on hover or tap) ----
 // One action bar per content entity, keyed by entity key ("main" for the
@@ -385,10 +423,28 @@ const isError = computed(() => props.message.type === "error");
 // distilled/compacted user messages (which render agent-side and aren't a
 // single person's turn).
 const showUserEmails = inject<ComputedRef<boolean>>("showUserEmails");
-const conversationSource = computed(() =>
-  isUser.value && !isDistilledUser.value
-    ? conversationMessageSource(props.message.user_data)
-    : null,
+// Emoji reactions the agent sent with message_user to this message.
+// Shared empty list: a fresh [] per recompute would re-render every message.
+const NO_REACTIONS: readonly MessageReaction[] = Object.freeze([]);
+const messageUserContext = inject(messageUserContextKey, null);
+const reactions = computed(
+  () => messageUserContext?.reactions.value.get(props.message.message_id) ?? NO_REACTIONS,
+);
+const sender = computed(() =>
+  isUser.value && !isDistilledUser.value ? messageSource(props.message.user_data) : null,
+);
+// Background job notices are user messages to the model but bash tool cards
+// to the reader, including notices stored before outcomes were structured.
+const jobNotice = computed(() =>
+  sender.value && "backgroundJobId" in sender.value ? sender.value : null,
+);
+// Messages from another conversation render as a tool card.
+const conversationSender = computed(() =>
+  sender.value && "conversationId" in sender.value ? sender.value : null,
+);
+// Notices that the registered MCP servers changed render as a system card.
+const mcpNotice = computed(() =>
+  isUser.value && !isDistilledUser.value ? mcpNoticeSource(props.message.user_data) : null,
 );
 const authorEmail = computed(() =>
   isUser.value && !isDistilledUser.value && showUserEmails?.value
@@ -495,8 +551,7 @@ const errorMeta = computed(() => {
       retryable = !!ud?.retryable;
       errorType = typeof ud?.error_type === "string" ? ud.error_type : "";
       refusalModel = typeof ud?.refusal_model === "string" ? ud.refusal_model.trim() : "";
-      refusalCategory =
-        typeof ud?.refusal_category === "string" ? ud.refusal_category.trim() : "";
+      refusalCategory = typeof ud?.refusal_category === "string" ? ud.refusal_category.trim() : "";
       refusalExplanation =
         typeof ud?.refusal_explanation === "string" ? ud.refusal_explanation.trim() : "";
     } catch {
@@ -610,7 +665,9 @@ const hasRenderableContent = computed(() => {
 
 // ---- Message container classes ----
 const messageClasses = computed(() => {
-  if (conversationSource.value) return "message message-tool message-conversation";
+  if (jobNotice.value || conversationSender.value) {
+    return "message message-tool message-tool-card";
+  }
   if (isUser.value && !isDistilledUser.value) {
     return "message message-user";
   }

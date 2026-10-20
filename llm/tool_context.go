@@ -15,19 +15,6 @@ func WorkingDir(ctx context.Context) string {
 	return wd
 }
 
-type sessionIDCtxKeyType string
-
-const sessionIDCtxKey sessionIDCtxKeyType = "sessionID"
-
-func WithSessionID(ctx context.Context, sessionID string) context.Context {
-	return context.WithValue(ctx, sessionIDCtxKey, sessionID)
-}
-
-func SessionID(ctx context.Context) string {
-	sessionID, _ := ctx.Value(sessionIDCtxKey).(string)
-	return sessionID
-}
-
 type toolProgressCtxKeyType string
 
 const toolProgressCtxKey toolProgressCtxKeyType = "toolProgress"

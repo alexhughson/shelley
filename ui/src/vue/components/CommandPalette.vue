@@ -23,9 +23,11 @@
          (e: "open-terminal"): void                           // onOpenTerminal
          (e: "open-file-finder"): void                       // onOpenFileFinder
          (e: "open-models-modal"): void                       // onOpenModelsModal
+         (e: "open-mcp-servers-modal"): void                  // onOpenMcpServersModal
          (e: "open-integrations-modal"): void                 // onOpenIntegrationsModal
          (e: "open-notifications-modal"): void                // onOpenNotificationsModal
          (e: "open-feature-flags-modal"): void                // onOpenFeatureFlagsModal
+         (e: "open-favicon-emoji-picker"): void                // onOpenFaviconEmojiPicker
          (e: "next-conversation"): void                       // onNextConversation
          (e: "previous-conversation"): void                   // onPreviousConversation
          (e: "next-user-message"): void                       // onNextUserMessage
@@ -169,9 +171,11 @@ const emit = defineEmits<{
   (e: "open-terminal"): void;
   (e: "open-file-finder"): void;
   (e: "open-models-modal"): void;
+  (e: "open-mcp-servers-modal"): void;
   (e: "open-integrations-modal"): void;
   (e: "open-notifications-modal"): void;
   (e: "open-feature-flags-modal"): void;
+  (e: "open-favicon-emoji-picker"): void;
   (e: "next-conversation"): void;
   (e: "previous-conversation"): void;
   (e: "next-user-message"): void;
@@ -203,7 +207,9 @@ const ICON_DIFF = `${SVG_OPEN}<path stroke-linecap="round" stroke-linejoin="roun
 const ICON_GRAPH = `${SVG_OPEN}<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 3v12m0 0a3 3 0 103 3 3 3 0 00-3-3zm0-12a3 3 0 100 6 3 3 0 000-6zm12 0a3 3 0 100 6 3 3 0 000-6zm0 6c0 4-6 4-6 9" /></svg>`;
 const ICON_TERMINAL = `${SVG_OPEN}<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>`;
 const ICON_COG = `${SVG_OPEN}<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>`;
+const ICON_SERVER = `${SVG_OPEN}<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" /></svg>`;
 const ICON_BELL = `${SVG_OPEN}<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg>`;
+const ICON_SMILE = `${SVG_OPEN}<circle cx="12" cy="12" r="9" stroke-width="2" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.5 14a4 4 0 007 0M9 9.5h.01M15 9.5h.01" /></svg>`;
 const ICON_FLAG = `${SVG_OPEN}<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 21V5a2 2 0 012-2h11l-2 4 2 4H5v10" /></svg>`;
 const ICON_MARKDOWN = `${SVG_OPEN}<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h8m-8 6h16" /></svg>`;
 const ICON_ARCHIVE = `${SVG_OPEN}<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" /></svg>`;
@@ -479,6 +485,19 @@ const actionItems = computed<CommandItem[]>(() => {
     ],
   });
 
+  items.push({
+    id: "mcp-servers",
+    type: "action",
+    title: t("mcpServers"),
+    subtitle: t("configureMcpServers"),
+    icon: ICON_SERVER,
+    action: () => {
+      emit("open-mcp-servers-modal");
+      emit("close");
+    },
+    keywords: ["mcp", "server", "tools", "oauth", "login"],
+  });
+
   if (window.__SHELLEY_INIT__?.is_exe_dev) {
     items.push({
       id: "vm-integrations",
@@ -505,6 +524,19 @@ const actionItems = computed<CommandItem[]>(() => {
       emit("close");
     },
     keywords: ["notification", "notify", "alert", "discord", "webhook", "browser", "favicon"],
+  });
+
+  items.push({
+    id: "favicon-emoji",
+    type: "action",
+    title: t("faviconEmoji"),
+    subtitle: t("pickFaviconEmoji"),
+    icon: ICON_SMILE,
+    action: () => {
+      emit("open-favicon-emoji-picker");
+      emit("close");
+    },
+    keywords: ["favicon", "emoji", "icon", "tab", "change", "edit", "customize"],
   });
 
   items.push({

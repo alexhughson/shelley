@@ -42,7 +42,6 @@ export function toolEmoji(name: string | undefined | null, input?: unknown): str
     case "openai_audio_transcription":
       return "🎙️";
     case "bash":
-    case "shell":
       return "🛠️";
     case "patch":
       return "🖋️";
@@ -57,6 +56,8 @@ export function toolEmoji(name: string | undefined | null, input?: unknown): str
       return "⚡";
     case "subagent":
       return "⚡";
+    case "message_parent":
+      return "💬";
     case "keyword_search":
       return "🔍";
     case "browser_recent_console_logs":
@@ -321,13 +322,14 @@ export function toolHeadline(
 
   switch (n) {
     case "bash":
-    case "shell":
       return bashHeadline(summary, maxLen);
     case "patch":
     case "openai_audio_transcription":
       return summary ? basename(summary) : n;
     case "change_dir":
       return summary || n;
+    case "message_parent":
+      return `→ parent: ${summary.split(/\r?\n/)[0] || "..."}`;
     case "screenshot":
     case "browser_take_screenshot":
     case "read_image":
@@ -357,7 +359,6 @@ function inputSummary(name: string | undefined | null, input: unknown): string {
   };
   switch (name) {
     case "bash":
-    case "shell":
       return pick("command");
     case "patch":
     case "change_dir":
@@ -376,6 +377,8 @@ function inputSummary(name: string | undefined | null, input: unknown): string {
       return pick("query");
     case "subagent":
       return pick("slug", "prompt");
+    case "message_parent":
+      return pick("text");
     case "llm_one_shot": {
       const files = o.prompt_files;
       if (Array.isArray(files) && files.length > 0) return files.join(", ");

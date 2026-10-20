@@ -8,7 +8,6 @@ const customModel = (overrides: Record<string, unknown> = {}) => ({
   api_key: "test-key",
   model_name: "custom-model",
   max_tokens: 200000,
-  tags: "",
   reasoning_effort: "",
   reasoning_support: "auto",
   reasoning_map: "",
@@ -44,7 +43,7 @@ test.describe("custom model output token limit", () => {
 
     await page.goto("/new");
     await page.locator(".model-picker").click();
-    await page.getByRole("button", { name: /Manage models/ }).click();
+    await page.getByRole("button", { name: "Manage Models" }).click();
     await page.getByRole("button", { name: "Edit Model" }).click();
 
     const form = page.getByRole("dialog").last();

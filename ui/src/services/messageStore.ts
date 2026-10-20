@@ -161,6 +161,10 @@ const IDB_TX_TIMEOUT_MS = 3_000;
  * much shorter than the startup transaction deadline: production Safari logs
  * showed conversation switches pausing for exactly the old 3-second bound
  * before a 36ms REST response could even start.
+ *
+ * Like every withDeadline bound, it charges only time the event loop was free:
+ * a read issued just before a long render must not be abandoned because the
+ * render delayed its delivery (see deadline.ts).
  */
 const IDB_READ_TIMEOUT_MS = 250;
 

@@ -46,6 +46,14 @@ export interface CachedDraft {
   // session (no server row yet); such an entry always wins on load since any
   // server row that later appears is a fresh draft we just created.
   basedOn: string;
+  // Set while the text is being POSTed as a message. The entry is shared by
+  // every tab on the conversation, and the new message's row echo can reach
+  // another tab before the POST returns to the sender; that tab's echo-driven
+  // reconcile must not seed the departing text into its own composer. The
+  // sending tab keeps seeing it as the composer's own text, and a fresh entry
+  // into the session (a reload mid-send) still restores it, so a send the
+  // server never received is not lost.
+  pending?: boolean;
 }
 
 export function loadCachedDraft(id: string | null): CachedDraft | null {
@@ -56,18 +64,50 @@ export function loadCachedDraft(id: string | null): CachedDraft | null {
     if (typeof parsed?.value !== "string" || typeof parsed?.basedOn !== "string") {
       return null;
     }
-    return { value: parsed.value, basedOn: parsed.basedOn };
+    return { value: parsed.value, basedOn: parsed.basedOn, pending: parsed.pending === true };
   } catch {
     return null;
   }
 }
 
-export function saveCachedDraft(id: string | null, value: string, basedOn: string): void {
+export function saveCachedDraft(
+  id: string | null,
+  value: string,
+  basedOn: string,
+  pending = false,
+): void {
   try {
-    localStorage.setItem(cacheKey(id), JSON.stringify({ value, basedOn }));
+    localStorage.setItem(
+      cacheKey(id),
+      JSON.stringify({ value, basedOn, pending: pending || undefined }),
+    );
   } catch {
     // Quota or disabled storage: nothing we can do; server autosave remains.
   }
+}
+
+// rebaseCachedDraft advances the entry's `basedOn` after the server acknowledged
+// a PUT with a newer `updated_at`, so keystrokes typed while that PUT was
+// outstanding (stamped with the older time) stay ahead of the server. Only
+// advances: responses can land out of order, and regressing the stamp would
+// re-open the stale-cache window.
+export function rebaseCachedDraft(id: string, updatedAt: string): void {
+  const cur = loadCachedDraft(id);
+  if (cur && updatedAt > cur.basedOn) saveCachedDraft(id, cur.value, updatedAt, cur.pending);
+}
+
+// markCachedDraftPending flags the entry holding `text` as in flight (see
+// CachedDraft.pending). Call it BEFORE the chat POST goes out. Returns an undo
+// for the failure path, which unflags the entry unless it has since been
+// rewritten with other text.
+export function markCachedDraftPending(id: string, text: string): () => void {
+  const cur = loadCachedDraft(id);
+  if (!cur || cur.value !== text) return () => {};
+  saveCachedDraft(id, cur.value, cur.basedOn, true);
+  return () => {
+    const now = loadCachedDraft(id);
+    if (now?.pending && now.value === text) saveCachedDraft(id, now.value, now.basedOn);
+  };
 }
 
 export function clearCachedDraft(id: string | null): void {
@@ -102,6 +142,23 @@ export function pickDraft(server: DraftCandidate, local: CachedDraft | null): Dr
   return server;
 }
 
+// Promoting a draft clears its server copy, and a conversation's composer
+// reads only this browser's mirror; leave the newer of the two there so text
+// written elsewhere (or not yet synced) outlives the promotion, and text
+// cleared elsewhere stays cleared.
+export function keepDraftThroughPromotion(draft: {
+  conversation_id: string;
+  draft: string;
+  updated_at: string;
+}): void {
+  const kept = pickDraft(
+    { value: draft.draft, updatedAt: draft.updated_at },
+    loadCachedDraft(draft.conversation_id),
+  );
+  if (kept.value) saveCachedDraft(draft.conversation_id, kept.value, draft.updated_at);
+  else clearCachedDraft(draft.conversation_id);
+}
+
 // reconcileComposerDraft decides what (if anything) the message composer should
 // be (re)seeded with when the focused conversation, its draft text, or its
 // server `updated_at` changes. It is the pure core of ChatInterface's draft
@@ -131,6 +188,14 @@ export interface ComposerReconcileInput {
   serverUpdatedAt: string;
   // The localStorage mirror for this session (null if none).
   cached: CachedDraft | null;
+  // Whether a send from THIS tab flagged `cached` pending (it is then still
+  // the composer's own text, not another tab's departing one).
+  ownsPending: boolean;
+  // The server draft text this echo turned into a message (the row flipped
+  // is_draft true->false without changing conversation), else null. While the
+  // sending tab's POST is in flight its pending entry is the more exact record
+  // of what went (the server draft may lag its last keystrokes).
+  promotedFrom: string | null;
   // The composer's live value right now (latest keystrokes).
   composerValue: string;
   // The session id we last seeded the composer for (undefined before any seed).
@@ -157,18 +222,32 @@ export function reconcileComposerDraft(
     isDraft,
     serverDraft,
     serverUpdatedAt,
-    cached,
+    ownsPending,
+    promotedFrom,
     composerValue,
     lastSeededSession,
     lastSeededValue,
   } = input;
 
+  const sessionId = conversationId; // null == new-conversation view
+
   // A brand-new conversation auto-saving a draft flips conversationId
   // null->draftId mid-typing. That is the same input session, not a switch, so
-  // leave the composer (and the user's keystrokes) untouched.
-  if (conversationId !== null && conversationId === lazyDraftId) return null;
+  // leave the composer (and the user's keystrokes) untouched. Record the
+  // session on the flip, though: the echoes that follow (the promotion, above
+  // all) are same-session echoes, not a fresh entry.
+  if (conversationId !== null && conversationId === lazyDraftId && isDraft) {
+    if (lastSeededSession === sessionId) return null;
+    return { value: composerValue, draftSyncedAt: serverUpdatedAt, seededSession: sessionId };
+  }
 
-  const sessionId = conversationId; // null == new-conversation view
+  // A pending entry is text on its way OUT of a composer (some tab's send is in
+  // flight). A same-session echo must not carry it into this one — unless the
+  // send is ours, in which case it IS this composer's text and the echo must
+  // not disturb it. A fresh entry into the session (reload mid-send) restores
+  // it regardless.
+  const foreignPending = !!input.cached?.pending && !ownsPending;
+  const cached = lastSeededSession === sessionId && foreignPending ? null : input.cached;
 
   // Compute the candidate value + sync stamp for this session.
   let value: string;
@@ -195,9 +274,19 @@ export function reconcileComposerDraft(
 
   // Same session: this is a server echo. Applying it must not clobber
   // in-progress keystrokes. Safe only when the candidate is already what the
-  // composer shows, or the user hasn't edited since our last seed.
+  // composer shows, or the user hasn't edited since our last seed. One more
+  // case: the draft was just sent from another tab (this tab's own send keeps
+  // its composer until the POST returns, and its own pending entry is still
+  // its text) and what went contains the composer's text: verbatim, or with
+  // the other tab's last-second additions around it. That text is done with,
+  // even though this tab typed it; otherwise the sent text would linger as a
+  // stale next-message draft. Text the other tab replaced, or that this tab
+  // typed beyond what went, was never sent and stays.
   if (value === composerValue) return null;
-  if (composerValue === lastSeededValue) {
+  let sentText = promotedFrom;
+  if (sentText !== null && foreignPending && input.cached) sentText = input.cached.value;
+  const sentAsTyped = sentText !== null && composerValue !== "" && sentText.includes(composerValue);
+  if (composerValue === lastSeededValue || sentAsTyped) {
     return { value, draftSyncedAt, seededSession: sessionId };
   }
   return null;

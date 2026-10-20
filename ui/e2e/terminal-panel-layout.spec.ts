@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { createConversationViaAPIWithDetails } from "./helpers";
+import { openWorkspaceTool, createConversationViaAPIWithDetails } from "./helpers";
 
 test("keeps the terminal inside its padded content area", async ({ page, request }) => {
   await page.addInitScript(() => {
@@ -38,8 +38,7 @@ test("keeps the terminal inside its padded content area", async ({ page, request
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto(`/c/${conversationId}`);
 
-  await page.locator(".chat-overflow-menu-wrapper .btn-icon").click();
-  await page.locator(".overflow-menu-item", { hasText: /terminal/i }).click();
+  await openWorkspaceTool(page, "Terminal");
 
   const terminal = page.locator(
     '.terminal-panel-content [data-terminal-id][style*="display: block"]',
@@ -52,7 +51,7 @@ test("keeps the terminal inside its padded content area", async ({ page, request
         terminal.evaluate((el) => {
           const terminalRect = el.getBoundingClientRect();
           const contentRect = el.parentElement!.getBoundingClientRect();
-          const screenRect = el.querySelector(".xterm-screen")!.getBoundingClientRect();
+          const screenRect = el.querySelector(".xterm-screen, canvas")!.getBoundingClientRect();
           return {
             terminalBottom: terminalRect.bottom <= contentRect.bottom,
             terminalRight: terminalRect.right <= contentRect.right,

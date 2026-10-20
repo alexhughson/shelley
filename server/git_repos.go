@@ -302,11 +302,6 @@ func inspectGitRepo(dirPath string) (GitRepoInfo, bool) {
 // repositories and returns them as a flat list, so the UI can present a
 // nice fuzzy-filterable picker instead of a tree.
 func (s *Server) handleGitRepos(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	start := time.Now()
 
 	// Roots: ?root=... can repeat. Default is the user's home directory.

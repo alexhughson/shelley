@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -15,7 +16,6 @@ import (
 	"shelley.exe.dev/claudetool"
 	"shelley.exe.dev/client"
 	"shelley.exe.dev/db"
-	"shelley.exe.dev/exeenv"
 	"shelley.exe.dev/llm/llmhttp"
 	"shelley.exe.dev/models"
 	"shelley.exe.dev/modelsources"
@@ -37,14 +37,8 @@ type GlobalConfig struct {
 }
 
 type shelleyConfig struct {
-	LLMGateway     string                `json:"llm_gateway"`
-	DefaultModel   string                `json:"default_model"`
-	ExeEnvironment *exeEnvironmentConfig `json:"exe_environment"`
-}
-
-type exeEnvironmentConfig struct {
-	Scheme  string `json:"scheme"`
-	BoxHost string `json:"box_host"`
+	LLMGateway   string `json:"llm_gateway"`
+	DefaultModel string `json:"default_model"`
 }
 
 var discoverLLMIntegrations = modelsources.DiscoverLLMIntegrations
@@ -77,6 +71,7 @@ func main() {
 		fmt.Fprintf(flag.CommandLine.Output(), "  serve [flags]                 Start the web server\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  models [flags]                List the models the server would expose, without starting it\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  client [flags] <subcommand>   CLI client (chat, read, list, archive) (experimental)\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "  mcp <command>                 Use MCP servers (list, call, add, rm, auth, restart)\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  skill <cat|ls|new> [name]     Read, list, or create skills\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  dtach <new|attach> ...        Legacy persistent PTY session helper\n")
 		fmt.Fprintf(flag.CommandLine.Output(), "  tour <chunks|verify|attach|show> ...  Commit guided tours (git notes)\n")
@@ -103,6 +98,8 @@ func main() {
 		runModels(global, args[1:])
 	case "client":
 		client.Run(args[1:])
+	case "mcp":
+		client.RunMCP(args[1:])
 	case "skill":
 		runSkill(args[1:])
 	case "dtach":
@@ -207,7 +204,7 @@ func runServe(global GlobalConfig, args []string) {
 	availableModels := llmManager.GetAvailableModels()
 	logger.Info("Available models", "models", strings.Join(availableModels, ", "))
 
-	toolSetConfig := setupToolSetConfig(llmManager, llmManager, database)
+	toolSetConfig := setupToolSetConfig(llmManager, llmManager)
 
 	// Create server
 	svr := server.NewServer(database, llmManager, toolSetConfig, logger, global.PredictableOnly, llmConfig.DefaultModel, *requireHeader)
@@ -365,7 +362,35 @@ func runVersion() {
 	}
 }
 
-func setupToolSetConfig(llmProvider claudetool.LLMServiceProvider, llmManager server.LLMProvider, database *db.DB) claudetool.ToolSetConfig {
+func modelRouteKeys(modelID string, info *models.ModelInfo) []string {
+	if info == nil {
+		return nil
+	}
+	provider := string(info.Provider)
+	// Prefer the wire model identity: integration aliases can share a
+	// catalog ID while actually sending different upstream model names.
+	if info.APIModelName != "" {
+		return []string{"api:" + provider + "/" + info.APIModelName}
+	}
+	baseID := modelID
+	if info.Source != models.SourceCustomLabel {
+		if candidate, _, qualified := strings.Cut(modelID, "@"); qualified && models.ByID(candidate) != nil {
+			baseID = candidate
+		}
+	}
+	keys := []string{"id:" + provider + "/" + baseID}
+	if model := models.ByID(baseID); model != nil {
+		keys = append(keys, "catalog:"+model.ID)
+	}
+	return keys
+}
+
+func isChatGPTSubscriptionRoute(info *models.ModelInfo, baseURL string) bool {
+	return baseURL != "" && info != nil && info.Source != models.SourceCustomLabel &&
+		info.Mode == "chatgpt" && info.BaseURL == baseURL
+}
+
+func setupToolSetConfig(llmProvider claudetool.LLMServiceProvider, llmManager server.LLMProvider) claudetool.ToolSetConfig {
 	wd, err := os.Getwd()
 	if err != nil {
 		// Fallback to "/" if we can't get working directory
@@ -375,47 +400,104 @@ func setupToolSetConfig(llmProvider claudetool.LLMServiceProvider, llmManager se
 	// Resolve the list of available models lazily, each time a ToolSet is
 	// built. This lets newly-added custom models become visible to subagents
 	// (and llm_one_shot) without restarting the server. See issue #195.
-	buildAvailableModels := func() []claudetool.AvailableModel {
-		availableIDs := llmManager.GetAvailableModels()
-		tiers := models.AssignTiers(availableIDs)
+	buildAvailableModelsForIDs := func(availableIDs []string, preferredBaseURL, alwaysIncludeID string) []claudetool.AvailableModel {
+		// Integration IDs may have an @integration suffix. Known models on
+		// the preferred subscription go by their catalog ID: that is what
+		// AssignTiers understands and what the agent sees in the tool enum,
+		// while the full ID still routes the request through the subscription.
+		names := make([]string, len(availableIDs))
+		infos := make([]*models.ModelInfo, len(availableIDs))
+		for i, id := range availableIDs {
+			names[i] = id
+			infos[i] = llmManager.GetModelInfo(id)
+			if isChatGPTSubscriptionRoute(infos[i], preferredBaseURL) {
+				if baseID, _, qualified := strings.Cut(id, "@"); qualified && models.ByID(baseID) != nil {
+					names[i] = baseID
+				}
+			}
+		}
+		tiers := models.AssignTiers(names)
 		var out []claudetool.AvailableModel
-		for _, id := range availableIDs {
-			info := llmManager.GetModelInfo(id)
+		nameCount := make(map[string]int)
+		for i, id := range availableIDs {
+			info := infos[i]
 			// Only surface tier-1 models to agents; tier-2 models are
 			// overshadowed by a better available sibling (see
 			// models.AssignTiers) or are unknown integration models and would
 			// just clutter the model enum. Explicit custom models stay visible.
-			if tiers[id] == models.Tier2 && (info == nil || info.Source != models.SourceCustomLabel) {
+			keepParentRoute := alwaysIncludeID != "" && id == alwaysIncludeID
+			if !keepParentRoute && tiers[names[i]] == models.Tier2 && (info == nil || info.Source != models.SourceCustomLabel) {
 				continue
 			}
-			am := claudetool.AvailableModel{ID: id}
-			if info != nil && info.DisplayName != "" && info.DisplayName != id {
-				am.DisplayName = info.DisplayName
+			nameCount[names[i]]++
+			out = append(out, claudetool.AvailableModel{Name: names[i], ID: id})
+		}
+		// Names must identify exactly one route; fall back to the full ID
+		// when two surviving routes would otherwise share a name.
+		for i := range out {
+			if nameCount[out[i].Name] > 1 {
+				out[i].Name = out[i].ID
 			}
-			out = append(out, am)
 		}
 		return out
 	}
 
-	flagEnabled := func(name string) func() bool {
-		return func() bool {
-			if database == nil {
-				return false
-			}
-			overrides, err := database.GetAllFeatureFlagOverrides(context.Background())
-			if err != nil {
-				panic(fmt.Sprintf("read feature flag %q: %v", name, err))
-			}
-			raw, ok := overrides[name]
-			if !ok {
-				return false
-			}
-			var enabled bool
-			if err := json.Unmarshal([]byte(raw), &enabled); err != nil {
-				panic(fmt.Sprintf("decode boolean feature flag %q: %v", name, err))
-			}
-			return enabled
+	buildAvailableModels := func(parentModelID string) []claudetool.AvailableModel {
+		availableIDs := llmManager.GetAvailableModels()
+		parentInfo := llmManager.GetModelInfo(parentModelID)
+		if parentInfo == nil || !isChatGPTSubscriptionRoute(parentInfo, parentInfo.BaseURL) {
+			return buildAvailableModelsForIDs(availableIDs, "", "")
 		}
+
+		// Prefer the parent's ChatGPT subscription when it also serves a
+		// model available through another route. Keep unrelated models from
+		// other integrations selectable.
+		infos := make(map[string]*models.ModelInfo, len(availableIDs))
+		for _, id := range availableIDs {
+			infos[id] = llmManager.GetModelInfo(id)
+		}
+
+		candidateIDs := append([]string(nil), availableIDs...)
+		if !slices.Contains(candidateIDs, parentModelID) {
+			candidateIDs = append(candidateIDs, parentModelID)
+		}
+		visibleSubscriptionKeys := make(map[string]struct{})
+		for _, model := range buildAvailableModelsForIDs(candidateIDs, parentInfo.BaseURL, parentModelID) {
+			info := infos[model.ID]
+			if info == nil && model.ID == parentModelID {
+				info = parentInfo
+			}
+			if !isChatGPTSubscriptionRoute(info, parentInfo.BaseURL) {
+				continue
+			}
+			for _, key := range modelRouteKeys(model.ID, info) {
+				visibleSubscriptionKeys[key] = struct{}{}
+			}
+		}
+
+		preferredIDs := make([]string, 0, len(availableIDs)+1)
+		foundParent := false
+		for _, id := range availableIDs {
+			info := infos[id]
+			if !isChatGPTSubscriptionRoute(info, parentInfo.BaseURL) && (info == nil || info.Source != models.SourceCustomLabel) {
+				duplicateOfSubscription := false
+				for _, key := range modelRouteKeys(id, info) {
+					if _, ok := visibleSubscriptionKeys[key]; ok {
+						duplicateOfSubscription = true
+						break
+					}
+				}
+				if duplicateOfSubscription {
+					continue
+				}
+			}
+			preferredIDs = append(preferredIDs, id)
+			foundParent = foundParent || id == parentModelID
+		}
+		if !foundParent {
+			preferredIDs = append(preferredIDs, parentModelID)
+		}
+		return buildAvailableModelsForIDs(preferredIDs, parentInfo.BaseURL, parentModelID)
 	}
 
 	return claudetool.ToolSetConfig{
@@ -424,7 +506,6 @@ func setupToolSetConfig(llmProvider claudetool.LLMServiceProvider, llmManager se
 		EnableJITInstall:     claudetool.EnableBashToolJITInstall,
 		EnableBrowser:        true,
 		BuildAvailableModels: buildAvailableModels,
-		PatchSimpleEnabled:   flagEnabled(server.FlagPatchSimple.Name),
 	}
 }
 
@@ -448,14 +529,6 @@ func buildLLMConfig(global GlobalConfig, logger *slog.Logger, database *db.DB) (
 	if err != nil {
 		return nil, err
 	}
-	if config.ExeEnvironment != nil {
-		env, err := exeenv.New(config.ExeEnvironment.Scheme, config.ExeEnvironment.BoxHost)
-		if err != nil {
-			return nil, fmt.Errorf("exe_environment: %w", err)
-		}
-		exeenv.Configure(env)
-	}
-
 	defaultModel, sources := buildLLMModelSources(context.Background(), global, config, logger)
 
 	httpc := llmhttp.NewClient(nil)
@@ -499,7 +572,7 @@ func buildLLMModelSources(ctx context.Context, global GlobalConfig, config shell
 	fireworksKey := os.Getenv("FIREWORKS_API_KEY")
 	// DEPRECATED: Per-provider env-var credentials are frozen. Do NOT add new
 	// env vars or models here; new models belong to the exe.dev LLM gateway or
-	// an exe.dev LLM integration.
+	// an exe.dev LLM integration. OPENAI_API_KEY also serves transcription.
 
 	var sources []modelsources.Source
 
@@ -609,6 +682,15 @@ func runModels(global GlobalConfig, args []string) {
 	}
 	tw.Flush()
 	fmt.Printf("\n%d models\n", len(llmCfg.Models))
+	if len(llmCfg.TranscriptionModels) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Fprintln(tw, "TRANSCRIPTION MODEL\tENDPOINT\tSOURCE")
+	for _, m := range llmCfg.TranscriptionModels {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", m.Model, m.Endpoint, m.Source)
+	}
+	tw.Flush()
 }
 
 // systemdListener returns a net.Listener from systemd socket activation.

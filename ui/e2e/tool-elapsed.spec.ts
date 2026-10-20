@@ -41,7 +41,7 @@ test("expanded running tools show a live elapsed time and stop on completion", a
   await expect(tool.locator(".bash-tool-time")).toHaveCount(0);
 });
 
-test("subagent tools and their running requests show elapsed time", async ({ page, request }) => {
+test("a working subagent's running requests show elapsed time", async ({ page, request }) => {
   const slug = await createConversationViaAPI(request, "hello");
   await page.goto(`/c/${slug}`);
   const input = page.getByTestId("message-input");
@@ -49,14 +49,11 @@ test("subagent tools and their running requests show elapsed time", async ({ pag
 
   await input.fill("subagent: helper bash: sleep 100");
   await page.getByTestId("send-button").click();
-  const subagent = page
-    .locator(".tool")
-    .filter({ has: page.locator(".tool-name", { hasText: "subagent" }) });
-  await expect(subagent).toHaveAttribute("data-testid", "tool-call-running", { timeout: 30000 });
-  await subagent.locator(".tool-header").click();
-  await expect(subagent.getByTestId("tool-running-elapsed")).toContainText("Running for");
-
-  await page.getByTestId("subagent-live").click();
+  const subagent = page.locator(".tool").filter({ has: page.locator(".subagent-tool-slug") });
+  // Subagent calls return as soon as the child starts; the live link stays
+  // while the child works.
+  await expect(subagent).toHaveAttribute("data-testid", "tool-call-completed", { timeout: 30000 });
+  await subagent.getByTestId("subagent-live").click();
   const childTool = page.locator(".bash-tool");
   await expect(childTool).toHaveAttribute("data-testid", "tool-call-running", { timeout: 30000 });
   await childTool.locator(".bash-tool-header").click();

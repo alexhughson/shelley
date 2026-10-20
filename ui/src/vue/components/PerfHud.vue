@@ -63,8 +63,11 @@
               <td class="perf-hud-stall-when">now</td>
               <td class="perf-hud-name">{{ wait.what }}</td>
               <td class="perf-hud-stall-outcome">
-                waiting {{ formatDuration(wait.elapsedMs) }} of
+                waiting {{ formatDuration(wait.chargedMs) }} of
                 {{ formatDuration(wait.deadlineMs) }}
+                <template v-if="describeStall(wait.stalledMs)">
+                  · {{ describeStall(wait.stalledMs) }}</template
+                >
               </td>
             </tr>
             <tr
@@ -78,6 +81,9 @@
               <td class="perf-hud-stall-outcome" :title="describeStallOutcome(stall)">
                 gave up at {{ formatDuration(stall.deadlineMs) }} ·
                 {{ describeStallOutcome(stall) }}
+                <template v-if="describeStall(stall.stalledMs)">
+                  · {{ describeStall(stall.stalledMs) }}</template
+                >
               </td>
             </tr>
           </tbody>
@@ -165,6 +171,7 @@ import { missedDeadlines, pendingWaits, resetMissedDeadlines } from "../../servi
 import {
   summarizeIdbContention,
   describeStallOutcome,
+  describeStall,
   formatDuration,
   type IdbContention,
 } from "./perfHudContention";

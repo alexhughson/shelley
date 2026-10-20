@@ -385,10 +385,32 @@ type profiledService struct{ mockService }
 func (profiledService) PatchProfile() string { return "codex_apply_patch" }
 
 func TestPatchProfile(t *testing.T) {
-	if got := PatchProfile(&mockService{}); got != "flat" {
-		t.Fatalf("plain service profile = %q, want flat", got)
+	if got := PatchProfile(&mockService{}); got != "nested" {
+		t.Fatalf("plain service profile = %q, want nested", got)
 	}
 	if got := PatchProfile(&profiledService{}); got != "codex_apply_patch" {
 		t.Fatalf("profiled service profile = %q, want codex_apply_patch", got)
+	}
+}
+
+func TestModelPatchProfile(t *testing.T) {
+	for _, tt := range []struct{ model, want string }{
+		{"glm", "simple"},
+		{"glm-5.3-fireworks", "simple"},
+		{"accounts/fireworks/models/glm-5p3-flash", "simple"},
+		{"z-ai/GLM-5.3", "simple"},
+		{"", "nested"},
+		{"claude-sonnet-4-6", "nested"},
+		{"gpt-6-sol", "nested"},
+		{"deepseek-v4", "nested"},
+		{"glmish", "nested"},
+		{"not-glm-5", "nested"},
+		{"glm/other-model", "nested"},
+	} {
+		t.Run(tt.model, func(t *testing.T) {
+			if got := ModelPatchProfile(tt.model); got != tt.want {
+				t.Fatalf("profile = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

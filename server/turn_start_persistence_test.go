@@ -55,9 +55,9 @@ func TestAcceptUserMessageRejectsUnpersistedTurn(t *testing.T) {
 
 	<-recordStarted
 	reservedWorking := manager.IsAgentWorking()
-	manager.mu.Lock()
-	manager.pendingBatches = append(manager.pendingBatches, pendingBatch{Kind: pendingBatchSubagentDone})
-	manager.mu.Unlock()
+	if _, err := database.AppendQueuedMessage(ctx, conversation.ConversationID, db.QueuedMessage{ID: "queued-meanwhile", Llm: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
 	close(finishRecord)
 	got := <-resultCh
 	if !reservedWorking {

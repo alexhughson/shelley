@@ -41,7 +41,7 @@ func TestPredictableFailRecordsWarningMessage(t *testing.T) {
 // TestWarningMessageReachesUnifiedStream asserts that a warning message is
 // delivered on /api/stream2, the stream the web UI actually listens to.
 //
-// Warnings are recorded by loop.recordRetryWarning on LLM retry / overload /
+// Warnings are recorded by loop.RunConfig.retryWarningHook on LLM retry / overload /
 // rate-limit events — ordinary operation, not damage. They get a real
 // sequence_id from GetNextSequenceID, so if they are published only to the
 // per-conversation subpub (the legacy /api/conversation/<id>/stream endpoint)

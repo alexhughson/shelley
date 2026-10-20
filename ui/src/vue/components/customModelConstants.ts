@@ -95,7 +95,6 @@ export interface FormData {
   api_key: string;
   model_name: string;
   max_tokens: number;
-  tags: string;
   reasoning_effort: string;
   reasoning_replay: "auto" | "none" | "reasoning_content";
   reasoning_support: "auto" | "yes" | "no";
@@ -111,7 +110,6 @@ export const emptyForm: FormData = {
   api_key: "",
   model_name: "",
   max_tokens: 0,
-  tags: "",
   reasoning_effort: "",
   reasoning_replay: "auto",
   reasoning_support: "auto",

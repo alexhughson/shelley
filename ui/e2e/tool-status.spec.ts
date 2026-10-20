@@ -35,7 +35,8 @@ for (const exitCode of [0, 7]) {
   });
 }
 
-test("a signal failure has no invented exit code", async ({ page, request }) => {
+// The job wrapper records a signal death as the shell does: 128 + signal.
+test("a signal failure reports the shell exit status", async ({ page, request }) => {
   const slug = await createConversationViaAPI(request, "bash: kill -TERM $$");
   await page.goto(`/c/${slug}`);
   const card = page.locator('.bash-tool[data-testid="tool-call-completed"]').first();
@@ -44,9 +45,8 @@ test("a signal failure has no invented exit code", async ({ page, request }) => 
   await expect(header.locator(".tool-status-icon")).toHaveCount(0);
   await header.click();
   const label = card.locator(".bash-tool-label").filter({ hasText: "Output" });
-  await expect(label).toContainText("Output (Error):");
-  await expect(label).not.toContainText("exit code");
-  await expect(card.locator(".bash-tool-details")).toContainText("signal: terminated");
+  await expect(label).toContainText("Output (exit code 143):");
+  await expect(card.locator(".bash-tool-details")).toContainText("exit status 143");
 });
 
 test("non-bash cards keep error details without header status marks", async ({ page, request }) => {

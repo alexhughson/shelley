@@ -1,11 +1,9 @@
 package claudetool
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"os"
@@ -32,8 +30,11 @@ type BashTool struct {
 	CheckPermission PermissionCallback
 	// EnableJITInstall enables just-in-time tool installation for missing commands
 	EnableJITInstall bool
-	// Timeouts holds the configurable timeout values (uses defaults if nil)
-	Timeouts *Timeouts
+	// Jobs is told about commands that outlive BackgroundAfter.
+	Jobs BackgroundJobs
+	// BackgroundAfter is how long a command runs before it is moved to the
+	// background; zero means DefaultBashBackgroundAfter.
+	BackgroundAfter time.Duration
 	// WorkingDir is the shared mutable working directory.
 	WorkingDir *MutableWorkingDir
 	// LLMProvider provides access to LLM services for tool validation
@@ -54,31 +55,17 @@ type BashTool struct {
 const (
 	EnableBashToolJITInstall = true
 	NoBashToolJITInstall     = false
-
-	DefaultFastTimeout = 30 * time.Second
-	DefaultSlowTimeout = 15 * time.Minute
 )
 
-// Timeouts holds the configurable timeout values for bash commands.
-type Timeouts struct {
-	Fast time.Duration // regular commands (e.g., ls, echo, simple scripts)
-	Slow time.Duration // commands that may reasonably take longer (e.g., downloads, builds, tests)
-}
+// DefaultBashBackgroundAfter is how long a bash command runs in the
+// foreground before it is moved to the background.
+const DefaultBashBackgroundAfter = 60 * time.Second
 
-// Fast returns t's fast timeout, or DefaultFastTimeout if t is nil.
-func (t *Timeouts) fast() time.Duration {
-	if t == nil {
-		return DefaultFastTimeout
+func (b *BashTool) backgroundAfter() time.Duration {
+	if b.BackgroundAfter == 0 {
+		return DefaultBashBackgroundAfter
 	}
-	return t.Fast
-}
-
-// Slow returns t's slow timeout, or DefaultSlowTimeout if t is nil.
-func (t *Timeouts) slow() time.Duration {
-	if t == nil {
-		return DefaultSlowTimeout
-	}
-	return t.Slow
+	return b.BackgroundAfter
 }
 
 // Tool returns an llm.Tool based on b.
@@ -107,15 +94,24 @@ func isNoTrailerSet() bool {
 
 const (
 	bashName        = "bash"
-	bashDescription = `Executes shell commands via bash --login -c, returning combined stdout/stderr.
-Shell state (cwd, variables, aliases) does not persist; use change_dir for cwd.
+	bashDescription = "Executes shell commands via bash --login -c, returning combined stdout/stderr.\n" +
+		"For commands like `cd app && make`, call change_dir with path `app`, then bash `make` without cd. " +
+		"These calls can share a response: change_dir completes before the following parallel group starts. " +
+		"Apply this before initial inspections and tests too, including README recipes. " +
+		"Skip change_dir if already there.\n\n" +
+		`Shell state (cwd, variables, aliases) does not persist.
+Commands already start in the working directory; omit redundant cd.
+For 'cd dir && ...' or 'cd dir; ...', call change_dir first,
+then run the remaining command directly.
 
-For long-running processes (servers, watch modes), use tmux instead.
-Do NOT use &, nohup, or disown — the bash tool kills its process group on exit.
+After 60s, commands move to the background. A background command's output
+arrives as a new message when it exits; never poll or sleep for it. While it
+runs, only do work that doesn't need its output; otherwise end your turn.
+Do not use &, nohup, or disown.
+
+For servers and watch modes, which never exit, use tmux.
 
 For delayed wakeups or scheduled tasks, use the schedule skill.
-
-Set slow_ok=true for potentially slow commands (increases timeout).
 
 Destructive commands (deleting .git, home directories, broad wildcards, etc) require
 explicit paths and user confirmation.
@@ -133,9 +129,9 @@ write a file and run it; both can share one call.
       "type": "string",
       "description": "Shell to execute"
     },
-    "slow_ok": {
+    "background": {
       "type": "boolean",
-      "description": "Use extended timeout"
+      "description": "Start in the background immediately instead of after 60s"
     }
   }
 }
@@ -143,21 +139,23 @@ write a file and run it; both can share one call.
 )
 
 type bashInput struct {
-	Command string `json:"command"`
-	SlowOK  bool   `json:"slow_ok,omitempty"`
+	Command    string `json:"command"`
+	Background bool   `json:"background,omitempty"`
 }
 
 // BashDisplayData is the display data sent to the UI for bash tool results.
 type BashDisplayData struct {
 	WorkingDir string `json:"workingDir"`
 	ExitCode   *int   `json:"exitCode,omitempty"`
+	// Background is set when the command was moved to the background.
+	Background *BashBackgroundDisplay `json:"background,omitempty"`
 }
 
-func (i *bashInput) timeout(t *Timeouts) time.Duration {
-	if i.SlowOK {
-		return t.slow()
-	}
-	return t.fast()
+// BashBackgroundDisplay identifies a backgrounded command in the UI.
+type BashBackgroundDisplay struct {
+	JobID   string `json:"jobId"`
+	LogPath string `json:"logPath"`
+	PGID    int    `json:"pgid"`
 }
 
 func (b *BashTool) run(ctx context.Context, req bashInput) llm.ToolOut {
@@ -196,11 +194,9 @@ func (b *BashTool) run(ctx context.Context, req bashInput) llm.ToolOut {
 		req.Command = bashkit.AddCoauthorTrailer(req.Command, "Co-authored-by: Shelley <shelley@exe.dev>")
 	}
 
-	timeout := req.timeout(b.Timeouts)
-
 	display := BashDisplayData{WorkingDir: wd}
 
-	out, execErr := b.executeBashInDir(ctx, req, timeout, wd)
+	res, execErr := b.executeBashInDir(ctx, req, wd)
 	if execErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(execErr, &exitErr) && exitErr.ProcessState.Exited() {
@@ -210,6 +206,11 @@ func (b *BashTool) run(ctx context.Context, req bashInput) llm.ToolOut {
 		toolOut := llm.ErrorToolOut(execErr)
 		toolOut.Display = display
 		return toolOut
+	}
+	out := res.out
+	if res.job != nil {
+		display.Background = &BashBackgroundDisplay{JobID: res.job.ID, LogPath: res.job.LogPath, PGID: res.job.PID}
+		return llm.ToolOut{LLMContent: llm.TextContent(out), Display: display}
 	}
 	exitCode := 0
 	display.ExitCode = &exitCode
@@ -252,191 +253,141 @@ const (
 	maxLineLength        = 200 // truncate displayed lines to this length
 )
 
-func (b *BashTool) makeBashCommand(ctx context.Context, command string, out io.Writer, wd string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "bash", "--login", "-c", command)
+// makeBashCommand returns a job wrapper (see bashJobWrapper) that runs
+// command in its own process group, recording its exit status in exitPath
+// and its combined output in log. It is deliberately not tied to a
+// context: a backgrounded job must outlive the tool call and Shelley.
+func (b *BashTool) makeBashCommand(command, wd string, log *os.File, exitPath string) *exec.Cmd {
+	cmd := exec.Command("bash", "-c", bashJobWrapper, "shelley-job", command, exitPath)
 	cmd.Dir = wd
 	cmd.Stdin = nil
-	cmd.Stdout = out
-	cmd.Stderr = out
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // set up for killing the process group
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			// Process hasn't started yet.
-			// Not sure whether this is possible in practice,
-			// but it is possible in theory, and it doesn't hurt to handle it gracefully.
-			return nil
-		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // kill entire process group
-	}
-	cmd.WaitDelay = 15 * time.Second // prevent indefinite hangs when child processes keep pipes open
+	cmd.Stdout = log
+	cmd.Stderr = log
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Strip any inherited SHELLEY_* vars so we control them explicitly below.
 	env := stripShelleyEnv(os.Environ())
 	env = append(env, "SKETCH=1")          // signal that this has been run by Sketch, sometimes useful for scripts
 	env = append(env, "EDITOR=/bin/false") // interactive editors won't work
+	env = append(env, `GIT_SEQUENCE_EDITOR=echo "To do an interactive rebase, run it in a tmux session." && exit 1`)
 	env = append(env, b.Env.Environ(cmd.Dir)...)
 	cmd.Env = env
 	return cmd
 }
 
-func cmdWait(cmd *exec.Cmd) error {
-	err := cmd.Wait()
-	// We used to kill the process group here, but it's not clear that
-	// this is correct in the case of self-daemonizing processes,
-	// and I encountered issues where daemons that I tried to run
-	// as background tasks would mysteriously exit.
-	return err
-}
-
 const (
 	// progressMaxBytes is the maximum bytes of output kept in the progress tail buffer.
 	progressMaxBytes = 10 * 1024
-	// progressInterval is how often we report progress to the UI.
-	progressInterval = 500 * time.Millisecond
 )
 
-// progressWriter wraps a bytes.Buffer and periodically reports the tail of output.
-type progressWriter struct {
-	buf      bytes.Buffer
-	mu       sync.Mutex
-	progress llm.ToolProgressFunc
-	toolID   string
-	toolName string
-	ctx      context.Context
-	cancel   context.CancelFunc
-	done     chan struct{}
+// bashResult is the outcome of a command that finished in the foreground
+// (job == nil) or was moved to the background (job != nil).
+type bashResult struct {
+	out string
+	job *BackgroundJob
 }
 
-func newProgressWriter(ctx context.Context, progress llm.ToolProgressFunc, toolID, toolName string) *progressWriter {
-	pCtx, cancel := context.WithCancel(ctx)
-	pw := &progressWriter{
-		progress: progress,
-		toolID:   toolID,
-		toolName: toolName,
-		ctx:      pCtx,
-		cancel:   cancel,
-		done:     make(chan struct{}),
-	}
-	go pw.reportLoop()
-	return pw
+func (b *BashTool) executeBash(ctx context.Context, req bashInput) (bashResult, error) {
+	return b.executeBashInDir(ctx, req, b.getWorkingDir())
 }
 
-func (pw *progressWriter) Write(p []byte) (int, error) {
-	pw.mu.Lock()
-	defer pw.mu.Unlock()
-	return pw.buf.Write(p)
-}
-
-// tail returns the last progressMaxBytes of accumulated output.
-func (pw *progressWriter) tail() string {
-	pw.mu.Lock()
-	defer pw.mu.Unlock()
-	b := pw.buf.Bytes()
-	if len(b) > progressMaxBytes {
-		b = b[len(b)-progressMaxBytes:]
+func (b *BashTool) executeBashInDir(ctx context.Context, req bashInput, wd string) (bashResult, error) {
+	dir := bashJobDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return bashResult{}, fmt.Errorf("create job dir: %w", err)
 	}
-	return string(b)
-}
-
-func (pw *progressWriter) reportLoop() {
-	defer close(pw.done)
-	ticker := time.NewTicker(progressInterval)
-	defer ticker.Stop()
-	lastReported := ""
-	for {
-		select {
-		case <-pw.ctx.Done():
-			// Final report
-			if t := pw.tail(); t != lastReported {
-				pw.progress(llm.ToolProgress{
-					ToolUseID: pw.toolID,
-					ToolName:  pw.toolName,
-					Output:    t,
-				})
-			}
-			return
-		case <-ticker.C:
-			t := pw.tail()
-			if t != lastReported {
-				lastReported = t
-				pw.progress(llm.ToolProgress{
-					ToolUseID: pw.toolID,
-					ToolName:  pw.toolName,
-					Output:    t,
-				})
-			}
-		}
+	job := BackgroundJob{
+		ID:             newBashJobID(),
+		ConversationID: b.Env.ConversationID,
+		ToolUseID:      ToolUseID(ctx),
+		Command:        req.Command,
 	}
-}
-
-func (pw *progressWriter) stop() {
-	pw.cancel()
-	<-pw.done
-}
-
-// String returns the accumulated output as a string.
-func (pw *progressWriter) String() string {
-	pw.mu.Lock()
-	defer pw.mu.Unlock()
-	return pw.buf.String()
-}
-
-func (b *BashTool) executeBash(ctx context.Context, req bashInput, timeout time.Duration) (string, error) {
-	return b.executeBashInDir(ctx, req, timeout, b.getWorkingDir())
-}
-
-func (b *BashTool) executeBashInDir(ctx context.Context, req bashInput, timeout time.Duration, wd string) (string, error) {
-	execCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	// Check if there's a progress callback for streaming output
-	progressFn := GetToolProgress(ctx)
-	toolID := ToolUseID(ctx)
-
-	var output io.Writer
-	var getOutput func() string
-
-	if progressFn != nil && toolID != "" {
-		pw := newProgressWriter(execCtx, progressFn, toolID, bashName)
-		defer pw.stop()
-		output = pw
-		getOutput = pw.String
-	} else {
-		buf := new(bytes.Buffer)
-		output = buf
-		getOutput = buf.String
-	}
-
-	cmd := b.makeBashCommand(execCtx, req.Command, output, wd)
-	cmd.Env = append(cmd.Env, `GIT_SEQUENCE_EDITOR=echo "To do an interactive rebase, run it in a tmux session." && exit 1`)
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("command failed: %w", err)
-	}
-
-	err := cmdWait(cmd)
-
-	out, formatErr := formatForegroundBashOutput(getOutput())
-	if formatErr != nil {
-		return "", formatErr
-	}
-
-	if execCtx.Err() == context.DeadlineExceeded {
-		hint := " For a longer timeout, set slow_ok: true."
-		if req.SlowOK {
-			hint = " To run longer, use tmux and write output to a log file."
-		}
-		return "", fmt.Errorf("[Command timed out after %s, showing output until timeout.%s]\n%s", timeout, hint, out)
-	}
-	if execCtx.Err() == context.Canceled {
-		// cmd.Wait commonly reports only "signal: killed" after CommandContext
-		// stops the process. Preserve the cancellation cause so the loop can
-		// classify this as an interrupted tool rather than an ordinary failure.
-		return "", fmt.Errorf("[command cancelled: %w]\n%s", execCtx.Err(), out)
-	}
+	job.LogPath = filepath.Join(dir, job.ID+".log")
+	job.ExitPath = filepath.Join(dir, job.ID+".exit")
+	log, err := os.OpenFile(job.LogPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return "", fmt.Errorf("[command failed: %w]\n%s", err, out)
+		return bashResult{}, fmt.Errorf("create job log: %w", err)
+	}
+	cmd := b.makeBashCommand(req.Command, wd, log, job.ExitPath)
+	job.StartedAt = time.Now()
+	err = cmd.Start()
+	log.Close() // the job holds its own descriptor
+	if err != nil {
+		os.Remove(job.LogPath)
+		return bashResult{}, fmt.Errorf("command failed: %w", err)
+	}
+	job.PID = cmd.Process.Pid
+	// Read the start time before anything reaps the wrapper, so even a
+	// command that exits immediately can still be recorded as a job.
+	job.StartTime, err = processStartTime(job.PID)
+	if err != nil {
+		syscall.Kill(-job.PID, syscall.SIGKILL)
+		cmd.Wait()
+		return bashResult{}, fmt.Errorf("job %s (PGID %d): %w", job.ID, job.PID, err)
+	}
+	exited := make(chan struct{})
+	go waitBashJob(cmd, job.ExitPath, exited)
+	if req.Background {
+		return b.background(ctx, job, exited, "Started as")
 	}
 
-	return out, nil
+	stopProgress := func() {}
+	if progressFn := GetToolProgress(ctx); progressFn != nil && job.ToolUseID != "" {
+		stop, done := make(chan struct{}), make(chan struct{})
+		go logProgressLoop(progressFn, job.ToolUseID, bashName, job.LogPath, stop, done)
+		stopProgress = func() {
+			close(stop)
+			<-done
+		}
+	}
+
+	timer := time.NewTimer(b.backgroundAfter())
+	defer timer.Stop()
+	select {
+	case <-exited:
+	case <-ctx.Done():
+		syscall.Kill(-job.PID, syscall.SIGKILL)
+		<-exited
+	case <-timer.C:
+		stopProgress()
+		return b.background(ctx, job, exited, fmt.Sprintf("Still running after %s; moved to", b.backgroundAfter()))
+	}
+	stopProgress()
+
+	content, readErr := os.ReadFile(job.LogPath)
+	os.Remove(job.LogPath)
+	os.Remove(job.ExitPath)
+	if readErr != nil {
+		return bashResult{}, fmt.Errorf("read command output: %w", readErr)
+	}
+	out, err := formatForegroundBashOutput(string(content))
+	if err != nil {
+		return bashResult{}, err
+	}
+	if ctx.Err() != nil {
+		// Preserve the cancellation cause so the loop can classify this as
+		// an interrupted tool rather than an ordinary failure.
+		return bashResult{}, fmt.Errorf("[command cancelled: %w]\n%s", ctx.Err(), out)
+	}
+	if !cmd.ProcessState.Success() {
+		return bashResult{}, fmt.Errorf("[command failed: %w]\n%s", &exec.ExitError{ProcessState: cmd.ProcessState}, out)
+	}
+	return bashResult{out: out}, nil
+}
+
+// background hands the still-running job to b.Jobs, which reports its
+// completion to the conversation, and describes it for the model.
+// how leads the description, e.g. "Started as" or "Still running after 1m0s; moved to".
+func (b *BashTool) background(ctx context.Context, job BackgroundJob, exited <-chan struct{}, how string) (bashResult, error) {
+	if err := b.Jobs.Background(context.WithoutCancel(ctx), job, exited); err != nil {
+		return bashResult{}, fmt.Errorf("background job %s (PGID %d, log %s): %w", job.ID, job.PID, job.LogPath, err)
+	}
+	var out strings.Builder
+	if tail := logTail(job.LogPath, jobNoticeTailLines); tail != "" {
+		out.WriteString(tail + "\n")
+	}
+	fmt.Fprintf(&out, "[%s background job %s (PGID %d). Log: %s\n", how, job.ID, job.PID, job.LogPath)
+	fmt.Fprintf(&out, "Its output will arrive as a new message; never poll or sleep for it. Continue only with work that doesn't need its output; otherwise end your turn. Cancel with `kill -- -%d`.]", job.PID)
+	return bashResult{out: out.String(), job: &job}, nil
 }
 
 // formatForegroundBashOutput formats the output of a foreground bash command for display to the agent.

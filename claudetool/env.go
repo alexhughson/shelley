@@ -12,7 +12,7 @@ import (
 // runs as SHELLEY_* environment variables. It is the single source of truth for
 // both code paths that run shell commands:
 //
-//   - the agent's bash and shell tools, and
+//   - the agent's bash tool, and
 //   - interactive "!" terminals spawned from the UI (see buildTerminalEnv).
 //
 // Keeping the logic in one place ensures the same variables are injected
@@ -31,6 +31,9 @@ type ShelleyEnv struct {
 	// SHELLEY_PORT and SHELLEY_URL (http://localhost:<port>) are exported so
 	// scripts on the VM can reach the shelley API without the auth proxy.
 	Port int
+	// Socket is the shelley server's Unix socket, exposed as SHELLEY_SOCKET
+	// so `shelley client` and `shelley mcp` reach this server.
+	Socket string
 }
 
 // shelleyEnvKeys lists every environment variable name ShelleyEnv may set. We
@@ -45,6 +48,7 @@ var shelleyEnvKeys = []string{
 	"SHELLEY_GIT_ROOT",
 	"SHELLEY_PORT",
 	"SHELLEY_URL",
+	"SHELLEY_SOCKET",
 }
 
 // Environ returns the SHELLEY_* "KEY=VALUE" entries for this context. cwd is the
@@ -72,6 +76,7 @@ func (e ShelleyEnv) Environ(cwd string) []string {
 		add("SHELLEY_PORT", fmt.Sprintf("%d", e.Port))
 		add("SHELLEY_URL", fmt.Sprintf("http://localhost:%d", e.Port))
 	}
+	add("SHELLEY_SOCKET", e.Socket)
 	return out
 }
 

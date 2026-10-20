@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -20,11 +21,12 @@ import (
 // Server -> client uses TermID in an "attached" message so the browser can
 // remember the persistent session id across reloads.
 type ExecMessage struct {
-	Type   string `json:"type"`
-	Data   string `json:"data,omitempty"`
-	Cols   uint16 `json:"cols,omitempty"`
-	Rows   uint16 `json:"rows,omitempty"`
-	TermID string `json:"term_id,omitempty"`
+	Type        string `json:"type"`
+	Data        string `json:"data,omitempty"`
+	Cols        uint16 `json:"cols,omitempty"`
+	Rows        uint16 `json:"rows,omitempty"`
+	TermID      string `json:"term_id,omitempty"`
+	CloseOnExit *bool  `json:"close_on_exit,omitempty"`
 }
 
 // handleExecWS handles websocket connections that proxy to a persistent
@@ -35,6 +37,7 @@ type ExecMessage struct {
 //   - term_id: existing session id to re-attach to (preferred)
 //   - cmd:     command to start a new session (required if term_id missing)
 //   - cwd:     working directory for new sessions
+//   - close_on_exit: close the UI tab on child exit (new sessions only; default false)
 func (s *Server) handleExecWS(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -49,6 +52,15 @@ func (s *Server) handleExecWS(w http.ResponseWriter, r *http.Request) {
 	if termID == "" && cmd == "" {
 		http.Error(w, "cmd or term_id parameter required", http.StatusBadRequest)
 		return
+	}
+	var closeOnExit bool
+	if q.Has("close_on_exit") {
+		var err error
+		closeOnExit, err = strconv.ParseBool(q.Get("close_on_exit"))
+		if err != nil {
+			http.Error(w, "invalid close_on_exit parameter", http.StatusBadRequest)
+			return
+		}
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -84,8 +96,11 @@ func (s *Server) handleExecWS(w http.ResponseWriter, r *http.Request) {
 			slug = *conv.Slug
 		}
 	}
-	extraEnv := buildTerminalEnv(conversationID, slug, model, userEmail, cwd, s.listenPort)
-	sess, dc, err := s.attachOrSpawn(termID, cmd, cwd, conversationID, cols, rows, extraEnv)
+	// Resolve the cwd before building the env so SHELLEY_CWD and
+	// SHELLEY_GIT_ROOT describe the directory the command actually runs in.
+	cwd = terminalCwd(cwd)
+	extraEnv := buildTerminalEnv(conversationID, slug, model, userEmail, cwd, s.listenPort, s.socketPath)
+	sess, dc, err := s.attachOrSpawn(termID, cmd, cwd, conversationID, closeOnExit, cols, rows, extraEnv)
 	if err != nil {
 		wsjson.Write(ctx, conn, ExecMessage{Type: "error", Data: err.Error()})
 		conn.Close(websocket.StatusInternalError, "attach failed")
@@ -95,7 +110,7 @@ func (s *Server) handleExecWS(w http.ResponseWriter, r *http.Request) {
 
 	// Tell the client which session it ended up on (especially important if it
 	// was just spawned).
-	if err := wsjson.Write(ctx, conn, ExecMessage{Type: "attached", TermID: sess.ID}); err != nil {
+	if err := wsjson.Write(ctx, conn, ExecMessage{Type: "attached", TermID: sess.ID, CloseOnExit: &sess.CloseOnExit}); err != nil {
 		return
 	}
 
@@ -107,15 +122,16 @@ func (s *Server) handleExecWS(w http.ResponseWriter, r *http.Request) {
 
 // buildTerminalEnv returns the SHELLEY_* environment variables to inject into
 // ephemeral / persistent terminals spawned from the UI. It shares the same
-// claudetool.ShelleyEnv used by the agent's bash/shell tools so interactive
+// claudetool.ShelleyEnv used by the agent's bash tool so interactive
 // "!" commands and agent-run commands see an identical environment.
-func buildTerminalEnv(conversationID, slug, model, userEmail, cwd string, listenPort int) []string {
+func buildTerminalEnv(conversationID, slug, model, userEmail, cwd string, listenPort int, socketPath string) []string {
 	return claudetool.ShelleyEnv{
 		ConversationID:   conversationID,
 		ConversationSlug: slug,
 		Model:            model,
 		UserEmail:        userEmail,
 		Port:             listenPort,
+		Socket:           socketPath,
 	}.Environ(cwd)
 }
 
@@ -126,9 +142,9 @@ func buildTerminalEnv(conversationID, slug, model, userEmail, cwd string, listen
 // behind the user's back would silently restart work they believe has finished.
 // Spawning is only reached when the caller supplied no term_id at all.
 //
-// conversationID is the owner recorded for newly spawned sessions. Reattaching
-// never changes ownership.
-func (s *Server) attachOrSpawn(termID, cmd, cwd, conversationID string, cols, rows uint16, extraEnv []string) (*TerminalSession, terminalClient, error) {
+// conversationID and closeOnExit are recorded for newly spawned sessions.
+// Reattaching never changes ownership or exit policy.
+func (s *Server) attachOrSpawn(termID, cmd, cwd, conversationID string, closeOnExit bool, cols, rows uint16, extraEnv []string) (*TerminalSession, terminalClient, error) {
 	unlock := s.terminals.LockAttach()
 	defer unlock()
 	if termID != "" {
@@ -144,7 +160,7 @@ func (s *Server) attachOrSpawn(termID, cmd, cwd, conversationID string, cols, ro
 		}
 		return sess, client, nil
 	}
-	return s.terminals.Spawn(cmd, cwd, conversationID, cols, rows, extraEnv)
+	return s.terminals.Spawn(cmd, cwd, conversationID, closeOnExit, cols, rows, extraEnv)
 }
 
 // bridgeWS shuttles bytes between the browser websocket and a terminal session.
@@ -220,6 +236,7 @@ type terminalDTO struct {
 	Command        string  `json:"command"`
 	Cwd            string  `json:"cwd"`
 	ConversationID *string `json:"conversation_id"`
+	CloseOnExit    bool    `json:"close_on_exit"`
 	CreatedAt      string  `json:"created_at"`
 }
 
@@ -234,6 +251,7 @@ func newTerminalDTO(t *TerminalSession) terminalDTO {
 		Command:        t.Command,
 		Cwd:            t.Cwd,
 		ConversationID: convID,
+		CloseOnExit:    t.CloseOnExit,
 		CreatedAt:      t.CreatedAt.Format("2006-01-02T15:04:05Z"),
 	}
 }

@@ -45,6 +45,7 @@ export interface SubagentLive {
   working: Ref<boolean>;
   /** One-line live activity (streaming text tail / running tool / preview). */
   activity: Ref<string>;
+  startedAt: Ref<string | null>;
 }
 
 /**
@@ -111,6 +112,21 @@ export function useSubagentLive(
   onUnmounted(unsubscribe);
 
   const working = computed(() => !!conv.value?.working);
+  const startedAt = computed(() => {
+    void tick.value;
+    const id = conv.value?.conversation_id;
+    if (!id) return null;
+    const messages = messageStore.peek(id)?.messages ?? [];
+    let start: string | null = null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if ((message.type === "agent" || message.type === "error") && message.end_of_turn) {
+        break;
+      }
+      if (message.type === "user") start = message.created_at;
+    }
+    return start;
+  });
   const activity = computed(() => {
     void tick.value; // subscribe to store updates
     const c = conv.value;
@@ -124,7 +140,7 @@ export function useSubagentLive(
     });
   });
 
-  return { conv, working, activity };
+  return { conv, working, activity, startedAt };
 }
 
 /** Client-side navigation to a conversation, mirroring SubagentTool's

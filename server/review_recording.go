@@ -22,7 +22,7 @@ const (
 	reviewOnScreenDwell  = 1000
 	reviewPointerDwell   = 400
 	reviewClearDwell     = 500
-	reviewPointerRunes   = 120
+	reviewPointerRunes   = 200
 	reviewSelectionRunes = 500
 )
 

@@ -27,6 +27,7 @@ export interface TranslationKeys {
   conversationView: string;
   seeAllMessages: string;
   seeEndOfTurnMessagesOnly: string;
+  seeChatOnly: string;
   brevity: string;
   look: string;
 
@@ -148,10 +149,13 @@ export interface TranslationKeys {
   recordingStopping: string;
   recordingTooShort: string;
   recordingFailed: string;
+  recordingUnavailable: string;
   recordingRetained: string;
   recordingDiscard: string;
   recordingInvalidResponse: string;
   recordingScreenAction: string;
+  recordingVoiceOption: string;
+  recordingVoiceScreenOption: string;
   recordingTranscribing: string;
   recordingScreenEnded: string;
   dropFilesHere: string;
@@ -170,7 +174,31 @@ export interface TranslationKeys {
   showAllModels: string;
   showFewerModels: string;
   manageModelsAction: string;
+  closeAction: string;
   effortLabel: string;
+  toolsLabel: string;
+  toolsAtDefaults: string;
+  profileLabel: string;
+  editAction: string;
+  editToolsAction: string;
+  editProfilesAction: string;
+  profileDiffersFrom: string;
+  profileUpdate: string;
+  profileSaveAsNew: string;
+  profileRevert: string;
+  profileDeleted: string;
+  profileUnsaved: string;
+  profileNewName: string;
+  changeReasoning: string;
+  autoCompaction: string;
+  /** The name inside a sentence, as in "auto compaction on". */
+  autoCompactionName: string;
+  autoCompactionNeeded: string;
+  changeToolOn: string;
+  changeToolOff: string;
+  changeNudge: string;
+  compactNudgeAt: string;
+  changeSystemPrompt: string;
   effortAuto: string;
   modelSwitchBusy: string;
   modelSwitchHint: string;
@@ -197,8 +225,6 @@ export interface TranslationKeys {
   imageSupportYes: string;
   imageSupportNo: string;
   tags: string;
-  tagsPlaceholder: string;
-  tagsTooltip: string;
   columnName: string;
   columnModelId: string;
   columnProvider: string;
@@ -233,6 +259,33 @@ export interface TranslationKeys {
   noModelsConfigured: string;
   noModelsHint: string;
 
+  // MCP Servers Modal
+  mcpServers: string;
+  configureMcpServers: string;
+  addMcpServer: string;
+  editMcpServer: string;
+  loadingMcpServers: string;
+  noMcpServers: string;
+  noMcpServersHint: string;
+  columnDescription: string;
+  mcpTools: string;
+  mcpToolsTitle: string;
+  mcpConnecting: string;
+  mcpNoTools: string;
+  mcpNameHint: string;
+  mcpDescriptionPlaceholder: string;
+  mcpHeaders: string;
+  mcpAddHeader: string;
+  mcpValue: string;
+  mcpRemoveHeader: string;
+  mcpColumnLogin: string;
+  mcpLoggedIn: string;
+  mcpLoginRequired: string;
+  mcpLogIn: string;
+  mcpLogOut: string;
+  mcpLoggedInTo: string;
+  mcpDebug: string;
+
   // Notifications Modal
   notifications: string;
   browserNotifications: string;
@@ -253,6 +306,13 @@ export interface TranslationKeys {
   noServerChannelsConfigured: string;
   addOne: string;
   edit: string;
+
+  // Favicon Emoji Modal
+  faviconEmoji: string;
+  pickFaviconEmoji: string;
+  faviconEmojiSaving: string;
+  faviconEmojiFromExe: string;
+  faviconEmojiChangeOnExe: string;
 
   // Integrations Modal
   slackDestination: string;
@@ -340,6 +400,8 @@ export interface TranslationKeys {
   welcomeOpenSource: string;
   welcomeCustomize: string;
   sendMessageToStart: string;
+  sendOrTalkToStart: string;
+  startVoiceConversation: string;
   noModelsTitle: string;
   noModelsExeNote: string;
   noModelsLocalNote: string;

@@ -56,7 +56,7 @@ func GenerateSlug(ctx context.Context, llmProvider LLMServiceProvider, database 
 	// the usage is accounted for through the ordinary message-usage path.
 	var marker *generated.Message
 	if entries := otherUsage.Take(); len(entries) > 0 {
-		marker, err = database.CreateSlugMessage(ctx, conversationID, entries)
+		marker, err = database.CreateUsageMessage(ctx, conversationID, entries)
 		if err != nil {
 			logger.Error("Failed to record slug usage", "conversationID", conversationID, "error", err)
 		}
@@ -65,8 +65,8 @@ func GenerateSlug(ctx context.Context, llmProvider LLMServiceProvider, database 
 	// Install the generated slug only if the conversation is still unnamed.
 	// Each attempt uses one write transaction, so a rename that completed while
 	// the LLM was running wins atomically instead of being overwritten here.
-	slug := baseSlug
-	for attempt := 0; attempt < 100; attempt++ {
+	for attempt := range db.SlugAttempts {
+		slug := db.SlugCandidate(baseSlug, attempt)
 		conversation, updated, updateErr := database.SetConversationSlugIfUnset(ctx, conversationID, slug)
 		if updateErr == nil {
 			if updated {
@@ -79,8 +79,6 @@ func GenerateSlug(ctx context.Context, llmProvider LLMServiceProvider, database 
 		if strings.Contains(strings.ToLower(updateErr.Error()), "unique constraint failed") ||
 			strings.Contains(strings.ToLower(updateErr.Error()), "unique constraint") ||
 			strings.Contains(strings.ToLower(updateErr.Error()), "duplicate") {
-			// Try with a numeric suffix
-			slug = fmt.Sprintf("%s-%d", baseSlug, attempt+1)
 			continue
 		}
 
@@ -89,8 +87,7 @@ func GenerateSlug(ctx context.Context, llmProvider LLMServiceProvider, database 
 		return "", marker, fmt.Errorf("failed to update conversation slug: %w", updateErr)
 	}
 
-	// If we've tried 100 times and still failed, give up
-	return "", marker, fmt.Errorf("failed to generate unique slug after 100 attempts")
+	return "", marker, fmt.Errorf("failed to generate unique slug after %d attempts", db.SlugAttempts)
 }
 
 // generateSlugText generates a human-readable slug with the conversation's

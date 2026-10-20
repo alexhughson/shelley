@@ -45,5 +45,10 @@ When a task matches a skill's description, run its activation command to read th
 {{.SkillsXML}}
 </skills>
 {{end}}
+{{if .MCPServers}}
+{{.MCPServersXML}}
+{{end}}
+
+To offer the user a file to download, link it as [name](sandbox:/absolute/path).
 
 Prefer fewer, richer tool calls.

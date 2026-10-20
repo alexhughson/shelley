@@ -85,6 +85,11 @@ Unless noted, results exclude **archived** conversations.
   `xhigh`, or `max`; the server also validates it against the selected model's
   advertised levels. Tool override values are `on` or `off`. With
   `disable_all_tools`, an explicit `on` override re-enables that tool.
+  The conversation starts from the settings of the profile named by
+  `conversation_options.profile`, or the default profile (see Profiles
+  below). A non-empty `model` overrides the profile's, as do the
+  `thinking_level`, `tool_overrides`, `compact_nudge_tokens`, and
+  `system_prompt` options where present, even as `""`, `{}`, or `0`.
 - `POST /api/conversations/distill-new-generation` — compact the current
   conversation into the next generation of the same conversation. The
   optional `method` field (`default` or `compact`) is accepted for
@@ -142,6 +147,58 @@ Unless noted, results exclude **archived** conversations.
 - `POST /api/conversation/<id>/archive` / `unarchive`.
 - `POST /api/conversation/<id>/hooks` — register an end-of-turn webhook.
 - `POST /api/conversation/<id>/tags` — replace the conversation's tag list.
+- `GET /api/conversation/<id>/settings` — the settings later turns use, and
+  the profile they came from (a label; either may have changed since):
+  ```json
+  {"profile": "Research", "model": "claude-opus-5.5", "thinking_level": "high",
+   "tool_overrides": {"browser": "off"}, "compact_nudge_tokens": 200000,
+   "system_prompt": ""}
+  ```
+- `POST /api/conversation/<id>/settings` — change them. The body has the same
+  fields; those left out keep their values, and `profile`, if present, first
+  replaces all of them with that profile's. `"model": ""` means the server's
+  default. When `thinking_level` is left out, a model that lacks the level
+  rounds it to one it has; an explicit level the model lacks is a `400`, as
+  are unknown fields. Responds with the settings now in effect. Unless only
+  the profile label changes, a running turn is stopped first, and queued
+  messages then go out on the new settings (those the turn had already taken
+  in end with it, as with Stop); `409` if another turn starts before the
+  change lands.
+  Changes record a `modelchange` message saying what changed (`profile_to`,
+  `from`/`to`, `reasoning_to`, `tools_on`/`tools_off`, `compact_nudge_tokens`,
+  `system_prompt_changed`, `text`, and the settings before, `previous`), just
+  after a new `system` message if the template or the tools changed. A fork
+  from before the change gets the settings before it. `409` if the
+  conversation is archived or a draft (a draft's settings travel with its
+  first message), for a custom `system_prompt` in a subagent, or for anything
+  but the model and reasoning in a btw reader.
+- `POST /api/conversation/<id>/live-session` — start a GPT-Live voice call:
+  `{"sdp", "model"?, "cwd"?, "conversation_options"?}` (the settings only for
+  a draft) → `201 {"session":{"id"},"transport":{"type","sdp"}}`. Shelley
+  writes the voice prompt and holds the key. The session id also names
+  Shelley's side of the call (capability `live-call-events`), which decides
+  what the user's speech becomes, delivers it as `Spoken request:` chat
+  messages (promoting a draft with the call's settings), and tells Live
+  about typed messages and final replies. The client relays and follows:
+  - `POST /api/conversation/<id>/live-session/<session>/events` —
+    `{"events":[<Live data-channel event>...]}`, verbatim and in order, one
+    request at a time. Shelley reads `session.input_transcript.delta`,
+    `session.output_transcript.delta`, `session.delegation.created` and
+    `session.closed`. `204`; `400` `Invalid live events`; `404` `Live call
+    not found`.
+  - `GET /api/conversation/<id>/live-session/<session>/stream` — SSE of
+    instructions, `id` numbered; resume with `?after=<id>` or
+    `Last-Event-ID`. `{"type":"send","event"}`: send `event` to Live;
+    `{"type":"error","message"}`: show the error, `null` clears it;
+    `{"type":"activity","handing_off"}`; `{"type":"stop","message"}`: end the
+    call showing `message`. Unknown types are ignored. The call ends a
+    minute after its last stream detaches.
+  - `DELETE /api/conversation/<id>/live-session/<session>` — hang up: pending
+    speech is dropped. `204`.
+- `POST /api/conversation/<id>/live-message` — for clients without
+  `live-call-events`: deliver one delegation the client decided on,
+  `{"transcript", "voice_context"?, "model"?, "cwd"?,
+  "conversation_options"?}` → chat's receipt.
 - `GET /api/conversation/<id>/subagents` — direct child conversations. Clients
   can recurse through this endpoint when they need the complete descendant
   tree (for example, aggregate usage reporting).
@@ -280,6 +337,78 @@ fresh reset event.
 - `GET/POST/PUT/DELETE /api/notification-channels[/<id>]`,
   `GET /api/notification-channel-types` — notification CRUD.
 
+### Profiles
+
+A profile is a named set of conversation settings: `model` (`""` means the
+server's default model), `thinking_level` (`""` means the model's default),
+`tool_overrides`, `compact_nudge_tokens` (`0` means the default), and
+`system_prompt`, a Go [text/template](https://pkg.go.dev/text/template)
+(`""` means Shelley's built-in prompt, which changes with Shelley). Exactly
+one profile is the default; new conversations start from it unless they name
+another. A conversation records the profile it came from in
+`conversation_options.profile`. Its settings are copy-on-write: until a
+change of its own sets `conversation_options.settings_edited`, the
+conversation takes the profile's edits at its next turn, with a marker saying
+what changed. Switching to a profile clears the flag. A deleted profile
+leaves the settings as they are.
+
+Shelley pre-installs `Default` (the coding profile, initially selected) and
+`Assistant` (an opt-in, text-message-first personal assistant for life and
+work). Assistant enables `message_user` and `compact_in_place` with a
+130k-token compaction nudge, disables `llm_one_shot` and `output_iframe`,
+replies in plain text through `message_user`, compacts in place after 8 idle
+minutes and keeps the prompt cache warm until then. Both profiles use the
+server's default model. Profiles can be edited; a non-default
+profile can be deleted. Built-in profiles have `builtin: true` and start with
+`user_edited: false`; Shelley refreshes them on startup until an actual user
+edit sets `user_edited: true`. Unchanged saves and default selection do not
+count as edits. Restore defaults resets their settings and clears that flag.
+Deleted profiles and pre-existing custom profiles with the same name stay
+untouched. Restoring follows the same copy-on-write rule as edits.
+
+New messaging webhook and web chats start from `Assistant` when it exists;
+otherwise they use the server's default model and built-in prompt. They
+always enable `message_user`. A first message's explicit `system_prompt`
+overrides the profile's prompt and makes the chat's settings its own. Later
+events' prompts are ignored.
+
+A profile also has a `voice_prompt` (trimmed, up to 4000 characters; `""`
+means none): who voice calls speak as. It is not a setting: conversations
+don't copy it, and a call reads the current voice prompt of the profile its
+conversation names.
+
+- `GET /api/profiles` — all profiles, default first:
+  `[{"name", "default", "builtin", "user_edited", "model", "thinking_level", "tool_overrides",
+  "compact_nudge_tokens", "system_prompt", "voice_prompt"}]`.
+- `POST /api/profiles` — create one: `name` (trimmed; up to 64 bytes, no
+  `/` or control characters, not `.` or `..`), the settings fields and
+  optionally `voice_prompt` (unknown fields are a `400`); `409` if the name
+  is taken.
+- `PUT /api/profiles/<name>` — replace a profile's settings; the body has
+  only the settings fields and optionally `voice_prompt`, which keeps its
+  value when absent. Profiles can't be renamed.
+- `POST /api/profiles/voice-prompt/generate` — suggest a voice prompt:
+  `{"model", "system_prompt"}` → `{"voice_prompt"}`. `""` means the server's
+  default model or the built-in system prompt; an unknown model is a `400`.
+  A model of the same provider and account writes it from the system prompt
+  alone; nothing is saved. `502` if it fails.
+- `POST /api/profiles/<name>/default` — make it the default profile.
+- `POST /api/profiles/<name>/restore` — restore a built-in's current shipped
+  settings and voice prompt, re-enabling automatic updates. Returns the
+  profile; `400` for a custom profile, `404` if missing. Default selection
+  and existing conversations are unchanged.
+- `DELETE /api/profiles/<name>` — `409` for the default profile.
+- `GET /api/system-prompt` — the built-in template and the variables a
+  template can use: `{"template", "variables": [{"name", "description"}]}`.
+  Templates are rendered with `missingkey=error` and checked on save, with
+  every optional variable both set and unset (outside a git repository,
+  `.GitInfo` is nil); a template that fails is a `400` saying where and why,
+  e.g. `Invalid system_prompt: line 2: unknown variable .Nope`.
+- `POST /api/system-prompt/check` — check a template as a save would:
+  `{"template"}` → `{"error": null}` or
+  `{"error": {"line", "column", "message"}}`, the line and the column (in
+  characters) counted from 1 and left out when unknown.
+
 ### Shell
 
 - `WS /api/exec-ws?cwd=` — websocket for an interactive shell session.
@@ -299,7 +428,6 @@ fresh reset event.
 
 ### Debug
 
-- `GET /debug/conversations` — HTML dump of the conversation list.
-- `GET /debug/conversation-stream` — HTML viewer over the patch stream.
+- `GET /debug/` — index of the debug pages.
 - `GET /debug/conversation-stream/history` — JSON dump of the last 100
   patch events.

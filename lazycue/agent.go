@@ -148,7 +148,9 @@ type runStepsInput struct {
 	Final bool `json:"final,omitempty"`
 }
 
-type screenshotInput struct{}
+type screenshotInput struct {
+	Tab string `json:"tab"`
+}
 
 type gitCommandInput struct {
 	Command string `json:"command"`
@@ -180,6 +182,9 @@ Available DSL actions:
 - assert_title: {"action": "assert_title", "text": "..."}
 - assert_count: {"action": "assert_count", "selector": "...", "count": 3}
 - sleep: {"action": "sleep", "timeout": "1s"}
+- close_tab: {"action": "close_tab", "tab": "B"} - Close a tab opened by an earlier step, as a user would.
+
+TABS: any step may add "tab": "<name>" to act in another tab of the same browser profile — like a user with two tabs open, the tabs share localStorage, cookies and IndexedDB but have their own windows. The tab the browser started with has no name: steps without "tab" act in it, and a description's "this tab", "the first tab" or "tab A" means it, so never give it a name (a navigate with a new name opens ANOTHER tab). A navigate step with a not-yet-open tab name opens that tab; {"action": "navigate", "tab": "B"} with no url opens it on the page the first tab is currently on (use this for a URL the app assigned, like a conversation's /c/<slug>). When a description says "in tab B" or "another tab", use this rather than iframes or window.open.
 
 WORKFLOW:
 1. Start by navigating to the appropriate page.
@@ -283,7 +288,7 @@ func buildTools() []apiTool {
 	return []apiTool{
 		{
 			Name:        "run_steps",
-			Description: "Execute an array of DSL test steps against the browser. Returns structured results showing which step passed/failed and why. The browser is reset to a clean state before execution. Use this to test your generated DSL. When you have the COMPLETE test that exercises everything in the description and it passes, call run_steps one last time with \"final\": true to submit it for caching.",
+			Description: "Execute an array of DSL test steps against the browser. Returns structured results showing which step passed/failed and why. The browser keeps its state between runs (only tabs opened by steps are closed), while a cached run starts from a fresh browser, so the final steps must not depend on an earlier run. Use this to test your generated DSL. When you have the COMPLETE test that exercises everything in the description and it passes, call run_steps one last time with \"final\": true to submit it for caching.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
 				"properties": {
@@ -305,7 +310,12 @@ func buildTools() []apiTool {
 			Description: "Take a screenshot of the current page state. Returns the screenshot as a base64-encoded PNG image. Use this to see what the page looks like.",
 			InputSchema: json.RawMessage(`{
 				"type": "object",
-				"properties": {},
+				"properties": {
+					"tab": {
+						"type": "string",
+						"description": "Name of the tab to capture, as used in steps' \"tab\" field. Omit for the tab the browser started with."
+					}
+				},
 				"required": []
 			}`),
 		},
@@ -547,8 +557,17 @@ func RunAgent(ctx context.Context, cfg *AgentConfig) (*AgentResult, error) {
 				toolResults = append(toolResults, makeToolResult(tu.ID, sb.String()))
 
 			case "screenshot":
-				logf("tool: screenshot")
-				png, err := cfg.Browser.Screenshot(ctx)
+				var input screenshotInput
+				if err := json.Unmarshal(tu.Input, &input); err != nil {
+					toolResults = append(toolResults, makeToolResult(tu.ID, fmt.Sprintf("Error parsing input: %v", err)))
+					continue
+				}
+				if input.Tab == "" {
+					logf("tool: screenshot")
+				} else {
+					logf("tool: screenshot tab %s", input.Tab)
+				}
+				png, err := cfg.Browser.Screenshot(ctx, input.Tab)
 				if err != nil {
 					toolResults = append(toolResults, makeToolResult(tu.ID, fmt.Sprintf("Screenshot failed: %v", err)))
 					continue

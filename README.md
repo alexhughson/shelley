@@ -1,5 +1,7 @@
 # Shelley: a coding agent for exe.dev
 
+[shelley.dev](https://shelley.dev/)
+
 Shelley is a mobile-friendly, web-based, multi-conversation, multi-modal,
 multi-model, single-user coding agent built for but not exclusive to
 [exe.dev](https://exe.dev/). It does not come with authorization or sandboxing:
@@ -54,6 +56,15 @@ with Vue 3 + PrimeVue for the UI.
 The data model is that Conversations have Messages, which might be from the
 user, the model, the tools, or the harness. All of that is stored in the
 database, and we use a SSE endpoint to keep the UI updated. 
+
+A profile's `idle_compaction_minutes` makes its top-level conversations compact
+once idle that long after a turn: an idle nudge starts a turn in which the agent
+compacts its own context with `compact_in_place`, which must be on (as it is by
+default).
+The nudge's mechanics are global; `idle_compaction_prompt` adds the profile's
+guidance on what to keep.
+New input cancels the pending timer. `cache_keep_warm_minutes` keeps the
+provider prompt cache warm while the conversation is idle.
 
 # History
 

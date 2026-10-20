@@ -45,8 +45,10 @@ type TerminalSession struct {
 	// global. On the wire this is represented as null (see terminalDTO); the
 	// "" <-> null conversion happens only in terminalDTO and in the scope
 	// handler.
-	ConversationID string    `json:"conversation_id"`
-	CreatedAt      time.Time `json:"created_at"`
+	ConversationID string `json:"conversation_id"`
+	// CloseOnExit closes the UI tab on a confirmed child exit, regardless of code.
+	CloseOnExit bool      `json:"close_on_exit"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // SpawnerFunc starts the legacy dtach server used by tests and compatibility
@@ -68,12 +70,10 @@ type TerminalSessions struct {
 	attachMu sync.Mutex
 }
 
-// NewTerminalSessions opens (or creates) a sessions directory and reaps any
-// stale records left over from previous runs.
+// NewTerminalSessions opens a sessions directory and reaps any stale records
+// left over from previous runs. The directory is created on first Spawn, so
+// a server that never opens a terminal leaves nothing on disk.
 func NewTerminalSessions(dir string, logger *slog.Logger) (*TerminalSessions, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("terminals: mkdir %s: %w", dir, err)
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("terminals: locate shelley executable: %w", err)
@@ -178,18 +178,28 @@ func (t *TerminalSessions) Get(id string) *TerminalSession {
 	return t.sessions[id]
 }
 
+// terminalCwd returns cwd if it names an existing directory. Otherwise
+// (empty, deleted, or not a directory) it returns the server's working
+// directory, or / if that is unavailable.
+func terminalCwd(cwd string) string {
+	if info, err := os.Stat(cwd); err == nil && info.IsDir() {
+		return cwd
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return "/"
+}
+
 // Spawn launches a new persistent session and immediately attaches to it.
 // Production sessions use exe-scroll; tests can set a legacy dtach spawner.
-func (t *TerminalSessions) Spawn(command, cwd, conversationID string, cols, rows uint16, extraEnv []string) (*TerminalSession, terminalClient, error) {
+func (t *TerminalSessions) Spawn(command, cwd, conversationID string, closeOnExit bool, cols, rows uint16, extraEnv []string) (*TerminalSession, terminalClient, error) {
 	if command == "" {
 		return nil, nil, errors.New("terminals: empty command")
 	}
-	if cwd == "" {
-		if wd, err := os.Getwd(); err == nil {
-			cwd = wd
-		} else {
-			cwd = "/"
-		}
+	cwd = terminalCwd(cwd)
+	if err := os.MkdirAll(t.dir, 0o700); err != nil {
+		return nil, nil, fmt.Errorf("terminals: mkdir %s: %w", t.dir, err)
 	}
 	id, err := newTerminalID()
 	if err != nil {
@@ -198,12 +208,12 @@ func (t *TerminalSessions) Spawn(command, cwd, conversationID string, cols, rows
 	env := append([]string(nil), extraEnv...)
 	env = append(env, "SHELLEY_TERMINAL_ID="+id)
 	if t.spawner != nil {
-		return t.spawnDtach(id, command, cwd, conversationID, cols, rows, env)
+		return t.spawnDtach(id, command, cwd, conversationID, closeOnExit, cols, rows, env)
 	}
-	return t.spawnExeScroll(id, command, cwd, conversationID, cols, rows, env)
+	return t.spawnExeScroll(id, command, cwd, conversationID, closeOnExit, cols, rows, env)
 }
 
-func (t *TerminalSessions) spawnDtach(id, command, cwd, conversationID string, cols, rows uint16, env []string) (*TerminalSession, terminalClient, error) {
+func (t *TerminalSessions) spawnDtach(id, command, cwd, conversationID string, closeOnExit bool, cols, rows uint16, env []string) (*TerminalSession, terminalClient, error) {
 	socket := filepath.Join(t.dir, id+".sock")
 	logFile := filepath.Join(t.dir, id+".log")
 	pid, err := t.spawner(socket, logFile, cwd, command, cols, rows, env)
@@ -223,6 +233,7 @@ func (t *TerminalSessions) spawnDtach(id, command, cwd, conversationID string, c
 		LogFile:        logFile,
 		PID:            pid,
 		ConversationID: conversationID,
+		CloseOnExit:    closeOnExit,
 		CreatedAt:      time.Now().UTC(),
 	}
 	if err := t.writeSession(sess); err != nil {
@@ -246,7 +257,7 @@ mv -f "$exit_tmp" "$3" || exit 125
 exit "$status"
 `
 
-func (t *TerminalSessions) spawnExeScroll(id, command, cwd, conversationID string, cols, rows uint16, extraEnv []string) (*TerminalSession, terminalClient, error) {
+func (t *TerminalSessions) spawnExeScroll(id, command, cwd, conversationID string, closeOnExit bool, cols, rows uint16, extraEnv []string) (*TerminalSession, terminalClient, error) {
 	socket := filepath.Join(t.dir, id+".sock")
 	pidFile := t.serverPIDFile(id)
 	exitFile := t.exitFile(id)
@@ -286,6 +297,7 @@ func (t *TerminalSessions) spawnExeScroll(id, command, cwd, conversationID strin
 		PID:            pid,
 		Engine:         terminalEngineExeScroll,
 		ConversationID: conversationID,
+		CloseOnExit:    closeOnExit,
 		CreatedAt:      time.Now().UTC(),
 	}
 	if err := t.writeSession(sess); err != nil {

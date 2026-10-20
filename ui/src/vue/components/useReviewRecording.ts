@@ -4,6 +4,7 @@
 // accepted the `/transcription` command that hands them to the server.
 import { onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
 import { api } from "../../services/api";
+import { keepDraftThroughPromotion, loadCachedDraft } from "../../services/draftCache";
 import { SLASH_COMMANDS } from "../../utils/slashCommands";
 import {
   startReviewCapture,
@@ -13,15 +14,27 @@ import {
   type ReviewEvent,
 } from "./reviewCapture";
 import { startRecordingMeter } from "./recordingMeter";
-import { ReviewRecordingStore, type ReviewSession } from "./reviewRecordingStore";
+import {
+  ReviewRecordingStore,
+  type NewReviewConversation,
+  type ReviewSession,
+} from "./reviewRecordingStore";
 
 export type ReviewRecordingPhase = "idle" | "starting" | "recording" | "stopping" | "sending";
 
 const WAVEFORM_BARS = 10;
-const EMPTY_STATE: ReviewCaptureState = { pointer: "", selection: "", screen: "", view: "" };
+const EMPTY_STATE: ReviewCaptureState = {
+  pointer: "",
+  pointerText: "",
+  selection: "",
+  screen: "",
+  view: "",
+};
 
 interface ActiveRecording {
   id: string;
+  // The page's draft, once it has one; the recording goes there.
+  draft?: string;
   t0: number;
   recorder: MediaRecorder;
   stream: MediaStream;
@@ -104,11 +117,32 @@ function saveFile(name: string, blob: Blob) {
   window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
+// A recording made outside a live conversation goes to the page's draft,
+// promoted with the page's settings; once the page has moved on (or after a
+// reload), to the draft it had, else to a draft of its own made with the
+// settings taken at start.
+export interface ReviewConversationStart {
+  settings: NewReviewConversation;
+  // The page's draft, while the page is the one recording began on.
+  draft: () => string | undefined;
+  // That draft, created if need be, and the page's settings now; undefined
+  // once the page has moved on or if it is archived.
+  resolve: (
+    cwd: string,
+  ) => Promise<{ conversationId: string; settings: NewReviewConversation } | undefined>;
+}
+
 export function useReviewRecording(options: {
   root: () => HTMLElement | null;
   context: ReviewContext;
   cwd: () => string;
+  // Where recordings go: the live conversation, else one started by
+  // startConversation (which may throw, e.g. without a model).
   conversationId: () => string | undefined;
+  startConversation: () => ReviewConversationStart | undefined;
+  // Called as a send begins; the result shows a conversation the recording
+  // started, unless the user has moved on since.
+  followConversation: () => (conversationId: string) => void;
 }) {
   const phase = ref<ReviewRecordingPhase>("idle");
   const error = ref("");
@@ -117,6 +151,9 @@ export function useReviewRecording(options: {
   const levels = ref<number[]>(Array.from({ length: WAVEFORM_BARS }, () => 0.15));
   const current = ref<ReviewCaptureState>(EMPTY_STATE);
   const pending = shallowRef<ReviewSession[]>([]);
+  // Whether the recording in progress starts a conversation.
+  const startsConversation = ref(false);
+  const starters = new Map<string, ReviewConversationStart>();
   let active: ActiveRecording | null = null;
   let sentTimer: number | null = null;
   let disposed = false;
@@ -158,7 +195,10 @@ export function useReviewRecording(options: {
   async function start() {
     const root = options.root();
     const conversationId = options.conversationId();
-    if (phase.value !== "idle" || !root || !conversationId) return;
+    if (phase.value !== "idle" || !root) return;
+    const starter = conversationId ? undefined : options.startConversation();
+    if (!conversationId && !starter) return;
+    startsConversation.value = !!starter;
     phase.value = "starting";
     error.value = "";
     sent.value = false;
@@ -195,6 +235,7 @@ export function useReviewRecording(options: {
       });
       const recording: ActiveRecording = {
         id,
+        draft: starter?.draft(),
         t0,
         recorder: media,
         stream,
@@ -218,6 +259,7 @@ export function useReviewRecording(options: {
         enqueue(recording, async () =>
           store().appendChunk(id, seq, await data.arrayBuffer(), durationMs),
         );
+        pinDraft(recording);
       };
       const interrupt = (reason: string) => () => stop(reason).catch(fail);
       media.onerror = interrupt("The microphone recorder failed; what was recorded is saved.");
@@ -229,11 +271,14 @@ export function useReviewRecording(options: {
         );
       }
       active = recording;
+      if (starter) starters.set(id, starter);
       enqueue(recording, () =>
         store().create({
           id,
           cwd: options.cwd(),
-          conversationId,
+          ...(starter
+            ? { newConversation: starter.settings, conversationId: recording.draft }
+            : { conversationId }),
           mimeType: media.mimeType || "audio/webm",
           startedAt: new Date(performance.timeOrigin + t0).toISOString(),
           durationMs: 0,
@@ -262,11 +307,11 @@ export function useReviewRecording(options: {
     }
   }
 
-  // Ends capture. Without an interruption reason the recording is sent;
-  // otherwise it stays saved and listed as unsent.
-  async function stop(interruption?: string) {
+  // Ends capture and waits until everything recorded is saved; null if no
+  // recording is active or it is already ending.
+  async function finish() {
     const recording = active;
-    if (!recording || recording.stopping) return;
+    if (!recording || recording.stopping) return null;
     recording.stopping = true;
     phase.value = "stopping";
     const durationMs = performance.now() - recording.t0;
@@ -284,11 +329,21 @@ export function useReviewRecording(options: {
     recording.stream.getTracks().forEach((track) => track.stop());
     recording.stopMeter();
     levels.value = levels.value.map(() => 0.15);
+    pinDraft(recording);
     enqueue(recording, () => store().update(recording.id, { durationMs }));
     await recording.writes.catch(() => {});
     active = null;
     current.value = EMPTY_STATE;
-    const problem = interruption ?? recording.storageError ?? captureError;
+    return { recording, problem: recording.storageError ?? captureError };
+  }
+
+  // Ends capture. Without an interruption reason the recording is sent;
+  // otherwise it stays saved and listed as unsent.
+  async function stop(interruption?: string) {
+    const finished = await finish();
+    if (!finished) return;
+    const { recording } = finished;
+    const problem = interruption ?? finished.problem;
     if (problem) {
       await recording.release();
       phase.value = "idle";
@@ -299,12 +354,28 @@ export function useReviewRecording(options: {
     await send(recording.id, recording.release);
   }
 
+  // Ends capture and throws the recording away.
+  async function cancel() {
+    const finished = await finish();
+    if (!finished) return;
+    try {
+      await store().delete(finished.recording.id);
+      starters.delete(finished.recording.id);
+      error.value = "";
+    } finally {
+      await finished.recording.release();
+      phase.value = "idle";
+      await refreshPending();
+    }
+  }
+
   // Uploads the audio and its events (each at most once), then hands the
   // recording to its conversation. `release` is the session's lock when the
   // caller already holds it.
   async function send(id: string, release: Release | null = null) {
     phase.value = "sending";
     error.value = "";
+    const follow = options.followConversation();
     try {
       release ??= await tryLock(id);
       if (!release) throw new Error("This recording is being sent from another tab");
@@ -329,10 +400,60 @@ export function useReviewRecording(options: {
         }
         session = await store().update(id, { eventsPath: path });
       }
-      await api.sendMessage(session.conversationId, {
-        message: `${SLASH_COMMANDS.TRANSCRIPTION.command} ${audioPath}`,
-      });
+      for (let replaced = false; ; replaced = true) {
+        const created = session.newConversation;
+        if (created) {
+          const bound = session.conversationId;
+          const showing = (starter?: ReviewConversationStart) =>
+            starter && (!bound || starter.draft() === bound) ? starter : undefined;
+          // On the page it began on, or (after a reload or a return) on its
+          // draft's page: that draft, with the page's settings now.
+          const starter = showing(starters.get(id)) ?? (bound ? showing(pageStarter()) : undefined);
+          const page = starter ? await starter.resolve(session.cwd) : undefined;
+          if (page) {
+            session = await store().update(id, {
+              conversationId: page.conversationId,
+              newConversation: page.settings,
+            });
+          } else if (!bound) {
+            const draft = await api.createDraft({ draft: "", cwd: session.cwd, ...created });
+            // Kept, so a retry goes to the same conversation.
+            session = await store().update(id, {
+              conversationId: draft.conversation_id,
+              ownsConversation: true,
+            });
+          }
+        }
+        const conversationId = session.conversationId;
+        if (!conversationId) throw new Error("This recording has no conversation to go to");
+        if (session.newConversation) {
+          const destination = await api.getConversationBySlug(conversationId);
+          if (!destination || destination.archived) {
+            // Deleted or archived since it was chosen: start another, once.
+            starters.delete(id);
+            session = await store().update(id, {
+              conversationId: undefined,
+              ownsConversation: undefined,
+            });
+            if (replaced) throw new Error("This recording's conversation is gone");
+            continue;
+          }
+          if (destination.is_draft) keepDraftThroughPromotion(destination);
+        }
+        await api.sendMessage(conversationId, {
+          message: `${SLASH_COMMANDS.TRANSCRIPTION.command} ${audioPath}`,
+          // These promote a draft; a conversation ignores them.
+          ...(session.newConversation && {
+            ...session.newConversation,
+            cwd: session.cwd,
+          }),
+        });
+        break;
+      }
+      const conversationId = session.conversationId!;
       await store().delete(id);
+      starters.delete(id);
+      if (session.newConversation) follow(conversationId);
       sent.value = true;
       if (sentTimer !== null) window.clearTimeout(sentTimer);
       sentTimer = window.setTimeout(() => (sent.value = false), 5000);
@@ -345,6 +466,31 @@ export function useReviewRecording(options: {
     }
   }
 
+  // A draft the recording made and that nobody has written in since, here
+  // or (as far as the server knows) elsewhere.
+  async function dropEmptyDraft(conversationId: string) {
+    if (loadCachedDraft(conversationId)?.value.trim()) return;
+    const draft = await api.getConversationBySlug(conversationId);
+    if (draft?.is_draft && !draft.draft.trim()) await api.deleteConversation(conversationId);
+  }
+
+  // The page's draft takes the recording as soon as there is one (say, made
+  // for a diff comment), so it goes there even after a reload mid-recording.
+  function pinDraft(recording: ActiveRecording) {
+    const draft = starters.get(recording.id)?.draft();
+    if (!draft || draft === recording.draft) return;
+    recording.draft = draft;
+    enqueue(recording, () => store().update(recording.id, { conversationId: draft }));
+  }
+
+  function pageStarter() {
+    try {
+      return options.startConversation();
+    } catch {
+      return undefined;
+    }
+  }
+
   async function retry(session: ReviewSession) {
     if (phase.value === "idle") await send(session.id);
   }
@@ -353,8 +499,15 @@ export function useReviewRecording(options: {
     const release = await tryLock(session.id);
     if (!release) throw new Error("This recording is being sent from another tab");
     try {
+      const saved = await store().get(session.id);
       await store().delete(session.id);
+      starters.delete(session.id);
       error.value = "";
+      if (saved?.ownsConversation && saved.conversationId) {
+        await dropEmptyDraft(saved.conversationId).catch((err) =>
+          console.error("Failed to delete the recording's draft:", err),
+        );
+      }
     } finally {
       await release();
     }
@@ -402,8 +555,10 @@ export function useReviewRecording(options: {
     levels,
     current,
     pending,
+    startsConversation,
     start: () => start().catch(fail),
     stop: () => stop().catch(fail),
+    cancel: () => cancel().catch(fail),
     retry: (session: ReviewSession) => retry(session).catch(fail),
     discard: (session: ReviewSession) => discard(session).catch(fail),
     download: (session: ReviewSession) => download(session).catch(fail),

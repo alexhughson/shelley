@@ -56,7 +56,7 @@ func (t *LLMOneShotTool) llmOneShotInputSchema() string {
 	if len(t.AvailableModels) > 0 {
 		var enumItems []string
 		for _, m := range t.AvailableModels {
-			enumItems = append(enumItems, fmt.Sprintf("%q", m.ID))
+			enumItems = append(enumItems, fmt.Sprintf("%q", m.Name))
 		}
 		modelProp = fmt.Sprintf(`,
     "model": {
@@ -152,23 +152,10 @@ func (t *LLMOneShotTool) run(ctx context.Context, req llmOneShotInput) llm.ToolO
 	// Determine which model to use: explicit choice > conversation's model
 	modelID := t.ModelID
 	if req.Model != "" {
-		if len(t.AvailableModels) > 0 {
-			found := false
-			for _, am := range t.AvailableModels {
-				if am.ID == req.Model {
-					found = true
-					break
-				}
-			}
-			if !found {
-				var ids []string
-				for _, am := range t.AvailableModels {
-					ids = append(ids, am.ID)
-				}
-				return llm.ErrorfToolOut("unknown model %q; available: %s", req.Model, strings.Join(ids, ", "))
-			}
+		var err error
+		if modelID, err = resolveModel(t.AvailableModels, req.Model); err != nil {
+			return llm.ErrorToolOut(err)
 		}
-		modelID = req.Model
 	}
 	if modelID == "" {
 		return llm.ErrorfToolOut("no model specified and no default model configured")

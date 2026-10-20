@@ -307,7 +307,7 @@ func systemPromptSkillNames(t *testing.T, h *TestHarness, subagent bool) []strin
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := h.server.getOrCreateSubagentConversationManager(t.Context(), child.ConversationID); err != nil {
+		if _, err := h.server.getOrCreateConversationManager(t.Context(), child.ConversationID, ""); err != nil {
 			t.Fatal(err)
 		}
 		conversationID = child.ConversationID

@@ -80,7 +80,7 @@ func TestMessagesAreAppendOnly(t *testing.T) {
 				t.Errorf("%s: query %q can modify an existing messages row, but message rows are append-only.\n"+
 					"Browser caches key on (conversation_id, sequence_id) and only ever fetch the tail, so an\n"+
 					"in-place change is never picked up; forks copy rows; a sequence_id is streamed exactly once.\n"+
-					"Record data that arrives later by APPENDING a row (see CreateSlugMessage), never by rewriting one.",
+					"Record data that arrives later by APPENDING a row (see CreateUsageMessage), never by rewriting one.",
 					file, name)
 			}
 		}

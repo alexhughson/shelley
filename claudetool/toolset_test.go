@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"shelley.exe.dev/llm"
+	"shelley.exe.dev/llm/ant"
+	"shelley.exe.dev/llm/oai"
 )
 
 // Mock LLM provider for testing
@@ -275,7 +277,7 @@ func TestNewToolSet_BuildAvailableModelsFreshOnEachCall(t *testing.T) {
 	db := newMockSubagentDB()
 	runner := &mockSubagentRunner{response: "ok"}
 
-	models := []AvailableModel{{ID: "model-a"}}
+	models := []AvailableModel{{Name: "model-a", ID: "model-a"}}
 	calls := 0
 	cfg := ToolSetConfig{
 		LLMProvider:          provider,
@@ -284,8 +286,11 @@ func TestNewToolSet_BuildAvailableModelsFreshOnEachCall(t *testing.T) {
 		SubagentRunner:       runner,
 		SubagentDB:           db,
 		ParentConversationID: "parent",
-		BuildAvailableModels: func() []AvailableModel {
+		BuildAvailableModels: func(parentModelID string) []AvailableModel {
 			calls++
+			if parentModelID != "test-model" {
+				t.Fatalf("BuildAvailableModels parent model = %q, want test-model", parentModelID)
+			}
 			out := make([]AvailableModel, len(models))
 			copy(out, models)
 			return out
@@ -311,7 +316,7 @@ func TestNewToolSet_BuildAvailableModelsFreshOnEachCall(t *testing.T) {
 	}
 
 	// Simulate a custom model being added at runtime.
-	models = append(models, AvailableModel{ID: "model-b", DisplayName: "Model B"})
+	models = append(models, AvailableModel{Name: "model-b", ID: "model-b"})
 
 	ts2 := NewToolSet(t.Context(), cfg)
 	schema2 := findSubagentSchema(ts2)
@@ -335,6 +340,35 @@ func TestNewToolSet_BuildAvailableModelsFreshOnEachCall(t *testing.T) {
 	}
 	if !strings.Contains(schema3, "test-model") {
 		t.Errorf("expected fallback schema to include the provider's model, got: %s", schema3)
+	}
+}
+
+func TestNewToolSetUsesParentAwareModelChoices(t *testing.T) {
+	cfg := ToolSetConfig{
+		LLMProvider:          &mockLLMProvider{},
+		ModelID:              "parent-model",
+		WorkingDir:           "/test",
+		SubagentRunner:       &mockSubagentRunner{},
+		SubagentDB:           &mockSubagentDB{},
+		ParentConversationID: "parent",
+		BuildAvailableModels: func(parentModelID string) []AvailableModel {
+			if parentModelID != "parent-model" {
+				t.Fatalf("BuildAvailableModels parent model = %q, want parent-model", parentModelID)
+			}
+			return []AvailableModel{{Name: "parent-route-model", ID: "parent-route-model"}}
+		},
+	}
+
+	ts := NewToolSet(t.Context(), cfg)
+	schemas := map[string]string{}
+	for _, tool := range ts.Tools() {
+		schemas[tool.Name] = string(tool.InputSchema)
+	}
+	if !strings.Contains(schemas["subagent"], "parent-route-model") {
+		t.Errorf("subagent schema = %q, want parent-route-model", schemas["subagent"])
+	}
+	if !strings.Contains(schemas["llm_one_shot"], "parent-route-model") {
+		t.Errorf("llm_one_shot schema = %q, want parent-route-model", schemas["llm_one_shot"])
 	}
 }
 
@@ -579,21 +613,39 @@ func (p *rawPatchProvider) GetWorkhorseService(modelID string) (llm.Service, err
 	return p.GetService(modelID)
 }
 
+type patchProfileProvider struct {
+	mockLLMProvider
+	service llm.Service
+}
+
+func (p *patchProfileProvider) GetService(string) (llm.Service, error) {
+	return p.service, nil
+}
+
 func TestNewToolSetPatchStrategy(t *testing.T) {
-	boolFn := func(value bool) func() bool { return func() bool { return value } }
 	for _, tt := range []struct {
 		name, want string
+		service    llm.Service
 		simple     bool
 	}{
-		{name: "capable service uses apply_patch", want: "apply_patch"},
-		{name: "capable service overrides simple", simple: true, want: "apply_patch"},
+		{name: "native apply_patch", service: &oai.ResponsesService{ProviderName: "openai", Model: oai.GPT6Sol}, want: "apply_patch"},
+		{name: "GLM 5.2", service: &oai.Service{Model: oai.GLM52Fireworks}, want: "patch", simple: true},
+		{name: "GLM 5.3", service: &oai.Service{Model: oai.GLM53Fireworks}, want: "patch", simple: true},
+		{name: "GLM flash", service: &oai.Service{Model: oai.GLM53FlashFireworks}, want: "patch", simple: true},
+		{name: "GLM alias", service: &oai.Service{Model: oai.GLM}, want: "patch", simple: true},
+		{name: "GLM responses", service: &oai.ResponsesService{ProviderName: "fireworks", Model: oai.GLM53Fireworks}, want: "patch", simple: true},
+		{name: "GLM messages", service: &ant.Service{Model: "z-ai/GLM-5.3"}, want: "patch", simple: true},
+		{name: "Claude", service: &ant.Service{Model: ant.Claude55Sonnet}, want: "patch"},
+		{name: "other chat model", service: &oai.Service{Model: oai.Model{ModelName: "deepseek-v4"}}, want: "patch"},
+		{name: "other responses model", service: &oai.ResponsesService{Model: oai.Model{ModelName: "other"}}, want: "patch"},
+		{name: "unknown service", service: &mockService{}, want: "patch"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ts := NewToolSet(t.Context(), ToolSetConfig{
-				LLMProvider:        &rawPatchProvider{},
-				ModelID:            "test",
-				PatchSimpleEnabled: boolFn(tt.simple),
+				LLMProvider: &patchProfileProvider{service: tt.service},
+				ModelID:     "custom-alias",
 			})
+			defer ts.Cleanup()
 			var patch *llm.Tool
 			for _, tool := range ts.Tools() {
 				if tool.Name == "patch" || tool.Name == "apply_patch" {
@@ -617,6 +669,9 @@ func TestNewToolSetPatchStrategy(t *testing.T) {
 				if hasEdits != tt.simple {
 					t.Fatalf("edits present = %v, want %v", hasEdits, tt.simple)
 				}
+				if _, hasPatches := schema.Properties["patches"]; hasPatches == tt.simple {
+					t.Fatalf("patches present = %v, want %v", hasPatches, !tt.simple)
+				}
 			}
 		})
 	}
@@ -624,18 +679,18 @@ func TestNewToolSetPatchStrategy(t *testing.T) {
 
 func TestNewToolSetPatchStrategyUnsupportedService(t *testing.T) {
 	for _, tt := range []struct {
-		name, property string
-		simple         bool
+		name     string
+		provider LLMServiceProvider
 	}{
-		{name: "nested", property: "patches"},
-		{name: "simple", property: "edits", simple: true},
+		{name: "no provider"},
+		{name: "unknown service", provider: &mockLLMProvider{}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ts := NewToolSet(t.Context(), ToolSetConfig{
-				LLMProvider:        &mockLLMProvider{},
-				ModelID:            "test-model",
-				PatchSimpleEnabled: func() bool { return tt.simple },
+				LLMProvider: tt.provider,
+				ModelID:     "glm-looking-alias",
 			})
+			defer ts.Cleanup()
 			for _, tool := range ts.Tools() {
 				if tool.Name == "apply_patch" {
 					t.Fatal("unsupported service received apply_patch")
@@ -647,8 +702,8 @@ func TestNewToolSetPatchStrategyUnsupportedService(t *testing.T) {
 					if err := json.Unmarshal(tool.InputSchema, &schema); err != nil {
 						t.Fatal(err)
 					}
-					if _, ok := schema.Properties[tt.property]; !ok {
-						t.Fatalf("unsupported service missing %q patch schema", tt.property)
+					if _, ok := schema.Properties["patches"]; !ok {
+						t.Fatal("unsupported service missing nested patch schema")
 					}
 					return
 				}

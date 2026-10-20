@@ -108,7 +108,9 @@ func Gateway(gatewayURL, anthropicKey, openAIKey, fireworksKey string) Source {
 // DEPRECATED: Per-provider env-var model credentials are frozen. Do NOT add
 // new providers here. New models should be served through the exe.dev LLM
 // gateway or an exe.dev LLM integration (or added as DB-backed custom
-// models) rather than a new direct env-var credential.
+// models) rather than a new direct env-var credential. The one exception is
+// transcription: an OpenAI key also serves recordings (see
+// TranscriptionModels).
 func Env(anthropicKey, openAIKey, geminiKey, fireworksKey string) Source {
 	prov := map[models.Provider]*providerConn{}
 	labels := map[models.Provider]string{}
@@ -231,7 +233,6 @@ func Build(catalog []models.Model, sources []Source, httpc *http.Client, logger 
 				ID:           id,
 				DisplayName:  id,
 				Provider:     m.Provider,
-				Tags:         m.Tags,
 				Source:       label,
 				ReleaseDate:  modelReleaseDate(baseURL, m.APIModelName),
 				Service:      svc,
@@ -245,19 +246,34 @@ func Build(catalog []models.Model, sources []Source, httpc *http.Client, logger 
 	return out
 }
 
-// TranscriptionModels returns the exact audio transcription routes advertised
-// by discovered LLM integrations.
+// TranscriptionModels returns the audio transcription routes the sources
+// serve: those advertised by discovered LLM integrations, plus Shelley's
+// transcription models for any other source with an OpenAI credential.
 func TranscriptionModels(sources []Source) []models.TranscriptionModel {
 	var out []models.TranscriptionModel
 	for _, src := range sources {
-		if src.integration == nil {
+		if src.integration != nil {
+			for _, model := range src.integration.TranscriptionModels {
+				out = append(out, models.TranscriptionModel{
+					Model:    model.apiModelName(),
+					Endpoint: strings.TrimSuffix(src.integration.URL, "/") + "/v1/audio/transcriptions",
+					Source:   src.integration.Host,
+				})
+			}
 			continue
 		}
-		for _, model := range src.integration.TranscriptionModels {
+		conn := src.providers[models.ProviderOpenAI]
+		if conn == nil {
+			continue
+		}
+		baseURL := cmp.Or(conn.baseURL, models.DefaultOpenAIBaseURL)
+		for _, name := range []string{models.TranscriptionTextModel, models.TranscriptionTimestampsModel} {
 			out = append(out, models.TranscriptionModel{
-				Model:    model.apiModelName(),
-				Endpoint: strings.TrimSuffix(src.integration.URL, "/") + "/v1/audio/transcriptions",
-				Source:   src.integration.Host,
+				Model:           name,
+				Endpoint:        baseURL + "/v1/audio/transcriptions",
+				APIKey:          conn.apiKey,
+				Source:          src.labelFor(models.ProviderOpenAI),
+				FromCredentials: true,
 			})
 		}
 	}
@@ -345,11 +361,34 @@ func providerStrippedIntegrationID(id string) string {
 }
 
 func buildIntegrationService(catalog []models.Model, model IntegrationModel, baseURL string, httpc *http.Client) (models.APIType, llm.Service, bool) {
+	api, service, ok := newIntegrationService(catalog, model, baseURL, httpc)
+	if !ok {
+		return "", nil, false
+	}
+	// Each (model, integration URL) gets its own service and its own controls.
+	if caps := model.reasoningOverride(); caps != nil {
+		configurable, ok := service.(interface {
+			SetReasoningOverride(*modelsdev.ReasoningCapabilities)
+		})
+		if !ok {
+			slog.Warn("Integration service cannot configure reasoning", "model", model.ID)
+			return "", nil, false
+		}
+		configurable.SetReasoningOverride(caps)
+	}
+	return api, service, true
+}
+
+func newIntegrationService(catalog []models.Model, model IntegrationModel, baseURL string, httpc *http.Client) (models.APIType, llm.Service, bool) {
 	modelName := model.apiModelName()
 	if modelName == "" {
 		return "", nil, false
 	}
-	if catalogModel, ok := compatibleCatalogModel(catalog, model); ok {
+	catalogModel, hasCatalog := compatibleCatalogModel(catalog, model)
+	override, hasOverride := integrationUpstreamAPIType(model)
+	// Catalog Build stays unless an explicit protocol override disagrees.
+	// ID matching ignores that override so published ids do not change.
+	if hasCatalog && (!hasOverride || catalogModel.APIType == override) {
 		return catalogModel.APIType, catalogModel.Build(baseURL, "implicit", httpc), true
 	}
 	apiType, ok := integrationAPIType(model)
@@ -390,6 +429,8 @@ func buildIntegrationService(catalog []models.Model, model IntegrationModel, bas
 	}
 }
 
+// compatibleCatalogModel matches provider and native name only.
+// upstream.api_type chooses the client later and must not rename the published id.
 func compatibleCatalogModel(catalog []models.Model, integrationModel IntegrationModel) (models.Model, bool) {
 	modelName := integrationModel.apiModelName()
 	for _, catalogModel := range catalog {
@@ -417,10 +458,23 @@ func integrationAdvertisesAPI(model IntegrationModel, apiType models.APIType) bo
 	return slices.Contains(model.APIs, api)
 }
 
-// integrationAPIType picks the wire protocol for an integration model.
-// Providers that serve multiple protocols (e.g. Fireworks) advertise both
-// OpenAI and Anthropic APIs; prefer the more common OpenAI protocol.
+// integrationUpstreamAPIType honors an explicit upstream protocol only when
+// Shelley supports it and the integration advertises that API. A proxy may
+// advertise every API globally while each native model only accepts one.
+func integrationUpstreamAPIType(model IntegrationModel) (models.APIType, bool) {
+	if model.Upstream == nil {
+		return "", false
+	}
+	apiType := models.APIType(model.Upstream.APIType)
+	return apiType, integrationAdvertisesAPI(model, apiType)
+}
+
+// integrationAPIType picks the endpoint's explicit upstream protocol first.
+// Without one, retain the established preference for OpenAI protocols.
 func integrationAPIType(model IntegrationModel) (models.APIType, bool) {
+	if apiType, ok := integrationUpstreamAPIType(model); ok {
+		return apiType, true
+	}
 	if slices.Contains(model.APIs, "openai_responses") {
 		return models.APITypeOpenAIResponses, true
 	}
@@ -450,10 +504,49 @@ type IntegrationModel struct {
 	APIs         []string                     `json:"apis,omitempty"`
 	Architecture IntegrationModelArchitecture `json:"architecture,omitempty"`
 	ExeDev       IntegrationModelExeDev       `json:"exe_dev"`
+	Upstream     *IntegrationModelUpstream    `json:"upstream,omitempty"`
 }
 
 type IntegrationModelExeDev struct {
 	Mode string `json:"mode"`
+}
+
+// IntegrationModelUpstream describes one model's controls at the integration's
+// endpoint. It applies neither to other models there nor to this model elsewhere.
+type IntegrationModelUpstream struct {
+	APIType           string   `json:"api_type,omitempty"`
+	SupportsReasoning *bool    `json:"supports_reasoning,omitempty"`
+	ReasoningLevels   []string `json:"reasoning_levels,omitempty"`
+}
+
+func (m IntegrationModel) reasoningOverride() *modelsdev.ReasoningCapabilities {
+	u := m.Upstream
+	if u == nil {
+		return nil
+	}
+	if u.SupportsReasoning != nil && !*u.SupportsReasoning {
+		return &modelsdev.ReasoningCapabilities{}
+	}
+	// Support alone does not specify controls. Keep the catalog's Build,
+	// defaults, and capability lookup untouched unless levels are explicit.
+	if u.ReasoningLevels == nil {
+		return nil
+	}
+	caps := &modelsdev.ReasoningCapabilities{}
+	for _, name := range u.ReasoningLevels {
+		level := llm.ParseThinkingLevel(name)
+		// Fail closed only for an explicit unsupported effort protocol.
+		if level == llm.ThinkingLevelDefault || level.Name() != name {
+			slog.Warn("Unsupported integration reasoning controls", "model", m.ID, "levels", u.ReasoningLevels)
+			return &modelsdev.ReasoningCapabilities{}
+		}
+		if !slices.Contains(caps.Levels, level) {
+			caps.Levels = append(caps.Levels, level)
+		}
+	}
+	slices.Sort(caps.Levels)
+	caps.Supported = len(caps.Levels) > 0
+	return caps
 }
 
 type IntegrationModelArchitecture struct {

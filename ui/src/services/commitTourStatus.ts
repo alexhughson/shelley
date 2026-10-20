@@ -14,11 +14,8 @@ interface CanonicalEntry {
 
 type Listener = (status: GitTourBuildStatus) => void;
 export interface CommitTourRequest {
-  conversationId: string;
   cwd: string;
   hash: string;
-  path: string;
-  startedAt: number;
 }
 
 type RequestListener = (request: CommitTourRequest) => void;
@@ -146,14 +143,8 @@ export function subscribeCommitTourRequests(listener: RequestListener): () => vo
   return () => requestListeners.delete(listener);
 }
 
-export function announceCommitTourRequest(
-  conversationId: string,
-  cwd: string,
-  hash: string,
-  path: string,
-  startedAt: number,
-) {
-  for (const listener of requestListeners) listener({ conversationId, cwd, hash, path, startedAt });
+export function announceCommitTourRequest(cwd: string, hash: string) {
+  for (const listener of requestListeners) listener({ cwd, hash });
 }
 
 export async function loadCommitTourStatus(
@@ -187,13 +178,9 @@ export async function requestCommitTour(
   cwd: string,
   hash: string,
 ): Promise<GitTourBuildStatus> {
-  const path = window.location.pathname;
-  const startedAt = performance.now();
   const status = await api.requestGitTour(conversationId, cwd, hash);
   const published = publish(commitTourStatusKey(cwd, hash), status);
-  if (published.status === "building") {
-    announceCommitTourRequest(conversationId, cwd, published.hash, path, startedAt);
-  }
+  if (published.status === "building") announceCommitTourRequest(cwd, published.hash);
   return published;
 }
 

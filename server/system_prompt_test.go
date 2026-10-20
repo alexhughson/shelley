@@ -197,6 +197,17 @@ func TestSystemPromptIncludesUserEmail(t *testing.T) {
 	}
 }
 
+func TestSystemPromptExplainsSandboxDownloadLinks(t *testing.T) {
+	t.Parallel()
+	prompt, err := GenerateSystemPrompt(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, "](sandbox:/") {
+		t.Error("system prompt should explain sandbox: download links")
+	}
+}
+
 // TestSystemPromptDeduplicatesIdenticalGuidanceFiles verifies that when multiple
 // user-level AGENTS.md files have identical content (or are symlinks to the same
 // file), only one copy appears in the system prompt.
@@ -840,10 +851,10 @@ func TestSubagentSystemPromptKeepsStableSkillsFirst(t *testing.T) {
 	DBPath = "/tmp/shelley-test.db"
 	t.Cleanup(func() { DBPath = oldDBPath })
 
-	prompt, _, err := generateSubagentSystemPromptWithIntegrationSkills(t.TempDir(), []skills.Skill{{
+	prompt, _, err := generateSubagentSystemPromptWithIntegrationSkills(t.TempDir(), true, []skills.Skill{{
 		Name:        "stable-prefix",
 		Description: "Keep reusable guidance first.",
-	}})
+	}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -907,7 +918,7 @@ func TestRunEndOfTurnHookNoHook(t *testing.T) {
 func TestRunEndOfTurnHookReceivesJSON(t *testing.T) {
 	// Use an explicit per-test hooks dir rather than t.Setenv("HOME"):
 	// $HOME is process-wide and other tests in this package fire the
-	// end-of-turn hook in background goroutines (via RunEndOfTurnHook
+	// end-of-turn hook in background goroutines (via RunEndOfTurnHookIn
 	// at end-of-turn in predictable-model conversations). Those would
 	// race with this test's hook script and clobber dumpFile.
 	hooksDir := t.TempDir()
@@ -1197,7 +1208,7 @@ func TestIntegrationSkillSnapshotIncludedInTopLevelAndSubagentPrompts(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	subagent, subSkills, err := generateSubagentSystemPromptWithIntegrationSkills(workingDir, integrationSkills)
+	subagent, subSkills, err := generateSubagentSystemPromptWithIntegrationSkills(workingDir, true, integrationSkills, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1211,5 +1222,35 @@ func TestIntegrationSkillSnapshotIncludedInTopLevelAndSubagentPrompts(t *testing
 	}
 	if len(subSkills) == 0 || subSkills[0].Name != "remote-release" {
 		t.Fatalf("subagent prompt skills = %+v", subSkills)
+	}
+}
+
+// TestSystemPromptListsMCPServers verifies the registered MCP servers appear
+// in the system prompt with their descriptions.
+func TestSystemPromptListsMCPServers(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+
+	// No servers: no block.
+	prompt, _, err := generateSystemPrompt(tmpDir)
+	if err != nil {
+		t.Fatalf("generateSystemPrompt: %v", err)
+	}
+	if strings.Contains(prompt, "<mcp_servers>") {
+		t.Fatalf("mcp_servers block present with no servers:\n%s", prompt)
+	}
+
+	// With servers: names and descriptions listed.
+	prompt, _, err = generateSystemPrompt(tmpDir, WithMCPServers([]MCPServerInfo{
+		{Name: "linear", Description: "issue tracker"},
+		{Name: "bare", Description: ""},
+	}))
+	if err != nil {
+		t.Fatalf("generateSystemPrompt: %v", err)
+	}
+	for _, want := range []string{"<mcp_servers>", "shelley mcp", "- linear: issue tracker", "- bare\n", "</mcp_servers>"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
 	}
 }

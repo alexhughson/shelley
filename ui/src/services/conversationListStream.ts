@@ -38,26 +38,50 @@ function getAt(doc: unknown, path: string): unknown {
   return cur;
 }
 
-function encodePointer(parts: string[]): string {
-  if (parts.length === 0) return "";
-  return `/${parts.map((part) => part.replace(/~/g, "~0").replace(/\//g, "~1")).join("/")}`;
-}
-
-function parentAndKey(doc: unknown, path: string): { parent: unknown; key: string } {
+// ownedParent walks to the parent of `path`, copying each container on the way
+// that this patch hasn't copied yet. Untouched rows keep their identity, so the
+// drawer only re-renders rows a patch actually changed.
+function ownedParent(
+  doc: unknown,
+  path: string,
+  owned: Set<unknown>,
+): { parent: unknown; key: string } {
   const parts = decodePointer(path);
   if (parts.length === 0) {
     throw new Error("root path has no parent");
   }
-  return {
-    parent: parts.length === 1 ? doc : getAt(doc, encodePointer(parts.slice(0, -1))),
-    key: parts[parts.length - 1],
-  };
+  let cur = doc;
+  for (const part of parts.slice(0, -1)) {
+    let child: unknown;
+    if (Array.isArray(cur)) {
+      const idx = Number(part);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= cur.length) {
+        throw new Error(`bad array index in patch path: ${path} (len=${cur.length})`);
+      }
+      child = cur[idx];
+    } else if (cur !== null && typeof cur === "object") {
+      child = (cur as Record<string, unknown>)[part];
+    } else {
+      throw new Error(`cannot traverse patch path: ${path}`);
+    }
+    if (child !== null && typeof child === "object" && !owned.has(child)) {
+      child = Array.isArray(child) ? child.slice() : { ...child };
+      owned.add(child);
+      (cur as Record<string, unknown>)[part] = child;
+    }
+    cur = child;
+  }
+  return { parent: cur, key: parts[parts.length - 1] };
 }
 
-function setAt(doc: unknown, path: string, value: unknown, mustExist: boolean): unknown {
-  if (path === "") return cloneValue(value);
-  const { parent, key } = parentAndKey(doc, path);
-  const nextValue = cloneValue(value);
+function setAt(
+  doc: unknown,
+  path: string,
+  value: unknown,
+  mustExist: boolean,
+  owned: Set<unknown>,
+): void {
+  const { parent, key } = ownedParent(doc, path, owned);
   if (Array.isArray(parent)) {
     const idx = Number(key);
     if (!Number.isInteger(idx) || idx < 0 || idx > parent.length) {
@@ -67,39 +91,39 @@ function setAt(doc: unknown, path: string, value: unknown, mustExist: boolean): 
       throw new Error(`array index out of range in patch path: ${path} (len=${parent.length})`);
     }
     if (idx === parent.length) {
-      parent.push(nextValue);
+      parent.push(value);
     } else if (mustExist) {
-      parent[idx] = nextValue;
+      parent[idx] = value;
     } else {
-      parent.splice(idx, 0, nextValue);
+      parent.splice(idx, 0, value);
     }
-    return doc;
+    return;
   }
   if (parent !== null && typeof parent === "object") {
     const obj = parent as Record<string, unknown>;
     if (mustExist && !(key in obj)) {
       throw new Error(`missing object key in patch path: ${path}`);
     }
-    obj[key] = nextValue;
-    return doc;
+    obj[key] = value;
+    return;
   }
   throw new Error(`cannot set patch path: ${path}`);
 }
 
-function removeAt(doc: unknown, path: string): unknown {
+function removeAt(doc: unknown, path: string, owned: Set<unknown>): void {
   if (path === "") throw new Error("cannot remove document root");
-  const { parent, key } = parentAndKey(doc, path);
+  const { parent, key } = ownedParent(doc, path, owned);
   if (Array.isArray(parent)) {
     const idx = Number(key);
     if (!Number.isInteger(idx) || idx < 0 || idx >= parent.length) {
       throw new Error(`bad array index in patch path: ${path} (len=${parent.length})`);
     }
     parent.splice(idx, 1);
-    return doc;
+    return;
   }
   if (parent !== null && typeof parent === "object") {
     delete (parent as Record<string, unknown>)[key];
-    return doc;
+    return;
   }
   throw new Error(`cannot remove patch path: ${path}`);
 }
@@ -121,24 +145,29 @@ export function applyConversationListPatch(
   patch: ConversationListPatchOp[],
 ): ConversationWithState[] {
   const start = performance.now();
-  let doc: unknown = cloneValue(state);
-  perfCount("list.cloneAll", performance.now() - start);
+  let doc: unknown = state.slice();
+  let owned = new Set<unknown>([doc]);
   for (const op of patch) {
     validateOp(op);
+    if (op.path === "" && (op.op === "replace" || op.op === "add")) {
+      doc = cloneValue(op.value);
+      owned = new Set([doc]);
+      continue;
+    }
     switch (op.op) {
       case "replace":
-        doc = setAt(doc, op.path, op.value, op.path !== "");
+        setAt(doc, op.path, cloneValue(op.value), true, owned);
         break;
       case "add":
-        doc = setAt(doc, op.path, op.value, false);
+        setAt(doc, op.path, cloneValue(op.value), false, owned);
         break;
       case "remove":
-        doc = removeAt(doc, op.path);
+        removeAt(doc, op.path, owned);
         break;
       case "move": {
-        const value = cloneValue(getAt(doc, op.from!));
-        doc = removeAt(doc, op.from!);
-        doc = setAt(doc, op.path, value, false);
+        const value = getAt(doc, op.from!);
+        removeAt(doc, op.from!, owned);
+        setAt(doc, op.path, value, false, owned);
         break;
       }
       default: {
@@ -147,6 +176,7 @@ export function applyConversationListPatch(
       }
     }
   }
+  perfCount("list.apply", performance.now() - start);
   if (!Array.isArray(doc)) {
     throw new Error("conversation list patch did not produce an array");
   }

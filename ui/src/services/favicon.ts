@@ -65,6 +65,17 @@ export function setFaviconStatus(status: FaviconStatus): void {
   link.href = "data:image/svg+xml," + encodeURIComponent(newSVG);
 }
 
+// Replace the favicon (e.g. after the emoji changes), keeping the status.
+export function setFaviconHref(href: string): void {
+  const svg = extractSVGFromDataURI(href);
+  const link = getFaviconLink();
+  if (!svg || !link) {
+    return;
+  }
+  originalSVG = svg;
+  link.href = "data:image/svg+xml," + encodeURIComponent(applyStatus(svg, currentStatus));
+}
+
 // Initialize the favicon service (call on app start)
 export function initializeFavicon(): void {
   // Wait a tick for the server-injected favicon to be present

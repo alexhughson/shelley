@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -163,41 +166,96 @@ func TestExecTerminal_WorkingDirectory(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/exec-ws?cmd=pwd&cwd=/tmp"
-
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	wd, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("Failed to dial websocket: %v", err)
+		t.Fatalf("Failed to get working directory: %v", err)
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "test done")
+	existing := t.TempDir()
 
-	// Send init message
-	initMsg := ExecMessage{Type: "init", Cols: 80, Rows: 24}
-	if err := wsjson.Write(ctx, conn, initMsg); err != nil {
-		t.Fatalf("Failed to write init message: %v", err)
-	}
+	for _, tc := range []struct {
+		name     string
+		cwdParam []string
+		want     string
+	}{
+		{
+			name:     "existing",
+			cwdParam: []string{existing},
+			want:     existing,
+		},
+		{
+			name:     "omitted",
+			cwdParam: nil,
+			want:     wd,
+		},
+		{
+			name:     "empty",
+			cwdParam: []string{""},
+			want:     wd,
+		},
+		{
+			name:     "nonexistent",
+			cwdParam: []string{filepath.Join(t.TempDir(), "does-not-exist")},
+			want:     wd,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// pwd -P resolves symlinks (e.g. macOS /var -> /private/var),
+			// so compare it against the resolved path. SHELLEY_CWD is
+			// passed through verbatim.
+			wantReal, err := filepath.EvalSymlinks(tc.want)
+			if err != nil {
+				t.Fatalf("EvalSymlinks(%q): %v", tc.want, err)
+			}
+			cmd := `echo "pwd=$(pwd -P)"; echo "SHELLEY_CWD=$SHELLEY_CWD"`
+			wsURL := url.URL{
+				Scheme:   "ws",
+				Host:     server.Listener.Addr().String(),
+				Path:     "/api/exec-ws",
+				RawQuery: url.Values{"cmd": {cmd}, "cwd": tc.cwdParam}.Encode(),
+			}
 
-	// Read messages
-	var output strings.Builder
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
 
-	for {
-		var msg ExecMessage
-		err := wsjson.Read(ctx, conn, &msg)
-		if err != nil {
-			break
-		}
+			conn, _, err := websocket.Dial(ctx, wsURL.String(), nil)
+			if err != nil {
+				t.Fatalf("Failed to dial websocket: %v", err)
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "test done")
 
-		if msg.Type == "output" {
-			data, _ := base64.StdEncoding.DecodeString(msg.Data)
-			output.Write(data)
-		}
-	}
+			// Send init message
+			initMsg := ExecMessage{Type: "init", Cols: 80, Rows: 24}
+			if err := wsjson.Write(ctx, conn, initMsg); err != nil {
+				t.Fatalf("Failed to write init message: %v", err)
+			}
 
-	if !strings.Contains(output.String(), "/tmp") {
-		t.Errorf("Expected output to contain '/tmp', got: %q", output.String())
+			// Read messages
+			var output strings.Builder
+
+			for {
+				var msg ExecMessage
+				err := wsjson.Read(ctx, conn, &msg)
+				if err != nil {
+					break
+				}
+
+				if msg.Type == "output" {
+					data, _ := base64.StdEncoding.DecodeString(msg.Data)
+					output.Write(data)
+				}
+			}
+
+			// Match whole lines so login-shell profile output can't interfere.
+			lines := strings.Split(output.String(), "\n")
+			for i, l := range lines {
+				lines[i] = strings.TrimSpace(l)
+			}
+			for _, want := range []string{"pwd=" + wantReal, "SHELLEY_CWD=" + tc.want} {
+				if !slices.Contains(lines, want) {
+					t.Errorf("Expected output line %q, got: %q", want, output.String())
+				}
+			}
+		})
 	}
 }
 

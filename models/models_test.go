@@ -78,6 +78,30 @@ func TestSonnet55InBuiltInCatalog(t *testing.T) {
 	}
 }
 
+func TestHaiku55InBuiltInCatalog(t *testing.T) {
+	models := All()
+	for i, m := range models {
+		if m.ID != "claude-haiku-5.5" {
+			continue
+		}
+		if m.Provider != ProviderAnthropic || m.APIModelName != "claude-haiku-5-5" ||
+			m.Description != "Claude Haiku 5.5" || m.APIType != APITypeAnthropicMessages ||
+			m.DefaultBaseURL != DefaultAnthropicBaseURL || m.Build == nil {
+			t.Fatalf("Haiku 5.5 = %+v", m)
+		}
+		for j, old := range models {
+			if old.ID == "claude-haiku-4.5" {
+				if i >= j {
+					t.Fatalf("new Haiku at %d after old Haiku at %d", i, j)
+				}
+				return
+			}
+		}
+		t.Fatal("Claude Haiku 4.5 was removed")
+	}
+	t.Fatal("Claude Haiku 5.5 not in built-in catalog")
+}
+
 func TestIDs(t *testing.T) {
 	ids := IDs()
 	if len(ids) == 0 {
@@ -757,6 +781,21 @@ func TestReasoningServiceMapping(t *testing.T) {
 	}
 	if inner.got != llm.ThinkingLevelMax {
 		t.Fatalf("mapped level = %s, want max", inner.got.Name())
+	}
+}
+
+// Reasoning effort is part of the cache key, so a warm must map it as Do does.
+func TestReasoningServiceWarmsWithMappedLevel(t *testing.T) {
+	inner := predictable.NewService()
+	svc := WrapReasoningConfig(inner, "", "unknown", "yes", `{"minimal":"low"}`)
+	if llm.CacheTTL(svc) != inner.CacheTTL() {
+		t.Fatalf("CacheTTL = %v, want %v", llm.CacheTTL(svc), inner.CacheTTL())
+	}
+	if _, err := llm.WarmCache(t.Context(), svc, &llm.Request{ThinkingLevel: llm.ThinkingLevelMinimal}); err != nil {
+		t.Fatal(err)
+	}
+	if warms := inner.WarmRequests(); len(warms) != 1 || warms[0].ThinkingLevel != llm.ThinkingLevelLow {
+		t.Fatalf("warms = %+v, want one at low", warms)
 	}
 }
 

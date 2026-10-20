@@ -50,13 +50,12 @@ test.describe('Tool Component Verification', () => {
       await expect(card.first().locator('.tool-emoji')).toHaveText(emoji);
     };
 
-    // bash and shell both render the BashTool card, with the command in the header.
-    for (const command of ["echo 'hello from bash'", "echo 'hello from shell'"]) {
-      const bashCard = page.locator('.bash-tool').filter({ hasText: command }).first();
-      await expect(bashCard).toBeAttached();
-      await expect(bashCard.locator('.bash-tool-emoji')).toBeAttached();
-      await expect(bashCard.locator('.bash-tool-command')).toContainText(command);
-    }
+    // bash renders the BashTool card, with the command in the header.
+    const command = "echo 'hello from bash'";
+    const bashCard = page.locator('.bash-tool').filter({ hasText: command }).first();
+    await expect(bashCard).toBeAttached();
+    await expect(bashCard.locator('.bash-tool-emoji')).toBeAttached();
+    await expect(bashCard.locator('.bash-tool-command')).toContainText(command);
 
     // Thinking content appears inline (not a tool card).
     const thinkingContent = page.locator('.thinking-content').filter({ hasText: "I'm thinking about the best approach" });
@@ -322,6 +321,131 @@ test.describe('Tool Component Verification', () => {
     await expect(warnings).toHaveCount(2);
     await expect(warnings.first()).toBeVisible();
     await expect(warnings.last()).toBeVisible();
+  });
+
+  test('browser input errors are labeled and keep the model guidance visible', async ({ page, request }) => {
+    const { conversationId, slug } = await createConversationViaAPIWithDetails(
+      request,
+      'echo: browser input errors',
+    );
+    const response = await request.get(`/api/conversation/${conversationId}`);
+    expect(response.ok()).toBeTruthy();
+    const body = await response.json();
+    const retry = ' · model asked to retry';
+    const missingAction = 'Invalid browser call: missing action';
+    const invalidInput = 'Invalid browser call: input must be a JSON object';
+    const actionType = 'Invalid browser call: action must be a string';
+    const unsupported = (action: string) => `Invalid browser call: unsupported action "${action}"`;
+    // Results mirror the backend's messages; legacy rows come from older builds.
+    const cases: { id: string; input: unknown; label: string; error: boolean; text: string }[] = [
+      { id: 'missing-action', input: { url: 'https://example.com' }, label: missingAction + retry, error: true,
+        text: 'invalid browser call: "action" is required and must be a non-empty string. Choose an action from the browser schema and resend the call.' },
+      { id: 'empty-action', input: { action: '' }, label: missingAction + retry, error: true,
+        text: 'invalid browser call: "action" is required.' },
+      { id: 'legacy-missing', input: { action: '' }, label: missingAction, error: true,
+        text: 'unknown action: ""' },
+      { id: 'string-input', input: '{"action":"eval"}', label: invalidInput + retry, error: true,
+        text: 'invalid browser call: arguments were sent as a quoted JSON string. Decoded arguments: {"action":"eval"}. Resend an unquoted JSON object with a non-empty string "action" and field types matching the browser schema.' },
+      { id: 'malformed-input', input: '{"action":"eval"', label: invalidInput + retry, error: true,
+        text: 'invalid browser call: arguments were not valid JSON.' },
+      { id: 'null-input', input: null, label: invalidInput + retry, error: true,
+        text: 'invalid browser call: arguments were null.' },
+      { id: 'array-input', input: [], label: invalidInput + retry, error: true,
+        text: 'invalid browser call: arguments were a JSON array.' },
+      { id: 'number-action', input: { action: 42 }, label: actionType + retry, error: true,
+        text: 'invalid browser call: "action" must be a string, got 42.' },
+      { id: 'null-action', input: { action: null }, label: actionType + retry, error: true,
+        text: 'invalid browser call: "action" must be a string, got null.' },
+      ...['click', 'emulate_bogus', 'network_bogus', 'accessibility_bogus', 'profile_bogus'].map((action) => ({
+        id: action, input: { action }, label: unsupported(action) + retry, error: true,
+        text: `invalid browser call: unknown action "${action}". Choose an action from the browser schema and resend the call. All supported actions: navigate, eval, screenshot.`,
+      })),
+      { id: 'width-type', input: { action: 'resize', width: 'wide' },
+        label: 'Invalid browser call: wrong field type for resize' + retry, error: true,
+        text: 'invalid browser call: field "width" must be an integer, got a JSON string.' },
+      { id: 'await-type', input: { action: 'eval', expression: 'x', await: 'yes' },
+        label: 'Invalid browser call: wrong field type for eval' + retry, error: true,
+        text: 'invalid browser call: field "await" must be a boolean, got a JSON string.' },
+      { id: 'legacy-unknown', input: { action: 'legacy_bogus' }, label: unsupported('legacy_bogus'), error: true,
+        text: 'unknown action: "legacy_bogus"' },
+    ];
+    // Actions the backend accepted (or failed at runtime) but this UI lacks a
+    // card for are missing UI, which keeps the bug-report warning.
+    const missingUI = [
+      { id: 'new-action-ok', action: 'brand_new_action', error: false, text: 'worked' },
+      { id: 'new-action-failed', action: 'other_new_action', error: true, text: 'failed to start browser' },
+    ];
+    const validFamilies = [
+      { action: 'emulate_help', emoji: '📱' },
+      { action: 'network_help', emoji: '📡' },
+      { action: 'accessibility_help', emoji: '🌳' },
+      { action: 'profile_help', emoji: '📊' },
+    ];
+    const calls = [
+      ...cases.map(({ id, input }) => ({ ID: id, Type: 5, ToolName: 'browser', ToolInput: input })),
+      ...missingUI.map(({ id, action }) => ({ ID: id, Type: 5, ToolName: 'browser', ToolInput: { action } })),
+      { ID: 'valid-action', Type: 5, ToolName: 'browser', ToolInput: { action: 'eval', expression: 'document.title' } },
+      ...validFamilies.map(({ action }) => ({ ID: action, Type: 5, ToolName: 'browser', ToolInput: { action } })),
+    ];
+    const result = (id: string, error: boolean, text: string) => ({
+      Type: 6, ToolUseID: id, ToolError: error, ToolResult: [{ Type: 2, Text: text }],
+    });
+    const results = [
+      ...cases.map(({ id, error, text }) => result(id, error, text)),
+      ...missingUI.map(({ id, error, text }) => result(id, error, text)),
+      result('valid-action', false, 'Fixture title'),
+      ...validFamilies.map(({ action }) => result(action, false, `Fixture ${action}`)),
+    ];
+    body.conversation.agent_working = false;
+    body.messages = [
+      {
+        message_id: 'browser-error-calls', conversation_id: conversationId,
+        sequence_id: 1, type: 'agent', generation: 1, created_at: '2026-10-11T12:00:00Z',
+        llm_data: JSON.stringify({ Role: 1, Content: calls, EndOfTurn: false }),
+      },
+      {
+        message_id: 'browser-error-results', conversation_id: conversationId,
+        sequence_id: 2, type: 'user', generation: 1, created_at: '2026-10-11T12:00:01Z',
+        llm_data: JSON.stringify({ Role: 0, Content: results, EndOfTurn: false }),
+      },
+    ];
+    await page.route('**/api/stream2*', (route) => route.abort());
+    await page.route(`**/api/conversation/${conversationId}`, (route) =>
+      route.fulfill({ json: body }),
+    );
+    await page.goto(`/c/${slug}`);
+    await expect(page.locator('[data-testid="tool-call-completed"]')).toHaveCount(calls.length);
+    await mountAllToolCards(page);
+
+    const invalidCards = page.locator('.tool').filter({ hasText: 'Invalid browser call:' });
+    await expect(invalidCards).toHaveCount(cases.length);
+    await expect(invalidCards.locator('.generic-tool-warning')).toHaveCount(0);
+    for (let i = 0; i < cases.length; i++) {
+      const card = invalidCards.nth(i);
+      await expect(card.locator('.tool-command')).toHaveText(cases[i].label);
+      await card.locator('.tool-header').click();
+      await expect(card.locator('.tool-details')).toContainText('Output (Error):');
+      await expect(card.locator('.tool-details')).toContainText(cases[i].text);
+      if (typeof cases[i].input === 'string') {
+        await expect(card.locator('.tool-code').first()).toHaveText(cases[i].input as string);
+      }
+    }
+
+    for (const { action } of missingUI) {
+      const card = page.locator('.tool').filter({
+        has: page.locator('.tool-command', { hasText: `browser (${action})` }),
+      });
+      await expect(card.locator('.generic-tool-warning')).toHaveCount(1);
+    }
+    await expect(page.locator('.generic-tool-warning')).toHaveCount(missingUI.length);
+
+    const validCard = page.locator('.tool').filter({
+      has: page.locator('.tool-command', { hasText: 'document.title' }),
+    });
+    await expect(validCard.locator('.tool-emoji')).toHaveText('⚡');
+    for (const { emoji } of validFamilies) {
+      await expect(page.locator('.tool-emoji').filter({ hasText: emoji })).toHaveCount(1);
+    }
   });
 
   test('generic tool audit stays inside its card on mobile', async ({ page }) => {

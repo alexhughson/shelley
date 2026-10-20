@@ -65,7 +65,15 @@ jobs:
           done
 
       - name: Fetch embedded exe-scroll
-        run: make exe-scroll
+        run: make exe-scroll-all
+
+      - name: Build all release targets
+        run: |
+          for GOOS in linux darwin; do
+            for GOARCH in amd64 arm64; do
+              GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 go build -o "bin/shelley-$GOOS-$GOARCH" ./cmd/shelley
+            done
+          done
 
       - name: Run Go tests
         run: go test -v ./...

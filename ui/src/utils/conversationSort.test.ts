@@ -23,12 +23,15 @@ function conv(id: string, updatedAt: string): ConversationWithState {
     current_generation: 0,
     agent_working: false,
     turn_interrupted: false,
+    external_conversation_id: null,
+    external_endpoint: null,
     tags: "[]",
     is_draft: false,
     draft: "",
     queued_messages: "[]",
     working: false,
     subagent_count: 0,
+    running_background_jobs: 0,
     max_sequence_id: 0,
   };
 }

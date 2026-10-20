@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,8 +9,6 @@ import (
 	"time"
 
 	"shelley.exe.dev/db"
-	"shelley.exe.dev/db/generated"
-	"shelley.exe.dev/llm"
 )
 
 // queuedMessages reads the conversation's queued_messages array from the DB.
@@ -394,8 +391,7 @@ func testCancelConversationClearsQueueUnconditionally(t *testing.T) {
 		t.Fatalf("getOrCreateConversationManager: %v", err)
 	}
 
-	// Seed the array directly WITHOUT going through QueueMessage, so the
-	// in-memory pendingBatches stay empty (simulating divergence/restart).
+	// Seed the array directly WITHOUT going through QueueMessage.
 	if _, err := database.AppendQueuedMessage(ctx, convID, db.QueuedMessage{
 		ID: "diverged", Llm: []byte(`{"Role":0}`), CreatedAt: time.Now(), Model: "predictable",
 	}); err != nil {
@@ -411,81 +407,10 @@ func testCancelConversationClearsQueueUnconditionally(t *testing.T) {
 	}
 }
 
-// TestHydrateDedupesQueuedAgainstInMemory verifies that Hydrate does NOT
-// restore a queued_messages array entry whose id is already present as an
-// in-memory pendingBatchUser. Without this dedup, a message that QueueMessage
-// persisted to BOTH the array and pendingBatches would be fed twice on the
-// drain loop==nil/Hydrate path, inserting a duplicate immutable user row.
-func TestHydrateDedupesQueuedAgainstInMemory(t *testing.T) {
-	t.Parallel()
-	server, database, _ := newTestServer(t)
-	ctx := t.Context()
-
-	conversation, err := database.CreateConversation(ctx, nil, true, nil, nil, db.ConversationOptions{})
-	if err != nil {
-		t.Fatalf("CreateConversation: %v", err)
-	}
-	convID := conversation.ConversationID
-
-	// Persist id "dup" to the array AND a distinct id "only-array".
-	for _, id := range []string{"dup", "only-array"} {
-		if _, err := database.AppendQueuedMessage(ctx, convID, db.QueuedMessage{
-			ID: id, Llm: []byte(`{"Role":0,"Content":[{"Type":2,"Text":"x"}]}`),
-			CreatedAt: time.Now(), Model: "predictable",
-		}); err != nil {
-			t.Fatalf("AppendQueuedMessage: %v", err)
-		}
-	}
-
-	// Build a fresh (un-hydrated) manager and inject an in-memory user batch
-	// for "dup", mirroring QueueMessage having already enqueued it in memory.
-	mgr := NewConversationManager(convID, database, server.logger, server.toolSetConfig, server.integrationSkills,
-		func(context.Context, llm.Message, llm.Usage, []llm.PurposedUsage) error { return nil },
-		func(context.Context, llm.Message, llm.Usage, []llm.PurposedUsage) (*generated.Message, error) {
-			return &generated.Message{}, nil
-		},
-		func(context.Context, []recordMessageInput) error { return nil },
-		func(ConversationState) {}, server.streamPub)
-	mgr.mu.Lock()
-	mgr.pendingBatches = []pendingBatch{{
-		Kind: pendingBatchUser, Messages: []llm.Message{{}}, ModelID: "predictable",
-		MessageIDs: []string{"dup"},
-	}}
-	mgr.mu.Unlock()
-
-	if err := mgr.Hydrate(ctx); err != nil {
-		t.Fatalf("Hydrate: %v", err)
-	}
-
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-	dupCount := 0
-	ids := map[string]int{}
-	for _, b := range mgr.pendingBatches {
-		if b.Kind != pendingBatchUser {
-			continue
-		}
-		for _, id := range b.MessageIDs {
-			ids[id]++
-			if id == "dup" {
-				dupCount++
-			}
-		}
-	}
-	if dupCount != 1 {
-		t.Fatalf("expected exactly 1 in-memory batch for id 'dup' after Hydrate, got %d", dupCount)
-	}
-	if ids["only-array"] != 1 {
-		t.Fatalf("expected 'only-array' restored exactly once, got %d", ids["only-array"])
-	}
-}
-
-// TestDrainNoDoubleFeedWhenInMemoryAndArrayBothHaveID covers Issue 2's exact
-// scenario: a message is present BOTH as an in-memory pendingBatchUser AND in
-// the queued_messages array (as QueueMessage leaves it), and the drain goes
-// through the loop==nil/Hydrate path (e.g. post-cancel/restart). The drainer
-// must insert EXACTLY ONE immutable user row — not two.
-func TestDrainNoDoubleFeedWhenInMemoryAndArrayBothHaveID(t *testing.T) {
+// TestDrainWithoutLoopFeedsQueuedMessageOnce verifies that a drain through
+// the loop==nil/Hydrate path (e.g. post-cancel/restart) inserts EXACTLY ONE
+// immutable user row for a queued message — not two.
+func TestDrainWithoutLoopFeedsQueuedMessageOnce(t *testing.T) {
 	t.Parallel()
 	server, database, _ := newTestServer(t)
 	defer stopActiveConversationLoops(server)
@@ -502,9 +427,8 @@ func TestDrainNoDoubleFeedWhenInMemoryAndArrayBothHaveID(t *testing.T) {
 		t.Fatalf("getOrCreateConversationManager: %v", err)
 	}
 
-	// Mirror QueueMessage: persist to the array AND inject the in-memory batch
-	// with the SAME id. Then force the loop==nil/Hydrate drain path by marking
-	// the manager un-hydrated with no loop (as CancelConversation does).
+	// Force the loop==nil/Hydrate drain path by marking the manager
+	// un-hydrated with no loop (as CancelConversation does).
 	const id = "both-places"
 	if _, err := database.AppendQueuedMessage(ctx, convID, db.QueuedMessage{
 		ID: id, Llm: []byte(`{"Role":0,"Content":[{"Type":2,"Text":"echo: exactly once"}]}`),
@@ -513,11 +437,6 @@ func TestDrainNoDoubleFeedWhenInMemoryAndArrayBothHaveID(t *testing.T) {
 		t.Fatalf("AppendQueuedMessage: %v", err)
 	}
 	mgr.mu.Lock()
-	mgr.pendingBatches = []pendingBatch{{
-		Kind: pendingBatchUser, ModelID: "predictable",
-		Messages:   []llm.Message{{Role: llm.MessageRoleUser, Content: []llm.Content{{Type: llm.ContentTypeText, Text: "echo: exactly once"}}}},
-		MessageIDs: []string{id},
-	}}
 	mgr.loop = nil
 	mgr.hydrated = false
 	mgr.mu.Unlock()
@@ -547,4 +466,84 @@ func TestDrainNoDoubleFeedWhenInMemoryAndArrayBothHaveID(t *testing.T) {
 	if q := queuedMessages(t, database, convID); len(q) != 0 {
 		t.Fatalf("queued array not emptied: %+v", q)
 	}
+}
+
+// A settings change interrupts the turn under way, but messages queued behind
+// it are kept and go out on the new settings.
+func TestSettingsChangeKeepsQueue(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		server, database, ps := newTestServer(t)
+		defer stopActiveConversationLoops(server)
+		conversation, err := database.CreateConversation(t.Context(), nil, true, nil, nil, db.ConversationOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		conversationID := conversation.ConversationID
+		sendChat(t, server, conversationID, "delay: 60", false)
+		synctest.Wait()
+		sendChat(t, server, conversationID, "echo: after the switch", true)
+		synctest.Wait()
+
+		request := httptest.NewRequest(http.MethodPost, "/api/conversation/"+conversationID+"/settings",
+			strings.NewReader(`{"tool_overrides":{"bash":"off"}}`))
+		response := httptest.NewRecorder()
+		server.handleConversationSettings(response, request, conversationID)
+		if response.Code != http.StatusOK {
+			t.Fatalf("settings = %d: %s", response.Code, response.Body.String())
+		}
+		synctest.Wait()
+		if !userMessageRowExists(t, database, conversationID, "after the switch") {
+			t.Fatal("queued message was dropped")
+		}
+		if got := queuedMessages(t, database, conversationID); len(got) != 0 {
+			t.Fatalf("queue after settings change = %#v", got)
+		}
+		req := ps.GetRecentRequests()
+		for _, tool := range req[len(req)-1].Tools {
+			if tool.Name == "bash" {
+				t.Fatal("queued message went out with the old tools")
+			}
+		}
+	})
+}
+
+// Messages queued during a turn reach the model together in the next
+// request, not one per request.
+func TestQueuedMessagesDrainIntoOneRequest(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, testQueuedMessagesDrainIntoOneRequest)
+}
+
+func testQueuedMessagesDrainIntoOneRequest(t *testing.T) {
+	server, database, llmSvc := newTestServer(t)
+	defer stopActiveConversationLoops(server)
+
+	conversation, err := database.CreateConversation(t.Context(), nil, true, nil, nil, db.ConversationOptions{})
+	if err != nil {
+		t.Fatalf("CreateConversation: %v", err)
+	}
+	convID := conversation.ConversationID
+	sendChat(t, server, convID, "delay: 2", false)
+	synctest.Wait()
+	for _, msg := range []string{"echo: first queued", "echo: second queued"} {
+		sendChat(t, server, convID, msg, true)
+	}
+	synctest.Wait()
+
+	for deadline := time.Now().Add(8 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		for _, req := range llmSvc.GetRecentRequests() {
+			var text strings.Builder
+			for _, msg := range req.Messages {
+				text.WriteString(messageText(msg))
+			}
+			if strings.Contains(text.String(), "first queued") {
+				if !strings.Contains(text.String(), "second queued") {
+					t.Fatal("the model saw the first queued message without the second")
+				}
+				return
+			}
+		}
+	}
+	t.Fatal("queued messages never reached the model")
 }

@@ -4,11 +4,19 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	gmtext "github.com/yuin/goldmark/text"
+	"github.com/yuin/goldmark/util"
 	"shelley.exe.dev/llm"
 )
 
@@ -39,63 +47,17 @@ import (
 // Remote (http/https) and data: URIs are handled entirely on the frontend and
 // never reach this endpoint.
 func (s *Server) handleMessageFile(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	reqPath, msg, convID, ok := s.messageFileRequest(w, r)
+	if !ok {
 		return
 	}
-
-	messageID := r.PathValue("message_id")
-	reqPath := r.URL.Query().Get("path")
-	if reqPath == "" {
-		http.Error(w, "path required", http.StatusBadRequest)
-		return
-	}
-
-	msg, err := s.db.GetMessageByID(r.Context(), messageID)
-	if err != nil {
-		http.Error(w, "message not found", http.StatusNotFound)
-		return
-	}
-	if msg.LlmData == nil {
-		http.Error(w, "message has no llm_data", http.StatusNotFound)
-		return
-	}
-
-	var llmMsg llm.Message
-	if err := json.Unmarshal([]byte(*msg.LlmData), &llmMsg); err != nil {
-		http.Error(w, "failed to parse message data", http.StatusInternalServerError)
-		return
-	}
-
 	// Capability check: the message must actually reference this path.
-	if !messageReferencesPath(messageTextContent(&llmMsg), reqPath) {
+	if !messageReferencesPath(messageTextContent(msg), reqPath) {
 		http.Error(w, "path not referenced by message", http.StatusNotFound)
 		return
 	}
-
-	resolved := reqPath
-	if !filepath.IsAbs(resolved) {
-		// A relative path is relative to where the agent was working.
-		cwd := s.conversationCwd(r, msg.ConversationID)
-		if cwd == "" {
-			http.Error(w, "conversation working directory unknown", http.StatusNotFound)
-			return
-		}
-		resolved = filepath.Join(cwd, resolved)
-	}
-	resolved = filepath.Clean(resolved)
-
-	// Check the type before opening: opening a FIFO blocks until a writer
-	// appears, which would hang this request goroutine, and a path can now name
-	// anything on the machine. Nothing we want to serve is a non-regular file.
-	if fi, err := os.Stat(resolved); err != nil || !fi.Mode().IsRegular() {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-
-	f, err := os.Open(resolved)
-	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
+	f, fi, ok := s.openLocalFile(w, r, convID, reqPath)
+	if !ok {
 		return
 	}
 	defer f.Close()
@@ -103,7 +65,7 @@ func (s *Server) handleMessageFile(w http.ResponseWriter, r *http.Request) {
 	// Sniff the content and require an image.
 	head := make([]byte, sniffLen)
 	n, _ := f.Read(head)
-	contentType, ok := servableImageType(head[:n], resolved)
+	contentType, ok := servableImageType(head[:n], fi.Name())
 	if !ok {
 		http.Error(w, "file is not an image", http.StatusForbidden)
 		return
@@ -123,6 +85,153 @@ func (s *Server) handleMessageFile(w http.ResponseWriter, r *http.Request) {
 	// during a session, so don't cache aggressively.
 	w.Header().Set("Cache-Control", "private, max-age=60")
 	io.Copy(w, f)
+}
+
+// sandboxScheme prefixes download links: [name](sandbox:/path/to/file). It is
+// ChatGPT's convention for files in its sandbox, which models use unprompted,
+// so Shelley adopts it (see system_prompt.txt) rather than fighting it.
+const sandboxScheme = "sandbox:"
+
+// handleMessageDownload serves a local file linked from a message's markdown as
+// [name](sandbox:<path>), as an attachment of any type.
+// Route: GET /api/message/{message_id}/download?path=<path>
+//
+// path is the link's destination after "sandbox:", exactly as a markdown
+// parser yields it. Unlike handleMessageFile there is no content check, so the
+// capability is stricter: path must equal the destination of a sandbox: link
+// in the message. A path the message merely mentions, shows as an image, or
+// that is a prefix of a link is not an offer to download it. The destination
+// is a URI, so it is percent-decoded to name the file. Serving as an
+// attachment keeps the bytes from ever rendering on Shelley's origin.
+func (s *Server) handleMessageDownload(w http.ResponseWriter, r *http.Request) {
+	reqPath, msg, convID, ok := s.messageFileRequest(w, r)
+	if !ok {
+		return
+	}
+	if !slices.Contains(sandboxLinkPaths(msg), reqPath) {
+		http.Error(w, "path not linked by message", http.StatusNotFound)
+		return
+	}
+	path, err := url.PathUnescape(reqPath)
+	if err != nil {
+		http.Error(w, "bad path encoding", http.StatusBadRequest)
+		return
+	}
+	f, fi, ok := s.openLocalFile(w, r, convID, path)
+	if !ok {
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": fi.Name()}))
+	w.Header().Set("Content-Security-Policy", "sandbox")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, no-cache")
+	http.ServeContent(w, r, "", fi.ModTime(), f)
+}
+
+// sandboxLinkPaths returns the destinations, minus the scheme, of the
+// sandbox: links and autolinks in m, read as the UI renders it: each run of
+// adjacent text blocks is one GFM document, and an image's alt text holds no
+// links. Backslash escapes are resolved, as the UI's markdown parser does;
+// percent-encoding is kept.
+func sandboxLinkPaths(m *llm.Message) []string {
+	md := goldmark.New(goldmark.WithExtensions(extension.GFM)).Parser()
+	var paths []string
+	for _, run := range textRuns(m) {
+		src := []byte(run)
+		ast.Walk(md.Parse(gmtext.NewReader(src)), func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+			if !entering {
+				return ast.WalkContinue, nil
+			}
+			var dest string
+			switch n := n.(type) {
+			case *ast.Image:
+				return ast.WalkSkipChildren, nil
+			case *ast.Link:
+				dest = string(util.UnescapePunctuations(n.Destination))
+			case *ast.AutoLink:
+				dest = string(n.URL(src))
+			}
+			if p, ok := strings.CutPrefix(dest, sandboxScheme); ok {
+				paths = append(paths, p)
+			}
+			return ast.WalkContinue, nil
+		})
+	}
+	return paths
+}
+
+// textRuns joins each run of adjacent text blocks in m, as the UI does
+// (coalesceContent) before rendering each run as markdown.
+func textRuns(m *llm.Message) []string {
+	runs := []string{""}
+	for _, c := range m.Content {
+		switch {
+		case c.Type == llm.ContentTypeText:
+			runs[len(runs)-1] += c.Text
+		case runs[len(runs)-1] != "":
+			runs = append(runs, "")
+		}
+	}
+	return runs
+}
+
+// messageFileRequest returns the ?path= of a per-message file request, and the
+// route's message and its conversation. On failure it writes the error
+// response.
+func (s *Server) messageFileRequest(w http.ResponseWriter, r *http.Request) (reqPath string, m *llm.Message, conversationID string, ok bool) {
+	reqPath = r.URL.Query().Get("path")
+	if reqPath == "" {
+		http.Error(w, "path required", http.StatusBadRequest)
+		return "", nil, "", false
+	}
+	msg, err := s.db.GetMessageByID(r.Context(), r.PathValue("message_id"))
+	if err != nil {
+		http.Error(w, "message not found", http.StatusNotFound)
+		return "", nil, "", false
+	}
+	if msg.LlmData == nil {
+		http.Error(w, "message has no llm_data", http.StatusNotFound)
+		return "", nil, "", false
+	}
+	m = new(llm.Message)
+	if err := json.Unmarshal([]byte(*msg.LlmData), m); err != nil {
+		http.Error(w, "failed to parse message data", http.StatusInternalServerError)
+		return "", nil, "", false
+	}
+	return reqPath, m, msg.ConversationID, true
+}
+
+// openLocalFile opens the regular file at path, resolving a relative path
+// against the conversation's working directory. On failure it writes the
+// error response.
+func (s *Server) openLocalFile(w http.ResponseWriter, r *http.Request, conversationID, path string) (*os.File, os.FileInfo, bool) {
+	if !filepath.IsAbs(path) {
+		// A relative path is relative to where the agent was working.
+		cwd := s.conversationCwd(r, conversationID)
+		if cwd == "" {
+			http.Error(w, "conversation working directory unknown", http.StatusNotFound)
+			return nil, nil, false
+		}
+		path = filepath.Join(cwd, path)
+	}
+	path = filepath.Clean(path)
+
+	// Check the type before opening: opening a FIFO blocks until a writer
+	// appears, which would hang this request goroutine, and a path can now name
+	// anything on the machine. Nothing we want to serve is a non-regular file.
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		http.Error(w, "not found", http.StatusNotFound)
+		return nil, nil, false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return nil, nil, false
+	}
+	return f, fi, true
 }
 
 // conversationCwd returns the working directory recorded for a conversation,

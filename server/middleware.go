@@ -21,17 +21,20 @@ func LoggerMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 		ClientErrorLevel: slog.LevelInfo,
 		ServerErrorLevel: slog.LevelInfo,
 		WithRequestID:    false,
+		// The callback's query holds an authorization code.
+		Filters: []sloghttp.Filter{sloghttp.IgnorePath("/mcp/oauth/callback")},
 	}
 	return sloghttp.NewWithConfig(logger, config)
 }
 
-// RequireHeaderMiddleware requires a specific header to be present on all API requests.
-// This is used to ensure requests come through an authenticated proxy.
+// RequireHeaderMiddleware requires a specific header to be present on API
+// requests and the MCP login and debug pages. This is used to ensure requests
+// come through an authenticated proxy.
 func RequireHeaderMiddleware(headerName string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Only check API routes
-			if strings.HasPrefix(r.URL.Path, "/api/") {
+			p := r.URL.Path
+			if strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/mcp/") || p == "/debug/mcp" {
 				if r.Header.Get(headerName) == "" {
 					http.Error(w, "missing required header: "+headerName, http.StatusForbidden)
 					return

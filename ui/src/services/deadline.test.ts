@@ -19,6 +19,7 @@ import {
   resetMissedDeadlines,
   isIndexedDBWait,
   MISSED_DEADLINE_BUFFER,
+  MAX_FORGIVEN_STALL_MS,
 } from "./deadline";
 
 function assert(cond: boolean, msg: string): void {
@@ -36,6 +37,13 @@ async function run(name: string, fn: () => Promise<void>): Promise<void> {
   }
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** Hold the event loop, as a long render or a tab resuming from suspension does. */
+function blockEventLoop(ms: number): void {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
+    // spin
+  }
+}
 
 async function main(): Promise<void> {
   await run("resolves normally when the operation beats the deadline", async () => {
@@ -145,6 +153,183 @@ async function main(): Promise<void> {
     }
     assert(String(err).includes("boom"), "the real error propagates");
     assert(pendingWaits().length === 0, "registry cleared on rejection");
+  });
+
+  // ── Event-loop stalls ───────────────────────────────────────────────────
+  //
+  // A result can only be observed when the event loop is free to deliver it.
+  // Safari 26.4, measured: issue a 3ms IndexedDB read with a 250ms timer, then
+  // block the main thread for 300ms or 1s — the overdue timer runs FIRST and
+  // the long-finished read second. Counting the stall against the deadline
+  // therefore declared "IndexedDB contention", aborted a good read and went
+  // to the network, all because the tab itself was busy.
+
+  await run("time the event loop spends blocked does not count against the deadline", async () => {
+    let resolveIt!: (v: string) => void;
+    const p = new Promise<string>((r) => {
+      resolveIt = r;
+    });
+    const wait = withDeadline(p, 20, { what: "indexedDB.read conversation_meta" });
+    blockEventLoop(60);
+    // The answer becomes deliverable only once the loop is free again, and is
+    // queued behind the now-overdue deadline timer — the Safari ordering.
+    setTimeout(() => resolveIt("ok"), 0);
+    let got: string | undefined;
+    let err: unknown;
+    try {
+      got = await wait;
+    } catch (e) {
+      err = e;
+    }
+    assert(got === "ok", `the result that arrived after the stall wins, got ${String(err)}`);
+    assert(missedDeadlines().length === 0, "a stall alone is not a missed deadline");
+  });
+
+  await run("a stall that lands on the last tick does not end the wait first", async () => {
+    // Most of the budget is used on time (a read genuinely queued behind a
+    // writer), then the tab blocks across the deadline. The answer that came
+    // in during the stall is queued behind the overdue final tick; that tick
+    // must not be the one that gives up.
+    const what = "indexedDB.read last-tick";
+    const charged = () => pendingWaits().find((w) => w.what === what)?.chargedMs;
+    for (let attempt = 1; ; attempt++) {
+      let resolveIt!: (v: string) => void;
+      const p = new Promise<string>((r) => {
+        resolveIt = r;
+      });
+      const outcome = withDeadline(p, 400, { what }).then(
+        (v) => v,
+        (e: unknown) => e,
+      );
+      let c = charged();
+      while (c !== undefined && c < 350) {
+        await sleep(1);
+        c = charged();
+      }
+      if (c === undefined || c >= 400) {
+        // A loaded machine woke us after the final tick had already run, so
+        // the stall cannot land inside it. Set up again.
+        resolveIt("missed");
+        await outcome;
+        resetMissedDeadlines();
+        assert(attempt < 10, "could not land a stall inside the final tick");
+        continue;
+      }
+      blockEventLoop(120);
+      setTimeout(() => resolveIt("ok"), 0);
+      const got = await outcome;
+      assert(got === "ok", `the answer queued behind the final tick wins, got ${String(got)}`);
+      assert(missedDeadlines().length === 0, "and nothing is recorded as missed");
+      return;
+    }
+  });
+
+  await run("a tab that stays busy still gives up within a fixed bound", async () => {
+    // Forgiving stalls must not make the wait unbounded: a visible tab whose
+    // loop is almost never free (back-to-back 100ms tasks, so every tick runs
+    // late) has to reach the network eventually.
+    const ms = 100;
+    const bound = ms + MAX_FORGIVEN_STALL_MS + 500;
+    const hog = setInterval(() => blockEventLoop(100), 0);
+    const started = performance.now();
+    let outcome: unknown;
+    try {
+      outcome = await Promise.race([
+        withDeadline(new Promise<string>(() => {}), ms, { what: "indexedDB.open" }),
+        sleep(bound).then(() => "hung"),
+      ]);
+    } catch (e) {
+      outcome = e;
+    } finally {
+      clearInterval(hog);
+    }
+    const took = performance.now() - started;
+    assert(isDeadlineExceeded(outcome), `gave up, got ${String(outcome)} after ${took}ms`);
+    assert(took < bound, `within ${bound}ms, took ${took}ms`);
+  });
+
+  await run("time hidden between two ticks does not count toward the backstop", async () => {
+    // A tab hidden and suspended mid-wait delivers its next tick only once it
+    // is visible again, so both ends of that tick look visible. Counting the
+    // gap as visible time would give up the moment the tab resumes, which is
+    // the very case stall forgiveness exists for.
+    const listeners: (() => void)[] = [];
+    const fakeDocument = {
+      visibilityState: "visible",
+      addEventListener: (type: string, fn: () => void) => {
+        if (type === "visibilitychange") listeners.push(fn);
+      },
+    };
+    const setVisibility = (state: string) => {
+      fakeDocument.visibilityState = state;
+      for (const fn of listeners) fn();
+    };
+    Object.defineProperty(globalThis, "document", { value: fakeDocument, configurable: true });
+    try {
+      let resolveIt!: (v: string) => void;
+      const p = new Promise<string>((r) => {
+        resolveIt = r;
+      });
+      const outcome = withDeadline(p, 200, { what: "indexedDB.open", maxStallMs: 100 }).then(
+        (v) => v,
+        (e: unknown) => e,
+      );
+      setVisibility("hidden");
+      blockEventLoop(500); // suspended: no tick runs while hidden
+      setVisibility("visible");
+      setTimeout(() => resolveIt("ok"), 60);
+      const got = await outcome;
+      assert(got === "ok", `a resumed tab keeps waiting, got ${String(got)}`);
+    } finally {
+      delete (globalThis as { document?: unknown }).document;
+    }
+  });
+
+  await run("a non-finite or negative deadline gives up at once", async () => {
+    for (const ms of [Infinity, NaN, -5]) {
+      let err: unknown;
+      const started = performance.now();
+      try {
+        await withDeadline(new Promise<string>(() => {}), ms, { what: "indexedDB.open" });
+      } catch (e) {
+        err = e;
+      }
+      assert(isDeadlineExceeded(err), `${ms}: gives up`);
+      // Generous: a scheduling pause on a loaded box may delay even a 0ms
+      // timer. The failure this guards against is ticking forever.
+      assert(performance.now() - started < 2_000, `${ms}: promptly`);
+      assert(pendingWaits().length === 0, `${ms}: nothing left in flight`);
+      const rec = missedDeadlines().pop();
+      assert(Number.isFinite(rec?.stalledMs), `${ms}: a finite stall in the record`);
+    }
+  });
+
+  await run("a stall still ends in a miss when the operation never answers", async () => {
+    const wait = withDeadline(new Promise<string>(() => {}), 20, { what: "indexedDB.open" });
+    blockEventLoop(60);
+    let err: unknown;
+    try {
+      await wait;
+    } catch (e) {
+      err = e;
+    }
+    assert(isDeadlineExceeded(err), "the budget still runs out on free time");
+    const [rec] = missedDeadlines();
+    assert(
+      rec.stalledMs !== undefined && rec.stalledMs >= 30,
+      `the stall is recorded so the HUD can tell it apart: ${rec.stalledMs}`,
+    );
+  });
+
+  await run("an in-flight wait reports budget used separately from wall time", async () => {
+    const wait = withDeadline(new Promise<string>(() => {}), 200, { what: "indexedDB.open" });
+    blockEventLoop(150);
+    await sleep(10);
+    const [w] = pendingWaits();
+    assert(w.elapsedMs >= 150, `wall time includes the stall: ${w.elapsedMs}`);
+    assert(w.chargedMs < 100, `the stall is not charged to the budget: ${w.chargedMs}`);
+    assert(w.stalledMs >= 100, `and is reported as a stall: ${w.stalledMs}`);
+    await wait.catch(() => {});
   });
 
   // ── Missed-deadline record ──────────────────────────────────────────────

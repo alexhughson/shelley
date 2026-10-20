@@ -110,7 +110,6 @@ func (g *loremGen) toolBatch(i int) []toolCall {
 	// take a variable-length slice so batches differ.
 	builders := []func(i, k int) toolCall{
 		g.bashCall,
-		g.shellCall,
 		g.patchCall,
 		g.changeDirCall,
 		g.subagentCall,
@@ -147,28 +146,6 @@ func (g *loremGen) bashCall(i, k int) toolCall {
 		},
 		result:  textResult(out.String()),
 		display: claudetool.BashDisplayData{WorkingDir: g.cwd},
-	}
-}
-
-// shellCall exercises the shell tool (long-running process) with its own
-// ShellDisplayData shape. The UI renders it via the same BashTool component.
-func (g *loremGen) shellCall(i, k int) toolCall {
-	return toolCall{
-		use: llm.Content{
-			Type: llm.ContentTypeToolUse, ID: toolUseID(i, k),
-			ToolName: "shell",
-			ToolInput: rawInput(map[string]any{
-				"command": fmt.Sprintf("go test ./... -run Turn%d", i),
-				"slow_ok": true,
-			}),
-		},
-		result: textResult(fmt.Sprintf("ok  \tshelley.exe.dev/pkg%d\t%s\n", i%9, lorem(i, 4))),
-		display: claudetool.ShellDisplayData{
-			WorkingDir: g.cwd,
-			PID:        1000 + i,
-			LogPath:    fmt.Sprintf("/tmp/shell-%d.log", i),
-			Yielded:    i%2 == 0,
-		},
 	}
 }
 

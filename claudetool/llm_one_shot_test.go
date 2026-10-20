@@ -79,7 +79,7 @@ func TestLLMOneShotShortResult(t *testing.T) {
 		LLMProvider:     provider,
 		ModelID:         "test-model",
 		WorkingDir:      NewMutableWorkingDir(dir),
-		AvailableModels: []AvailableModel{{ID: "test-model"}},
+		AvailableModels: []AvailableModel{{Name: "test-model", ID: "test-model"}},
 	}
 
 	input, _ := json.Marshal(llmOneShotInput{PromptFiles: []string{"prompt.txt"}})
@@ -113,7 +113,7 @@ func TestLLMOneShotLongResult(t *testing.T) {
 		LLMProvider:     provider,
 		ModelID:         "test-model",
 		WorkingDir:      NewMutableWorkingDir(dir),
-		AvailableModels: []AvailableModel{{ID: "test-model"}},
+		AvailableModels: []AvailableModel{{Name: "test-model", ID: "test-model"}},
 	}
 
 	input, _ := json.Marshal(llmOneShotInput{PromptFiles: []string{"prompt.txt"}})
@@ -151,7 +151,7 @@ func TestLLMOneShotExplicitOutputFile(t *testing.T) {
 		LLMProvider:     provider,
 		ModelID:         "test-model",
 		WorkingDir:      NewMutableWorkingDir(dir),
-		AvailableModels: []AvailableModel{{ID: "test-model"}},
+		AvailableModels: []AvailableModel{{Name: "test-model", ID: "test-model"}},
 	}
 
 	input, _ := json.Marshal(llmOneShotInput{PromptFiles: []string{"prompt.txt"}, OutputFile: "output.txt"})
@@ -182,8 +182,8 @@ func TestLLMOneShotAlternateModel(t *testing.T) {
 
 	provider := &oneShotMockProvider{
 		services: map[string]llm.Service{
-			"default-model": &oneShotMockService{response: "from default"},
-			"other-model":   &oneShotMockService{response: "from other"},
+			"default-model":            &oneShotMockService{response: "from default"},
+			"other-model@subscription": &oneShotMockService{response: "from other"},
 		},
 	}
 
@@ -192,8 +192,8 @@ func TestLLMOneShotAlternateModel(t *testing.T) {
 		ModelID:     "default-model",
 		WorkingDir:  NewMutableWorkingDir(dir),
 		AvailableModels: []AvailableModel{
-			{ID: "default-model"},
-			{ID: "other-model"},
+			{Name: "default-model", ID: "default-model"},
+			{Name: "other-model", ID: "other-model@subscription"},
 		},
 	}
 
@@ -226,7 +226,7 @@ func TestLLMOneShotUnknownModel(t *testing.T) {
 		LLMProvider:     provider,
 		ModelID:         "test-model",
 		WorkingDir:      NewMutableWorkingDir(dir),
-		AvailableModels: []AvailableModel{{ID: "test-model"}},
+		AvailableModels: []AvailableModel{{Name: "test-model", ID: "test-model@subscription"}},
 	}
 
 	input, _ := json.Marshal(llmOneShotInput{PromptFiles: []string{"prompt.txt"}, Model: "bogus-model"})
@@ -235,8 +235,8 @@ func TestLLMOneShotUnknownModel(t *testing.T) {
 	if result.Error == nil {
 		t.Fatal("expected error for unknown model")
 	}
-	if !strings.Contains(result.Error.Error(), "unknown model") {
-		t.Errorf("expected unknown model error, got: %v", result.Error)
+	if !strings.Contains(result.Error.Error(), `unknown model "bogus-model"; available: test-model`) || strings.Contains(result.Error.Error(), "@subscription") {
+		t.Errorf("expected unknown model error listing names, got: %v", result.Error)
 	}
 }
 
@@ -253,7 +253,7 @@ func TestLLMOneShotMissingFile(t *testing.T) {
 		LLMProvider:     provider,
 		ModelID:         "test-model",
 		WorkingDir:      NewMutableWorkingDir(dir),
-		AvailableModels: []AvailableModel{{ID: "test-model"}},
+		AvailableModels: []AvailableModel{{Name: "test-model", ID: "test-model"}},
 	}
 
 	input, _ := json.Marshal(llmOneShotInput{PromptFiles: []string{"nonexistent.txt"}})
@@ -281,7 +281,7 @@ func TestLLMOneShotEmptyPrompt(t *testing.T) {
 		LLMProvider:     provider,
 		ModelID:         "test-model",
 		WorkingDir:      NewMutableWorkingDir(dir),
-		AvailableModels: []AvailableModel{{ID: "test-model"}},
+		AvailableModels: []AvailableModel{{Name: "test-model", ID: "test-model"}},
 	}
 
 	input, _ := json.Marshal(llmOneShotInput{PromptFiles: []string{"prompt.txt"}})
@@ -301,8 +301,8 @@ func TestLLMOneShotToolSchemaEnum(t *testing.T) {
 		ModelID:     "model-a",
 		WorkingDir:  NewMutableWorkingDir("/tmp"),
 		AvailableModels: []AvailableModel{
-			{ID: "model-a"},
-			{ID: "model-b"},
+			{Name: "model-a", ID: "model-a"},
+			{Name: "model-b", ID: "model-b@subscription"},
 		},
 	}
 
@@ -311,8 +311,8 @@ func TestLLMOneShotToolSchemaEnum(t *testing.T) {
 	if !strings.Contains(schema, `"enum"`) {
 		t.Errorf("expected enum in schema, got: %s", schema)
 	}
-	if !strings.Contains(schema, `"model-a"`) || !strings.Contains(schema, `"model-b"`) {
-		t.Errorf("expected model IDs in enum, got: %s", schema)
+	if !strings.Contains(schema, `"model-a"`) || !strings.Contains(schema, `"model-b"`) || strings.Contains(schema, "model-b@subscription") {
+		t.Errorf("expected short model names in enum, got: %s", schema)
 	}
 
 	// The model parameter must stay optional so calls default to the
@@ -365,7 +365,7 @@ func TestLLMOneShotSystemPrompt(t *testing.T) {
 		LLMProvider:     provider,
 		ModelID:         "test-model",
 		WorkingDir:      NewMutableWorkingDir(dir),
-		AvailableModels: []AvailableModel{{ID: "test-model"}},
+		AvailableModels: []AvailableModel{{Name: "test-model", ID: "test-model"}},
 	}
 
 	input, _ := json.Marshal(llmOneShotInput{PromptFiles: []string{"prompt.txt"}, SystemPrompt: "You are a pirate."})

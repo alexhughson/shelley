@@ -1,4 +1,4 @@
-import { clearConversationQuery } from "./helpers";
+import { clearConversationQuery, createConversationViaAPIWithDetails } from "./helpers";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import type { ConversationWithState } from "../src/types";
 
@@ -6,6 +6,40 @@ test.use({
   viewport: { width: 1280, height: 720 },
   isMobile: false,
   hasTouch: false,
+});
+
+test("double-clicking a conversation name renames it and Escape cancels", async ({
+  page,
+  request,
+}) => {
+  const conversation = await createConversationViaAPIWithDetails(request, "rename from name");
+  await page.goto("/new");
+  const row = page.locator(`[data-conversation-id="${conversation.conversationId}"]`);
+  const title = row.locator(".conversation-title");
+  const input = row.locator(".drawer-rename-input");
+
+  // Single-click still opens the conversation; double-click also opens its editor.
+  await title.click();
+  await expect(page).toHaveURL(new RegExp(`/c/${conversation.slug}$`));
+  await expect(input).toHaveCount(0);
+  await title.dblclick();
+  await expect(input).toBeFocused();
+  await expect(input).toHaveValue(conversation.slug);
+  await input.fill("discarded-name");
+  await input.press("Escape");
+  await expect(title).toHaveText(conversation.slug);
+
+  await page.goto("/new");
+  await title.dblclick();
+  await expect(input).toBeFocused();
+  const newSlug = `renamed-${conversation.conversationId.toLowerCase()}`;
+  await input.fill(newSlug);
+  await input.press("Enter");
+  await expect(title).toHaveText(newSlug);
+  await page.reload();
+  await expect(title).toHaveText(newSlug);
+  await title.click();
+  await expect(page).toHaveURL(new RegExp(`/c/${newSlug}$`));
 });
 
 function conversation(
@@ -31,6 +65,8 @@ function conversation(
     draft: isDraft ? "unfinished message" : "",
     queued_messages: "[]",
     turn_interrupted: false,
+    external_conversation_id: null,
+    external_endpoint: null,
     working: false,
     subagent_count: 0,
     preview: "Preview",
@@ -88,6 +124,78 @@ test.describe("conversation drawer startup and app bar", () => {
     await expect(runningRow.locator(".drawer-interrupted-indicator")).toHaveCount(0);
   });
 
+  test("shows a running-task gear count that opens the conversation", async ({ page }) => {
+    const parent = conversation("parent");
+    parent.running_background_jobs = 1;
+    await stubConversationList(page, [parent]);
+
+    await page.goto("/new");
+    const row = page.locator('[data-conversation-id="parent"]');
+    const runningWork = row.getByTestId("conversation-running-work");
+    await expect(runningWork).toHaveText("1");
+    await expect(runningWork).toHaveAttribute("title", "1 task running");
+    await expect(runningWork).toHaveAttribute("aria-label", "1 task running");
+    await expect(runningWork.locator("svg")).toBeVisible();
+
+    // The compact indicator is part of the ordinary row target; it no longer
+    // expands job logs in the drawer.
+    await runningWork.click();
+    await expect(page).toHaveURL(/\/c\/parent$/);
+    await expect(page.getByTestId("background-job")).toHaveCount(0);
+  });
+
+  test("shows running and total subagent counts independently", async ({ page }) => {
+    const activeParent = conversation("active-parent");
+    activeParent.subagent_count = 3;
+    const activeChild = conversation("active-child");
+    activeChild.parent_conversation_id = activeParent.conversation_id;
+    activeChild.working = true;
+    activeChild.running_background_jobs = 1;
+    const waitingChild = conversation("waiting-child");
+    waitingChild.parent_conversation_id = activeParent.conversation_id;
+    waitingChild.running_background_jobs = 2;
+    const activeIdleChild = conversation("active-idle-child");
+    activeIdleChild.parent_conversation_id = activeParent.conversation_id;
+
+    const idleParent = conversation("idle-parent");
+    idleParent.subagent_count = 2;
+    const idleChild = conversation("idle-child");
+    idleChild.parent_conversation_id = idleParent.conversation_id;
+    const secondIdleChild = conversation("second-idle-child");
+    secondIdleChild.parent_conversation_id = idleParent.conversation_id;
+    await stubConversationList(page, [
+      activeParent,
+      activeChild,
+      waitingChild,
+      activeIdleChild,
+      idleParent,
+      idleChild,
+      secondIdleChild,
+    ]);
+
+    await page.goto("/new");
+    const activeBadge = page.locator(
+      '[data-conversation-id="active-parent"] .subagent-count-badge',
+    );
+    await expect(activeBadge).toContainText("2/3");
+    await expect(activeBadge.getByTestId("subagent-badge-running")).toBeVisible();
+
+    const idleBadge = page.locator('[data-conversation-id="idle-parent"] .subagent-count-badge');
+    await expect(idleBadge).toHaveText("2");
+    await expect(idleBadge.getByTestId("subagent-badge-running")).toHaveCount(0);
+
+    activeChild.working = false;
+    activeChild.running_background_jobs = 0;
+    await page.reload();
+    await expect(activeBadge).toContainText("1/3");
+    await expect(activeBadge.getByTestId("subagent-badge-running")).toBeVisible();
+
+    waitingChild.running_background_jobs = 0;
+    await page.reload();
+    await expect(activeBadge).toHaveText("3");
+    await expect(activeBadge.getByTestId("subagent-badge-running")).toHaveCount(0);
+  });
+
   test("truncates long slugs to one line with an ellipsis", async ({ page }) => {
     const long = conversation(
       "unexpected-conversation-navigation-redirect-with-an-even-longer-tail",
@@ -115,6 +223,50 @@ test.describe("conversation drawer startup and app bar", () => {
       textOverflow: getComputedStyle(el).textOverflow,
     }));
     expect(overflow).toEqual({ clipped: true, textOverflow: "ellipsis" });
+  });
+
+  test("keeps commit hashes behind a compact copy icon", async ({ page, context }) => {
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const withCommit = conversation("with-commit");
+    withCommit.git_commit = "424904d";
+    withCommit.git_subject = "Make git graph file paths readable";
+    const hashOnly = conversation("hash-only");
+    hashOnly.git_commit = "abcdef1";
+    await stubConversationList(page, [withCommit, hashOnly, conversation("no-commit")]);
+    await page.goto("/new");
+
+    const row = page.locator('[data-conversation-id="with-commit"]');
+    const copy = row.getByRole("button", { name: "Copy commit hash 424904d", exact: true });
+    await expect(copy).toBeVisible();
+    await expect(row.locator(".drawer-git-info")).toHaveText(withCommit.git_subject);
+    await expect(copy.locator("circle")).toHaveCount(3);
+    await expect(copy.locator("path")).toHaveAttribute("d", "M6 16.6V7.4M6 16.6C8 11 12 6 14.6 5");
+    const before = await copy.boundingBox();
+    expect(before!.width).toBeLessThanOrEqual(24);
+    const restingColor = await copy.evaluate((el) => getComputedStyle(el).color);
+    await copy.hover();
+    await expect(page.getByRole("tooltip")).toContainText("Click to copy 424904d");
+    expect(await copy.evaluate((el) => getComputedStyle(el).color)).not.toBe(restingColor);
+    await copy.click();
+
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("424904d");
+    await expect(copy).toHaveClass(/drawer-git-copy-copied/);
+    await expect(copy.locator("circle")).toHaveCount(0);
+    await expect(copy).toBeFocused();
+    expect(await copy.boundingBox()).toEqual(before);
+    await expect(page).toHaveURL(/\/new$/);
+
+    const hashOnlyCopy = page
+      .locator('[data-conversation-id="hash-only"]')
+      .getByRole("button", { name: "Copy commit hash abcdef1", exact: true });
+    await expect(hashOnlyCopy).toBeVisible();
+    await hashOnlyCopy.focus();
+    await hashOnlyCopy.press("Enter");
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("abcdef1");
+    await expect(page).toHaveURL(/\/new$/);
+    await expect(page.locator('[data-conversation-id="no-commit"] .drawer-git-info')).toHaveCount(
+      0,
+    );
   });
 
   test("highlights matching slug text in drawer and command-palette searches", async ({ page }) => {
@@ -770,7 +922,9 @@ test.describe("conversation drawer startup and app bar", () => {
     await expect(page.locator('[data-conversation-id="mine"]')).toBeVisible();
     // Drop the seeded current-user filter so every group is on screen.
     await page.getByRole("button", { name: "Search conversations..." }).click();
-    await queryEditor(page).fill("");
+    const editor = queryEditor(page);
+    await expectQuery(editor, "user:adam@poyo.co ");
+    await clearConversationQuery(editor);
     await expect(page.locator('[data-conversation-id="none"]')).toBeVisible();
 
     await page.getByRole("button", { name: "Group conversations" }).click();

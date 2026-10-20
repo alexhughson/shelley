@@ -238,10 +238,6 @@ type FindFilesResponse struct {
 //     concurrently with the listing+fuzzy phase, so its cost is max() rather
 //     than sum().
 func (s *Server) handleFindFiles(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	if ctx.Err() != nil {

@@ -49,17 +49,6 @@
       </div>
 
       <div class="header-actions">
-        <button class="btn-new" :aria-label="t('newConversation')" @click="onNewConversationClick">
-          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" class="chat-icon-1rem">
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              :stroke-width="2"
-              d="M12 4v16m8-8H4"
-            />
-          </svg>
-        </button>
-
         <!-- Overflow menu (PrimeVue Popover + Select) -->
         <ChatOverflowMenu
           :has-cwd="hasCwd"
@@ -71,6 +60,7 @@
           "
           :can-export="!!(conversationId && messages.length > 0)"
           :has-update="hasUpdate"
+          :message-user="messageUserEnabled"
           @open-command-palette="props.onOpenCommandPalette?.()"
           @open-directory-picker="showDirectoryPicker = true"
           @open-diffs="showDiffViewer = true"
@@ -81,8 +71,42 @@
           @export="openExport"
           @edit-agents-md="showAgentsMdEditor = true"
           @edit-file="props.onOpenFileFinder?.()"
+          @open-mcp-servers="props.onOpenMcpServersModal?.()"
           @check-version="openVersionModal"
-        />
+          @new-conversation="onNewConversationClick"
+        >
+          <button
+            type="button"
+            class="btn-icon live-call-trigger"
+            :class="{ 'is-active': voicePhase !== 'idle' }"
+            :disabled="
+              voicePhase === 'idle' &&
+              (!!currentConversation?.archived || !canSendWithModel(selectedModel, readyModelIds))
+            "
+            :aria-label="headerCallLabel"
+            :title="headerCallLabel"
+            data-testid="live-call-header"
+            @click="onHeaderCallClick"
+          >
+            <svg fill="currentColor" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path :transform="voicePhase !== 'idle' ? 'rotate(135 12 12)' : undefined" d="M6.62 10.79a15.05 15.05 0 0 0 6.59 6.59l2.2-2.2a1 1 0 0 1 1.02-.24c1.12.37 2.33.57 3.57.57a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1C10.61 21 3 13.39 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1.02l-2.2 2.2Z" />
+            </svg>
+          </button>
+          <button
+            class="btn-new hide-on-mobile"
+            :aria-label="t('newConversation')"
+            @click="onNewConversationClick"
+          >
+            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" class="chat-icon-1rem">
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                :stroke-width="2"
+                d="M12 4v16m8-8H4"
+              />
+            </svg>
+          </button>
+        </ChatOverflowMenu>
       </div>
     </div>
 
@@ -91,7 +115,7 @@
       <div ref="messagesContainerRef" class="messages-container scrollable">
         <div v-if="!loading || renderingConversation" ref="messagesListRef" class="messages-list">
           <!-- empty state -->
-          <div v-if="messages.length === 0" class="empty-state">
+          <div v-if="messages.length === 0 && liveExchangeTurns.length === 0" class="empty-state">
             <div class="empty-state-content">
               <p class="text-base chat-welcome-text">
                 <template v-for="(part, i) in welcomeParts" :key="i">
@@ -146,7 +170,9 @@
                 </ul>
                 <p v-if="modelSetupHint.footer">{{ t(modelSetupHint.footer) }}</p>
               </PvMessage>
-              <p v-else class="text-sm chat-secondary-text">{{ t("sendMessageToStart") }}</p>
+              <p v-else-if="voicePhase === 'idle'" class="text-sm chat-secondary-text">
+                {{ t(canSendWithModel(selectedModel, readyModelIds) ? "sendOrTalkToStart" : "sendMessageToStart") }}
+              </p>
             </div>
           </div>
           <!-- generations -->
@@ -182,11 +208,7 @@
                 :chunk="chunk"
                 :conversation-id="conversationId"
                 :on-open-diff-viewer="handleOpenDiffViewer"
-                :can-request-tour="
-                  !!currentConversation &&
-                  !currentConversation.parent_conversation_id &&
-                  !currentConversation.is_draft
-                "
+                :can-request-tour="canRequestTour"
                 :on-comment-text-change="setDiffCommentText"
                 :on-fork="forkHandler"
               />
@@ -221,7 +243,7 @@
           <!-- Durable queued items render in their exact server order. Working
                and failed transcriptions get a specialized card; ready
                transcriptions are ordinary queued user-message ghosts. -->
-          <template v-for="(qm, queuedIndex) in queuedGhosts" :key="`queued-${qm.id}`">
+          <template v-for="qm in visibleQueuedGhosts" :key="`queued-${qm.id}`">
             <TranscriptionTask
               v-if="queuedTranscriptionTaskState(qm)"
               :path="queuedTranscriptionPath(qm)"
@@ -237,7 +259,7 @@
               v-else
               :queued="qm"
               :on-send-now="
-                conversationId && queuedIndex === 0 && !isDistilling
+                conversationId && qm.id === queuedGhosts[0]?.id && !isDistilling
                   ? sendQueuedMessageNow
                   : undefined
               "
@@ -245,7 +267,7 @@
               :on-cancel="conversationId ? cancelQueuedMessage : undefined"
             />
           </template>
-          <div v-if="queuedGhosts.length > 1 && conversationId" class="queued-cancel-all-row">
+          <div v-if="visibleQueuedGhosts.length > 1 && conversationId" class="queued-cancel-all-row">
             <button
               class="queued-message-badge-cancel"
               data-testid="cancel-all-queued"
@@ -255,6 +277,19 @@
               Cancel all queued
             </button>
           </div>
+          <LiveExchange
+            v-if="voicePhase !== 'idle'"
+            v-show="liveExchangeTurns.length > 0"
+            :turns="liveExchangeTurns"
+            :origin-title="liveExchangeOriginTitle"
+            @return-to-call="liveVoiceRef?.returnToCall()"
+          />
+          <RunningWorkStrip
+            v-if="conversationId && !currentConversation?.archived"
+            :key="conversationId"
+            :conversation-id="conversationId"
+            @toggle="handleRunningWorkToggle"
+          />
           <div ref="bottomSentinelRef" class="messages-bottom-sentinel" aria-hidden="true" />
         </div>
       </div>
@@ -303,13 +338,14 @@
       :model="selectedModel"
       :auto-focus-id="terminalAutoFocusId"
       :can-insert-into-input="true"
-      @attached="(id, termId) => onTerminalAttached?.(id, termId)"
+      @attached="(id, termId, closeOnExit) => onTerminalAttached?.(id, termId, closeOnExit)"
       @scope-change="(id, cid) => onTerminalScopeChange?.(id, cid)"
       @scope-error="(message) => (error = message)"
       @close="onTerminalCloseHandler"
       @insert-into-input="handleInsertFromTerminal"
       @auto-focus-consumed="terminalAutoFocusId = null"
       @active-terminal-exited="focusMessageInputIfUnfocused"
+      @new-terminal="openInAppTerminal"
     />
 
     <!-- Low disk space notice: server-wide, shown once per episode until dismissed. -->
@@ -364,14 +400,14 @@
          switches is handled by MessageInput's draftSeed watch. -->
     <MessageInput
       ref="messageInputRef"
-      v-show="!currentConversation?.archived"
+      v-show="!currentConversation?.archived || voicePhase !== 'idle'"
+      :composer-hidden="!!currentConversation?.archived"
       :on-send="sendMessage"
+      :voice-active="voicePhase !== 'idle'"
       :on-start-recording="prepareRecording"
       :recording-inline-available="!currentConversation?.archived"
       :on-queue="queueMessage"
-      :on-compact="
-        conversationId && onDistillNewGeneration ? handleDistillCompactNewGeneration : undefined
-      "
+      :on-compact-and-queue="conversationId && onDistillNewGeneration ? compactAndQueue : undefined"
       :show-queue-option="!!conversationId"
       :can-queue="canQueue"
       :auto-queue="autoQueue"
@@ -399,8 +435,20 @@
       @draft-send-started="handleDraftSendStarted"
       @draft-cleared="handleDraftCleared"
       @recording-unsent="handleRecordingUnsent"
+      @recording-unavailable="error = t('recordingUnavailable')"
       @open-terminal="openInAppTerminal"
     >
+      <template #call>
+        <LiveVoice
+          ref="liveVoiceRef"
+          :conversation-id="conversationId"
+          :disabled="!!currentConversation?.archived"
+          :capture-conversation="captureLiveConversation"
+          :get-conversation="getLiveConversation"
+          :on-return="onSelectConversation"
+          @phase-change="voicePhase = $event"
+        />
+      </template>
       <template v-if="statusSlotInline" #status>
         <ChatStatusContent v-bind="statusContentProps" />
         <span :id="`${tocTargetId}-mobile`" class="status-navigation" />
@@ -424,6 +472,29 @@
       />
     </Teleport>
 
+    <ToolsModal
+      :is-open="showToolsModal"
+      :tools="availableTools"
+      :tool-overrides="settingsInEffect.settings.tool_overrides"
+      :disable-all-tools="conversationNoTools"
+      :compact-nudge-tokens="settingsInEffect.settings.compact_nudge_tokens"
+      :apply-label="conversationLive ? 'Apply to this conversation' : 'Apply'"
+      :on-apply="applyTools"
+      :locked="conversationLive && agentWorking"
+      @close="showToolsModal = false"
+    />
+    <ProfilesModal
+      :is-open="showProfilesModal"
+      :models="models"
+      :tools="availableTools"
+      :current="settingsInEffect.profile"
+      :modified="knob.changes.length > 0"
+      :on-use="useProfile"
+      :on-saved="onProfileSaved"
+      :locked="conversationLive && agentWorking"
+      @close="showProfilesModal = false"
+    />
+
     <!-- Directory Picker Modal -->
     <DirectoryPickerModal
       :is-open="showDirectoryPicker"
@@ -441,11 +512,7 @@
       :covered="showDiffViewer"
       :can-open-diff="true"
       :conversation-id="conversationId"
-      :can-request-tour="
-        !!currentConversation &&
-        !currentConversation.parent_conversation_id &&
-        !currentConversation.is_draft
-      "
+      :can-request-tour="canRequestTour"
       @close="
         showGitGraph = false;
         focusMessageInputIfUnfocused();
@@ -471,17 +538,28 @@
       @close="closeImageComment"
     />
 
+    <MarkdownDocModal
+      v-if="markdownDoc"
+      :key="markdownDoc.url"
+      :doc="markdownDoc"
+      @close="closeMarkdownDoc"
+    />
+
     <!-- Diff Viewer -->
     <DiffViewer
       :cwd="(diffViewerCwd || currentConversation?.cwd || selectedCwd) as string"
       :is-open="showDiffViewer"
       :initial-commit="diffViewerInitialCommit"
       :initial-file="diffViewerInitialFile"
+      :open-on-files="diffViewerOpenOnFiles"
       :recording-conversation-id="
         currentConversation && !currentConversation.archived && !currentConversation.is_draft
           ? (conversationId ?? undefined)
           : undefined
       "
+      :start-review-conversation="startReviewConversation"
+      :follow-review-conversation="followReviewConversation"
+      :tour-conversation-id="canRequestTour ? (conversationId ?? undefined) : undefined"
       @close="onDiffViewerClose"
       @comment-text-change="(text) => (diffCommentText = text)"
       @cwd-change="(cwd) => (diffViewerCwd = cwd)"
@@ -501,7 +579,18 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, provide, reactive, ref, useId, watch } from "vue";
+import {
+  computed,
+  inject,
+  nextTick,
+  onMounted,
+  onUnmounted,
+  provide,
+  reactive,
+  ref,
+  useId,
+  watch,
+} from "vue";
 import Button from "primevue/button";
 import PvMessage from "primevue/message";
 import {
@@ -514,6 +603,10 @@ import {
   type Usage,
   type LLMContent,
   type DiskSpaceStatus,
+  type Profile,
+  type Settings,
+  type SettingsChange,
+  type ConversationSettings,
   isDistillStatusMessage,
   distillStatus,
   parseQueuedMessages,
@@ -522,7 +615,12 @@ import {
   queuedTranscriptionPath,
   queuedTranscriptionTaskState,
 } from "../../types";
-import { api } from "../../services/api";
+import {
+  COMPACT_IN_PLACE_REQUEST,
+  COMPACT_IN_PLACE_TOOL,
+  DEFAULT_COMPACT_NUDGE_TOKENS,
+} from "./autoCompaction";
+import { api, ApiError, profilesApi } from "../../services/api";
 import { btwStore } from "../../services/btwStore";
 import { messageStore } from "../../services/messageStore";
 import { cacheDiag } from "../../services/cacheDiag";
@@ -530,6 +628,8 @@ import {
   loadCachedDraft,
   saveCachedDraft,
   clearCachedDraft,
+  rebaseCachedDraft,
+  markCachedDraftPending,
   reconcileComposerDraft,
 } from "../../services/draftCache";
 import { setFaviconStatus } from "../../services/favicon";
@@ -543,11 +643,21 @@ import {
 import { useMarkdownMode } from "../composables/markdownMode";
 import { useConversationView } from "../composables/conversationView";
 import { useI18n } from "../composables/i18n";
+import {
+  settingsDifferences,
+  reloadProfiles,
+  settingsOf,
+  toolOn,
+  useProfiles,
+  withTool,
+  type SettingsKnob,
+} from "../composables/profiles";
 import { useDraftAutosave } from "../composables/draftAutosave";
 import { useFeatureFlag } from "../composables/featureFlags";
 import { useVersionChecker } from "../composables/versionChecker";
 import { provideToolProgress } from "../composables/toolProgress";
 import { closeImageComment, useImageCommentTarget } from "../composables/imageComment";
+import { closeMarkdownDoc, useMarkdownDoc } from "../composables/markdownDoc";
 import { isImeComposing } from "../../utils/imeComposing";
 import { focusMessageInputIfUnfocused } from "../../utils/focusMessageInput";
 import { buildMessageQuote } from "../../utils/messageQuote";
@@ -559,6 +669,9 @@ import {
   clearConversationViewCache,
   isHumanUserMessage,
   isVisibleConversationMessage,
+  isDeliveredUserMessage,
+  isFailedChatDelivery,
+  MESSAGE_USER_TOOL,
 } from "../../utils/conversationView";
 import { SLASH_COMMANDS } from "../../utils/slashCommands";
 import { replaceLocationFragment } from "../../utils/locationFragment";
@@ -596,6 +709,7 @@ import {
 import { coalesceMessages, type CoalescedItem } from "./coalesce";
 import type { RenderNode, RenderChunk, GenerationBlock } from "./renderNode";
 import type { EphemeralTerminal } from "./terminalTypes";
+import { INTERACTIVE_SHELL_COMMAND, isInteractiveShellLaunch } from "./terminalHelpers";
 import {
   THINKING_LEVELS,
   normalizeThinkingLevelForModel,
@@ -603,27 +717,44 @@ import {
   storedThinkingLevel,
   type ThinkingLevel,
 } from "./thinkingLevel";
-import { SELECTED_MODEL_KEY, pickReadyModel, storedSelectedModel } from "./selectedModel";
+import {
+  SELECTED_MODEL_KEY,
+  pickReadyModel,
+  serverDefaultModel,
+  storedSelectedModel,
+} from "./selectedModel";
 import { RefusalContinueKey } from "./refusalContinue";
 
 import MessageInput from "./MessageInput.vue";
+import RunningWorkStrip from "./RunningWorkStrip.vue";
+import { BackgroundJobsKey, useBackgroundJobs } from "../composables/backgroundJobs";
+import { ConversationsListKey } from "../composables/subagentLive";
 import type { RecordingMode, RecordingPreparation } from "./recordingDestination";
 import ConversationTOC from "./ConversationTOC.vue";
 import ModelBar from "./ModelBar.vue";
 import SystemPromptView from "./SystemPromptView.vue";
 import DirectoryPickerModal from "./DirectoryPickerModal.vue";
+import ProfilesModal from "./ProfilesModal.vue";
+import ToolsModal from "./ToolsModal.vue";
 import MessageSelectionToolbar from "./MessageSelectionToolbar.vue";
 import DiffViewer from "./DiffViewer.vue";
+import type { ReviewConversationStart } from "./useReviewRecording";
 import ImageCommentModal from "./ImageCommentModal.vue";
+import MarkdownDocModal from "./MarkdownDocModal.vue";
 import GitGraphViewer from "./GitGraphViewer.vue";
 import AgentsMdEditorModal from "./AgentsMdEditorModal.vue";
 import TerminalPanel from "./TerminalPanel.vue";
 import VersionChecker from "./VersionChecker.vue";
 import ChatOverflowMenu from "./ChatOverflowMenu.vue";
+import LiveVoice from "./LiveVoice.vue";
+import LiveExchange from "./LiveExchange.vue";
+import type { LiveCallDestination } from "../composables/liveCallConversation";
 import { matchChatInterfaceAction } from "../../utils/menuShortcuts";
 import ChunkHost from "./ChunkHost.vue";
 import { chunkMountKey } from "./chunkMount";
+import { collectReactions, messageUserContextKey, targetResolver } from "./messageUserContext";
 import QueuedGhostMessage from "./QueuedGhostMessage.vue";
+import { useVisibleQueuedMessages } from "../composables/visibleQueuedMessages";
 import TranscriptionTask from "./TranscriptionTask.vue";
 import ChatStatusContent from "./ChatStatusContent.vue";
 import MarkdownContent from "./MarkdownContent.vue";
@@ -641,17 +772,18 @@ const props = withDefaults(
     diskSpaceStatus?: DiskSpaceStatus | null;
     onDiskSpaceStatus?: (status: DiskSpaceStatus) => void;
     onOpenDrawer: () => void;
-    onNewConversation: () => void;
+    onNewConversation: () => Promise<boolean>;
     onSelectConversation?: (conversation: Conversation) => void;
     onArchiveConversation?: (conversationId: string) => Promise<void>;
     currentConversation?: Conversation;
+    conversations: Conversation[];
     onConversationUpdate?: (conversation: Conversation) => void;
+    onMessageSent?: (conversationId: string) => void;
     onFirstMessage?: (
       message: string,
       model: string,
       cwd?: string,
-      toolOverrides?: Record<string, "on" | "off">,
-      thinkingLevel?: Exclude<ThinkingLevel, "default">,
+      conversationOptions?: ChatRequest["conversation_options"],
     ) => Promise<void>;
     onDistillNewGeneration?: (
       sourceConversationId: string,
@@ -669,13 +801,14 @@ const props = withDefaults(
     modelsRefreshTrigger?: number;
     cwdSyncTrigger?: number;
     onOpenModelsModal?: () => void;
+    onOpenMcpServersModal?: () => void;
     onOpenFileFinder?: () => void;
     onOpenCommandPalette?: () => void;
     ephemeralTerminals: EphemeralTerminal[];
     setEphemeralTerminals: (
       next: EphemeralTerminal[] | ((prev: EphemeralTerminal[]) => EphemeralTerminal[]),
     ) => void;
-    onTerminalAttached?: (id: string, termId: string) => void;
+    onTerminalAttached?: (id: string, termId: string, closeOnExit: boolean) => void;
     onTerminalScopeChange?: (id: string, conversationId: string | null) => void;
     onTerminalClose?: (id: string) => void;
     navigateUserMessageTrigger?: number;
@@ -694,8 +827,41 @@ const props = withDefaults(
 );
 
 const { t } = useI18n();
+const conversations = inject(ConversationsListKey);
+if (!conversations) throw new Error("ChatInterface requires ConversationsListKey");
+const backgroundJobCount = computed(
+  () =>
+    conversations.value.find((c) => c.conversation_id === props.conversationId)
+      ?.running_background_jobs ?? 0,
+);
+provide(
+  BackgroundJobsKey,
+  useBackgroundJobs(
+    computed(() => props.conversationId),
+    backgroundJobCount,
+  ),
+);
 const { markdownMode } = useMarkdownMode();
-const { conversationViewMode } = useConversationView();
+// The open conversation's options: its settings (as of the last change) and
+// the profile they came from.
+const conversationOptions = computed<
+  Partial<Settings> & { profile?: string; disable_all_tools?: boolean }
+>(() => {
+  try {
+    return JSON.parse(props.currentConversation?.conversation_options || "{}") ?? {};
+  } catch {
+    return {};
+  }
+});
+const conversationToolOverrides = computed<Record<string, string>>(
+  () => conversationOptions.value.tool_overrides ?? {},
+);
+// With the message_user tool on, the agent chats through it, and the view has
+// its own (brief) default.
+const messageUserEnabled = computed(
+  () => conversationToolOverrides.value[MESSAGE_USER_TOOL] === "on",
+);
+const { conversationViewMode } = useConversationView(messageUserEnabled);
 // A view-mode switch refilters coalescedItems, which renumbers every chunk
 // and can restructure them wholesale; reset the tail-first floor and
 // re-prime for the new model. Synchronous on purpose: renderModel is a
@@ -705,6 +871,9 @@ const { conversationViewMode } = useConversationView();
 // hoisted; safe to reference at setup time.)
 watch(conversationViewMode, () => {
   resetTailFirst();
+  // Band keys are positions in the view's items: another view's bands reuse
+  // them.
+  expandedCarriedBands.clear();
   primeTailFirstMount();
 });
 const compactSendThresholdsEnabled = useFeatureFlag("compact-send-thresholds");
@@ -719,6 +888,32 @@ const {
 
 // ---- core state ----
 const messageInputRef = ref<InstanceType<typeof MessageInput> | null>(null);
+const liveVoiceRef = ref<InstanceType<typeof LiveVoice> | null>(null);
+const voicePhase = ref<"idle" | "connecting" | "live">("idle");
+const liveExchangeTurns = computed(() => {
+  const live = liveVoiceRef.value;
+  return voicePhase.value !== "idle" && live
+    ? live.transcript
+    : [];
+});
+const liveExchangeOriginTitle = computed(() => {
+  const live = liveVoiceRef.value;
+  return live && live.transcriptConversationId !== props.conversationId
+    ? live.transcriptTitle
+    : undefined;
+});
+const headerCallLabel = computed(() =>
+  voicePhase.value === "idle"
+    ? t("startVoiceConversation")
+    : voicePhase.value === "connecting" ? "Cancel voice call" : "End voice call",
+);
+function startVoice() {
+  void liveVoiceRef.value?.start();
+}
+function onHeaderCallClick() {
+  if (voicePhase.value === "idle") startVoice();
+  else liveVoiceRef.value?.stop();
+}
 // Call through synchronously: screen capture must retain the user gesture.
 defineExpose({
   canRecordAudio: computed(() => messageInputRef.value?.canRecordAudio ?? false),
@@ -742,11 +937,22 @@ const btwExchanges = ref<BtwExchange[]>([]);
 // them for the same reason.
 const lastMessageId = computed(() => {
   for (let i = messages.value.length - 1; i >= 0; i--) {
-    if (messages.value[i].type !== "slug") return messages.value[i].message_id;
+    if (messages.value[i].type !== "slug" && messages.value[i].type !== "livetranscript") {
+      return messages.value[i].message_id;
+    }
   }
   return null;
 });
 provide("lastMessageId", lastMessageId);
+
+// Tours are built by subagents, which only started top-level conversations
+// can spawn (server/commit_tour_request.go).
+const canRequestTour = computed(
+  () =>
+    !!props.currentConversation &&
+    !props.currentConversation.parent_conversation_id &&
+    !props.currentConversation.is_draft,
+);
 
 // When more than one distinct human user (by exe.dev email) has participated in
 // a conversation, descendant Message components show each user message's author
@@ -876,10 +1082,7 @@ function putDraftModel(draftId: string, model: string) {
       if (draftConvId === draftId && conv.updated_at > draftSyncedAt) {
         draftSyncedAt = conv.updated_at;
       }
-      const cur = loadCachedDraft(draftId);
-      if (cur && conv.updated_at > cur.basedOn) {
-        saveCachedDraft(draftId, cur.value, conv.updated_at);
-      }
+      rebaseCachedDraft(draftId, conv.updated_at);
     })
     .catch(() => {})
     .finally(() => {
@@ -887,32 +1090,55 @@ function putDraftModel(draftId: string, model: string) {
       if (modelPutsInFlight === 0) modelPutDraftId = null;
     });
 }
-// Changing the model or reasoning level of a conversation that is already under
-// way. Both are server state at this point: they are baked into the agent loop
-// at build time, and conversation_options are locked once a conversation is
-// promoted (see the send path's `promoting` guard) — so a purely local change
-// would silently do nothing. /model already does the whole job for both:
-// validates the argument, rebuilds the loop, records a modelchange marker in the
-// log, and broadcasts the updated conversation, which the currentConversation
-// watch applies. So route through it rather than duplicating any of that, and
-// don't apply locally first: a rejected switch would visibly snap back.
-async function sendModelCommand(arg: string) {
+// Changing the settings of a conversation that is already under way: they are
+// server state, baked into the agent loop. The server validates, rebuilds the
+// loop, records a marker in the log, and broadcasts the updated conversation,
+// which the currentConversation watches apply — so nothing is applied locally
+// first, and a rejected change doesn't visibly snap back.
+async function updateConversationSettings(change: SettingsChange) {
   const id = props.conversationId;
   if (!id) return;
-  try {
-    await api.sendMessage(id, { message: `/model ${arg}`, model: selectedModel.value });
-  } catch (err) {
-    console.error("Failed to run /model:", err);
-    error.value = err instanceof Error ? err.message : "Failed to change model settings";
-  }
+  await api.updateConversationSettings(id, change);
+}
+// The picker's changes go to the server one at a time, in the order made. A
+// change can be worked out when its turn comes, from the settings the one
+// before left, which the picker may not show yet; null changes nothing.
+type QueuedChange = SettingsChange | ((s: Settings) => SettingsChange | null);
+let settingsQueue = Promise.resolve<{ id: string; settings: ConversationSettings } | null>(null);
+let settingsQueued = 0;
+function changeConversationSettings(change: QueuedChange) {
+  const id = props.conversationId;
+  if (!id) return;
+  settingsQueued++;
+  settingsQueue = settingsQueue.then(async (prior) => {
+    let left = prior?.id === id ? prior : null;
+    try {
+      // A change made just before switching conversations is dropped.
+      const c =
+        typeof change !== "function"
+          ? change
+          : props.conversationId === id
+            ? change(left?.settings ?? settingsInEffect.value.settings)
+            : null;
+      if (c) left = { id, settings: await api.updateConversationSettings(id, c) };
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : "Failed to change settings";
+      left = null;
+    }
+    // Once the queue empties, the conversation shows what's in effect.
+    return --settingsQueued ? left : null;
+  });
+}
+
+// The open conversation's reasoning level, as the pills name it.
+function conversationLevel(): ThinkingLevel {
+  return (settingsInEffect.value.settings.thinking_level || "default") as ThinkingLevel;
 }
 
 function switchConversationModel(model: string) {
-  if (model === selectedModel.value) return;
-  const rounded = thinkingLevelForModel(model, thinkingLevel.value);
-  const arg =
-    rounded !== "default" && rounded !== thinkingLevel.value ? `${model} ${rounded}` : model;
-  return sendModelCommand(arg);
+  if (model === settingsInEffect.value.settings.model) return;
+  // The server rounds the reasoning level to one the model has.
+  changeConversationSettings({ model });
 }
 
 function switchConversationCombination(
@@ -922,28 +1148,17 @@ function switchConversationCombination(
   if (level === null) {
     return switchConversationModel(model);
   }
-  if (model === selectedModel.value && level === thinkingLevel.value) return;
-  return sendModelCommand(`${model} ${level}`);
+  if (model === settingsInEffect.value.settings.model && level === conversationLevel()) return;
+  changeConversationSettings({ model, thinking_level: level });
 }
 
 // Reasoning pills in the status readout's picker. Same policy as the model
-// above: don't touch local state, let the server's echo drive the pill, so a
-// rejected level doesn't leave the UI (and the stored default) claiming a
-// setting the conversation doesn't have.
-//
-// The "auto" sentinel is the exception. It means "defer to the model's own
-// default", which has no /model spelling ("default" there selects the default
-// MODEL), so it can only be applied locally. It's only offered when the model's
-// concrete default is unknown, in which case there's no level to send anyway.
+// above: the server's echo drives the pill.
 function switchConversationThinkingLevel(level: ThinkingLevel) {
   // The pills are radios and re-emit on a click on the current one; without this
   // guard that rebuilds the agent loop and appends a marker for a no-op.
-  if (level === thinkingLevel.value) return;
-  if (level === "default") {
-    setThinkingLevel(level);
-    return;
-  }
-  void sendModelCommand(level);
+  if (level === conversationLevel()) return;
+  changeConversationSettings({ thinking_level: level === "default" ? "" : level });
 }
 
 // Model pick from the composer's picker (new/draft conversations), where the
@@ -1044,10 +1259,12 @@ const showAgentsMdEditor = ref(false);
 const diffViewerInitialCommit = ref<string | undefined>(undefined);
 const diffViewerCwd = ref<string | undefined>(undefined);
 const diffViewerInitialFile = ref<string | undefined>(undefined);
+const diffViewerOpenOnFiles = ref(false);
 const diffCommentText = ref("");
 // The image being annotated, if any (module state so any image in the message
 // tree can open the view without prop drilling).
 const imageCommentTarget = useImageCommentTarget();
+const markdownDoc = useMarkdownDoc();
 const agentWorking = ref(false);
 const resumingInterrupted = ref(false);
 const cancelling = ref(false);
@@ -1059,8 +1276,8 @@ const toolProgress = ref<Record<string, ToolProgress>>({});
 provideToolProgress(toolProgress);
 const streamingText = ref("");
 const streamingThinking = ref("");
-const showAdvancedSettings = ref(false);
-const advancedSettingsRef = ref<HTMLDivElement | null>(null);
+const showToolsModal = ref(false);
+const showProfilesModal = ref(false);
 const availableTools = ref<Array<{ name: string; summary: string; default_on: boolean }>>([]);
 
 const showScrollToBottom = ref(false);
@@ -1174,6 +1391,8 @@ const SWEEP_CHUNKS_PER_STEP = 4;
 const tailFloor = ref(0);
 const sweptTop = ref(0);
 const revealedChunks = reactive(new Set<string>());
+// Keys of the expanded carried bands of this conversation and view.
+const expandedCarriedBands = reactive(new Set<string>());
 let tailSweepToken = 0;
 let tailPrimedFor: string | null = null;
 let tailFloorKey: string | null = null;
@@ -1348,6 +1567,8 @@ interface ChunkTargetIndex {
   // precomputed so fragment resolution (which retries on a timer) is O(1).
   byMessageFrag: Map<string, number>;
   byToolFrag: Map<string, number>;
+  // Message id → key of the carried band it is in.
+  bandByMessage: Map<string, string>;
 }
 const chunkTargetIndexCache = new WeakMap<GenerationBlock[], ChunkTargetIndex>();
 
@@ -1355,12 +1576,18 @@ function fragPrefix(id: string): string {
   return id.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8);
 }
 
-function collectChunkTargets(node: RenderNode, index: number, into: ChunkTargetIndex): void {
+function collectChunkTargets(
+  node: RenderNode,
+  index: number,
+  into: ChunkTargetIndex,
+  band?: string,
+): void {
   switch (node.kind) {
     case "message":
       if (node.item.message) {
         into.byMessage.set(node.item.message.message_id, index);
         into.byMessageFrag.set(fragPrefix(node.item.message.message_id), index);
+        if (band) into.bandByMessage.set(node.item.message.message_id, band);
       }
       break;
     case "tool-call":
@@ -1370,7 +1597,7 @@ function collectChunkTargets(node: RenderNode, index: number, into: ChunkTargetI
       }
       break;
     case "carried-band":
-      for (const child of node.children) collectChunkTargets(child, index, into);
+      for (const child of node.children) collectChunkTargets(child, index, into, node.key);
       break;
   }
 }
@@ -1384,6 +1611,7 @@ function chunkTargetIndex(): ChunkTargetIndex {
       byTool: new Map(),
       byMessageFrag: new Map(),
       byToolFrag: new Map(),
+      bandByMessage: new Map(),
     };
     for (const block of model) {
       for (const chunk of block.chunks) {
@@ -1429,6 +1657,7 @@ provide(chunkMountKey, {
   revealed: revealedChunks,
   reveal: revealChunk,
   revealTarget: revealChunkTarget,
+  expandedBands: expandedCarriedBands,
 });
 
 const links = window.__SHELLEY_INIT__?.links || [];
@@ -1455,10 +1684,7 @@ const toolOverrides = ref<Record<string, "on" | "off">>(
     return {};
   })(),
 );
-function setToolOverride(name: string, value: "default" | "on" | "off") {
-  const next = { ...toolOverrides.value };
-  if (value === "default") delete next[name];
-  else next[name] = value;
+function setToolOverrides(next: Record<string, "on" | "off">) {
   toolOverrides.value = next;
   try {
     if (Object.keys(next).length === 0) localStorage.removeItem(TOOL_OVERRIDES_KEY);
@@ -1467,17 +1693,226 @@ function setToolOverride(name: string, value: "default" | "on" | "off") {
     /* ignore */
   }
 }
-function resetToolOverrides() {
-  toolOverrides.value = {};
+
+// ---- auto compaction nudge threshold (persisted) ----
+// Kept as a profile keeps it, 0 for the default, so that it follows the
+// default when that changes. The old key kept the default spelled out, when
+// that was 250k; any other pick carries over.
+const COMPACT_NUDGE_KEY = "shelley.compactNudge";
+const OLD_COMPACT_NUDGE_KEY = "shelley.compactNudgeTokens";
+const oldCompactNudge = Number(localStorage.getItem(OLD_COMPACT_NUDGE_KEY));
+if (oldCompactNudge) {
+  localStorage.removeItem(OLD_COMPACT_NUDGE_KEY);
   try {
-    localStorage.removeItem(TOOL_OVERRIDES_KEY);
+    if (localStorage.getItem(COMPACT_NUDGE_KEY) === null && oldCompactNudge !== 250_000) {
+      localStorage.setItem(COMPACT_NUDGE_KEY, String(oldCompactNudge));
+    }
   } catch {
     /* ignore */
   }
 }
-const toolOverrideCount = computed(() => Object.keys(toolOverrides.value).length);
+const compactNudgeTokens = ref<number>(
+  Number(localStorage.getItem(COMPACT_NUDGE_KEY)) || DEFAULT_COMPACT_NUDGE_TOKENS,
+);
+function setCompactNudgeTokens(tokens: number) {
+  compactNudgeTokens.value = tokens;
+  try {
+    localStorage.setItem(
+      COMPACT_NUDGE_KEY,
+      String(tokens === DEFAULT_COMPACT_NUDGE_TOKENS ? 0 : tokens),
+    );
+  } catch {
+    /* ignore */
+  }
+}
 
-const toolOverrideList = computed(() => availableTools.value);
+// ---- profiles, and the settings knob ----
+// The composer's settings are the persisted picks above, started from a
+// profile; a conversation's are server state. The knob (the model picker,
+// plus the tools and profiles modals) shows and changes whichever is in
+// effect.
+const { profiles } = useProfiles();
+onMounted(() =>
+  reloadProfiles().catch((err) => {
+    error.value = err instanceof Error ? err.message : String(err);
+  }),
+);
+// The profile picked in the composer, unless that's the default: then ""
+// follows whichever profile is the default.
+const PROFILE_KEY = "shelley.profile";
+const storedProfile = ref(localStorage.getItem(PROFILE_KEY) || "");
+// The profile whose settings the composer took last; the picks made since
+// survive a reload.
+const APPLIED_PROFILE_KEY = "shelley.profileApplied";
+const appliedProfile = ref(localStorage.getItem(APPLIED_PROFILE_KEY) || "");
+const composerProfile = computed(
+  () =>
+    profiles.value.find((p) => p.name === storedProfile.value) ??
+    profiles.value.find((p) => p.default),
+);
+function applyComposerProfile(p: Profile) {
+  appliedProfile.value = p.name;
+  localStorage.setItem(APPLIED_PROFILE_KEY, p.name);
+  // The server's default model when the profile names none.
+  setSelectedCombination(p.model || serverDefaultModel(), null);
+  const model = selectedModel.value;
+  setThinkingLevel(thinkingLevelForModel(model, (p.thinking_level || "default") as ThinkingLevel));
+  setToolOverrides({ ...p.tool_overrides });
+  setCompactNudgeTokens(p.compact_nudge_tokens || DEFAULT_COMPACT_NUDGE_TOKENS);
+}
+function selectComposerProfile(name: string) {
+  const p = profiles.value.find((candidate) => candidate.name === name);
+  if (!p) return;
+  storedProfile.value = p.default ? "" : name;
+  localStorage.setItem(PROFILE_KEY, storedProfile.value);
+  applyComposerProfile(p);
+}
+
+// Whether the status bar shows a conversation under way rather than the
+// composer (see ChatStatusContent), including while it loads.
+const conversationLive = computed(
+  () => !!props.conversationId && !props.currentConversation?.is_draft,
+);
+// What the composer shows: the settings a new conversation starts with.
+const composerSettings = computed<Settings>(() => ({
+  model: selectedModel.value,
+  thinking_level: thinkingLevel.value === "default" ? "" : thinkingLevel.value,
+  tool_overrides: toolOverrides.value,
+  // The picker can't leave it unset; 0 is what a profile stores for that.
+  compact_nudge_tokens:
+    compactNudgeTokens.value === DEFAULT_COMPACT_NUDGE_TOKENS ? 0 : compactNudgeTokens.value,
+  idle_compaction_minutes: composerProfile.value?.idle_compaction_minutes || 0,
+  idle_compaction_prompt: composerProfile.value?.idle_compaction_prompt || "",
+  cache_keep_warm_minutes: composerProfile.value?.cache_keep_warm_minutes || 0,
+  system_prompt: composerProfile.value?.system_prompt || "",
+}));
+const settingsInEffect = computed<{ profile: string; settings: Settings }>(() => {
+  const conv = props.currentConversation;
+  if (conversationLive.value) {
+    const opts = conversationOptions.value;
+    return {
+      profile: opts.profile || "",
+      settings: {
+        model: conv?.model || "",
+        thinking_level: opts.thinking_level || "",
+        tool_overrides: opts.tool_overrides || {},
+        compact_nudge_tokens: opts.compact_nudge_tokens || 0,
+        idle_compaction_minutes: opts.idle_compaction_minutes || 0,
+        idle_compaction_prompt: opts.idle_compaction_prompt || "",
+        cache_keep_warm_minutes: opts.cache_keep_warm_minutes || 0,
+        system_prompt: opts.system_prompt || "",
+      },
+    };
+  }
+  return { profile: composerProfile.value?.name || "", settings: composerSettings.value };
+});
+// The composer takes on its profile's settings when that becomes another
+// one: on first load, when its profile is deleted, or when it follows the
+// default and another is made the default.
+watch([composerProfile, () => conversationLive.value], ([p, live]) => {
+  if (!p || live || p.name === appliedProfile.value) return;
+  applyComposerProfile(p);
+});
+// A conversation's model shows in the picker while it's open (see the
+// conversation watch below); back in the composer, its own pick returns.
+watch(
+  () => conversationLive.value,
+  (live) => {
+    if (!live) selectedModel.value = pickReadyModel(models.value, storedSelectedModel());
+  },
+);
+// Switches whichever settings are in effect to the named profile's.
+async function useProfile(name: string) {
+  if (conversationLive.value) await updateConversationSettings({ profile: name });
+  else selectComposerProfile(name);
+}
+async function applyTools(overrides: Record<string, "on" | "off">, nudge: number) {
+  if (conversationLive.value) {
+    await updateConversationSettings({ tool_overrides: overrides, compact_nudge_tokens: nudge });
+    return;
+  }
+  setToolOverrides(overrides);
+  setCompactNudgeTokens(nudge);
+}
+// The composer takes on an edit to its profile; a conversation under way
+// keeps its settings until switched to the profile again.
+function onProfileSaved(name: string) {
+  const p = composerProfile.value;
+  if (!conversationLive.value && p?.name === name) applyComposerProfile(p);
+}
+// Changes the tools or the nudge in effect, each on its own, worked out from
+// the settings in effect when made: see changeConversationSettings.
+function changeToolSettings(
+  change: (s: Settings) => Pick<SettingsChange, "tool_overrides" | "compact_nudge_tokens"> | null,
+) {
+  if (conversationLive.value) return changeConversationSettings(change);
+  const c = change(settingsInEffect.value.settings);
+  if (c?.tool_overrides) setToolOverrides(c.tool_overrides);
+  if (c?.compact_nudge_tokens !== undefined) {
+    setCompactNudgeTokens(c.compact_nudge_tokens || DEFAULT_COMPACT_NUDGE_TOKENS);
+  }
+}
+// A conversation started with -no-tools has only the tools turned on.
+const conversationNoTools = computed(
+  () => conversationLive.value && !!conversationOptions.value.disable_all_tools,
+);
+const knob = computed<SettingsKnob>(() => {
+  const { profile, settings } = settingsInEffect.value;
+  const noTools = conversationNoTools.value;
+  const p = profiles.value.find((candidate) => candidate.name === profile);
+  return {
+    profiles: profiles.value,
+    profile,
+    changes: p ? settingsDifferences(p, settings, models.value, availableTools.value) : [],
+    // Auto compaction has its own section.
+    toolChanges: settingsDifferences(
+      { ...settings, tool_overrides: {}, compact_nudge_tokens: 0 },
+      settings,
+      models.value,
+      availableTools.value,
+    ).filter((c) => !(c.kind === "tool" && c.name === COMPACT_IN_PLACE_TOOL) && c.kind !== "nudge"),
+    autoCompaction: {
+      on: toolOn(settings.tool_overrides, COMPACT_IN_PLACE_TOOL, availableTools.value, noTools),
+      nudge: settings.compact_nudge_tokens || DEFAULT_COMPACT_NUDGE_TOKENS,
+      needed: settings.idle_compaction_minutes > 0,
+    },
+    // The choice in effect changes nothing, however spelled: Assistant's
+    // explicit "on" stays.
+    setAutoCompaction: (on) =>
+      changeToolSettings((s) =>
+        toolOn(s.tool_overrides, COMPACT_IN_PLACE_TOOL, availableTools.value, noTools) === on
+          ? null
+          : {
+              tool_overrides: withTool(
+                s.tool_overrides,
+                COMPACT_IN_PLACE_TOOL,
+                on,
+                availableTools.value,
+                noTools,
+              ),
+            },
+      ),
+    setCompactNudge: (tokens) =>
+      changeToolSettings((s) =>
+        (s.compact_nudge_tokens || DEFAULT_COMPACT_NUDGE_TOKENS) === tokens
+          ? null
+          : { compact_nudge_tokens: tokens === DEFAULT_COMPACT_NUDGE_TOKENS ? 0 : tokens },
+      ),
+    selectProfile: useProfile,
+    updateProfile: async () => {
+      await profilesApi.update(profile, settingsOf(settings, p));
+      await reloadProfiles();
+    },
+    saveAsProfile: async (name) => {
+      await profilesApi.create(name, settingsOf(settings, p));
+      await reloadProfiles();
+      // The settings are now this profile's; this only relabels them.
+      await useProfile(name);
+    },
+    configureTools: () => (showToolsModal.value = true),
+    editProfiles: () => (showProfilesModal.value = true),
+  };
+});
 
 // ---- per-conversation localStorage helpers ----
 function msgCountKey(): string | null {
@@ -1598,7 +2033,7 @@ function messageSnippet(m: Message): string {
       if (!snippet) {
         for (const c of content) {
           if (c.Type === LLM_TYPE_TOOL_USE && c.ToolName) {
-            snippet = `→ ${c.ToolName}`;
+            snippet = c.ToolName;
             break;
           }
         }
@@ -1692,8 +2127,11 @@ const usageData = computed<{ entries: UsageEntry[]; otherRows: OtherUsageRow[] }
   // Timestamp of the message that triggered the pending turn; anchors the
   // first call's duration (created_at only marks call completion).
   let turnStartTs = 0;
+  // An in-place compaction rewrote the context since the last call.
+  let compacted = false;
   for (const m of messages.value) {
     otherEntries.push(...parseOtherUsage(m));
+    if (m.type === "inplacecompaction") compacted = true;
     if (isHumanUserMessage(m)) {
       nextStartsTurn = true;
       turnStartTs = Date.parse(m.created_at) || 0;
@@ -1717,11 +2155,13 @@ const usageData = computed<{ entries: UsageEntry[]; otherRows: OtherUsageRow[] }
         ...u,
         snippet: messageSnippet(m),
         generation: m.generation,
+        afterCompaction: compacted,
         timestamp: Date.parse(m.created_at) || 0,
         startsTurn: nextStartsTurn,
         turnStartTimestamp: nextStartsTurn && turnStartTs ? turnStartTs : undefined,
       });
       nextStartsTurn = false;
+      compacted = false;
     }
     if (endsTurn) {
       nextStartsTurn = true;
@@ -1738,23 +2178,28 @@ const otherUsageRows = computed<OtherUsageRow[]>(() => usageData.value.otherRows
 watch(
   selectedModelInfo,
   (model) => {
-    if (!model) return;
+    // A conversation under way has its own level.
+    if (!model || conversationLive.value) return;
     const rounded = thinkingLevelForModel(model.id, thinkingLevel.value);
     if (rounded !== thinkingLevel.value) setThinkingLevel(rounded);
   },
   { immediate: true },
 );
 
-const conversationThinkingLevel = computed<string | null>(() => {
-  const raw = props.currentConversation?.conversation_options;
-  if (!raw) return null;
-  try {
-    const opts = JSON.parse(raw);
-    return opts?.thinking_level || null;
-  } catch {
-    return null;
-  }
-});
+const conversationThinkingLevel = computed<string | null>(
+  () => conversationOptions.value.thinking_level || null,
+);
+
+// Whether this conversation has the compact_in_place tool on: by default, as
+// started, or since the Compact in Place button enabled it.
+const compactInPlaceEnabled = computed(() =>
+  toolOn(
+    conversationToolOverrides.value,
+    COMPACT_IN_PLACE_TOOL,
+    availableTools.value,
+    conversationOptions.value.disable_all_tools,
+  ),
+);
 
 const displayTitle = computed(() => {
   const title = props.currentConversation?.slug || "Shelley";
@@ -1773,20 +2218,34 @@ const welcomeParts = computed(() =>
   ),
 );
 
-const coalescedItems = computed(() => {
-  const items = perfWrap("chat.coalesceMessages", () =>
+const allCoalescedItems = computed(() =>
+  perfWrap("chat.coalesceMessages", () =>
     coalesceMessages(
       messages.value,
       conversationInterrupted.value ? props.currentConversation?.current_generation : undefined,
+      buildingTours.value,
     ),
-  )();
-  if (conversationViewMode.value === "all") return items;
-  return items.filter(
-    (item) =>
-      item.type === "message" &&
-      !!item.message &&
-      isVisibleConversationMessage(item.message, conversationViewMode.value),
+  )(),
+);
+const coalescedItems = computed(() => {
+  const items = allCoalescedItems.value;
+  const mode = conversationViewMode.value;
+  if (mode === "all") return items;
+  return items.filter((item) =>
+    item.type === "tool"
+      ? mode === "brief" && (isDeliveredUserMessage(item) || isFailedChatDelivery(item))
+      : !!item.message && isVisibleConversationMessage(item.message, mode),
   );
+});
+const messageUserResolveTarget = computed(() => targetResolver(messages.value));
+provide(messageUserContextKey, {
+  reactions: computed(() =>
+    messageUserEnabled.value
+      ? collectReactions(allCoalescedItems.value, messageUserResolveTarget.value)
+      : new Map(),
+  ),
+  resolveTarget: messageUserResolveTarget,
+  jumpTo: jumpToMessage,
 });
 const visibleMessages = computed(() =>
   messages.value.filter((message) =>
@@ -2348,6 +2807,11 @@ function handleScrollToBottomClick() {
   scrollToBottom();
 }
 
+function handleRunningWorkToggle() {
+  if (!atBottom || userScrolled) return;
+  nextTick(scrollToBottom);
+}
+
 function requestCurrentConversationBottom() {
   followExplicitSelectionToBottom = true;
   suppressExplicitSelectionClamp = pendingScroll !== undefined;
@@ -2548,6 +3012,12 @@ async function loadMessages(focusedId: string) {
   const loadEpoch = ++conversationLoadEpoch;
   const isCurrent = () =>
     focusedId === currentConversationId && loadEpoch === conversationLoadEpoch;
+  // Capture the server-resolved state before hydration publishes older cached
+  // metadata through syncFromStore. Archived conversations have no live list
+  // entry to correct that metadata or seed their known message tail.
+  const isArchived =
+    !!props.currentConversation?.archived &&
+    props.currentConversation.conversation_id === focusedId;
   const timing: ConversationLoadTiming = {
     startedAt: performance.now(),
     hydrateMs: 0,
@@ -2603,14 +3073,7 @@ async function loadMessages(focusedId: string) {
     !!cached &&
     cached.hasFullHistory &&
     (cached.maxSequenceIdKnown <= 0 || cached.maxSequenceId >= cached.maxSequenceIdKnown);
-  // Archived conversations are absent from the live list, so nothing seeds
-  // maxSequenceIdKnown for them and a cached prefix that fell behind (say,
-  // while every tab was hidden) would read as complete. Confirm the tail with
-  // the server; for a complete cache that is one cheap ?last_sequence_id= call.
-  const isArchived =
-    !!props.currentConversation?.archived &&
-    props.currentConversation.conversation_id === focusedId;
-
+  // Always confirm archived history with the server, even if the cache looks complete.
   if (cacheIsComplete && !cached!.needsRefresh && !isArchived) {
     cacheDiag("hit", "load.served_from_cache", {
       conversation_id: focusedId,
@@ -2726,7 +3189,7 @@ async function loadMessages(focusedId: string) {
   } catch (err) {
     if (!isCurrent()) return;
     console.error("Failed to load messages:", err);
-    error.value = "Failed to load messages";
+    error.value = err instanceof ApiError ? err.message : "Failed to load messages";
     clearConversationLoading();
   }
 }
@@ -2739,31 +3202,37 @@ const pendingQueuedMessages: {
 }[] = [];
 
 async function queueMessage(message: string) {
-  if (!message.trim() || !props.conversationId) return;
+  if (!props.conversationId) return;
+  await queueMessageTo(props.conversationId, selectedModel.value, message);
+}
+
+async function queueMessageTo(conversationId: string, model: string, message: string) {
+  if (!message.trim()) return;
   // Same guard as sendMessage: a queued turn runs the LLM later, so an
   // unavailable model just defers the confusing "Unsupported model" error.
   // Throws (not returns) so MessageInput's catch restores the composer text.
-  if (!canSendWithModel(selectedModel.value, readyModelIds.value)) {
+  if (!canSendWithModel(model, readyModelIds.value)) {
     const err = new Error(noModelErrorMessage());
     error.value = err.message;
     throw err;
   }
   const pending = {
-    conversationId: props.conversationId,
+    conversationId,
     text: message,
     controller: new AbortController(),
   };
   pendingQueuedMessages.push(pending);
   try {
     await api.sendMessage(
-      props.conversationId,
+      conversationId,
       {
         message: message.trim(),
-        model: selectedModel.value,
+        model,
         queue: true,
       },
       pending.controller.signal,
     );
+    props.onMessageSent?.(conversationId);
   } catch (err) {
     if (pending.controller.signal.aborted) return;
     console.error("Failed to queue message:", err);
@@ -2772,6 +3241,33 @@ async function queueMessage(message: string) {
     const index = pendingQueuedMessages.indexOf(pending);
     if (index !== -1) pendingQueuedMessages.splice(index, 1);
   }
+}
+
+function getLiveConversation(id: string): Conversation | undefined {
+  return props.conversations.find((row) => row.conversation_id === id) ??
+    (props.currentConversation?.conversation_id === id ? props.currentConversation : undefined);
+}
+
+// A call is pinned to the conversation on screen when it is tapped. On /new,
+// the draft is created only once the call can proceed, as a recording's is,
+// and belongs to this composer session even if the user navigates meanwhile.
+function captureLiveConversation(): LiveCallDestination {
+  if (!canSendWithModel(selectedModel.value, readyModelIds.value)) {
+    throw new Error(noModelErrorMessage());
+  }
+  const conversationId = props.conversationId;
+  const isDraft = !conversationId || !!props.currentConversation?.is_draft;
+  const creation = { model: selectedModel.value, cwd: selectedCwd.value || undefined };
+  const sessionVersion = draftSessionVersion;
+  const draft = { text: draftText, newSessionVersion: newDraftSessionVersion };
+  return {
+    conversationId,
+    conversation: props.currentConversation,
+    settings: isDraft ? { ...creation, conversation_options: buildConversationOptions() } : undefined,
+    prepareConversation: () => sessionVersion === draftSessionVersion
+      ? ensureDraftConversation(draftText, creation)
+      : createDraftForSession(draft, sessionVersion, creation),
+  };
 }
 
 const sendingQueuedNow = ref<string | null>(null);
@@ -2826,22 +3322,81 @@ const queuedGhosts = computed(() => {
   perfCount("chat.queuedGhosts");
   return parseQueuedMessages(props.currentConversation?.queued_messages);
 });
+const visibleQueuedGhosts = useVisibleQueuedMessages(() => queuedGhosts.value);
 
-// Build the conversation_options bundle from the current composer selection
-// (tool overrides, thinking level). "default" omits the
-// thinking override so the model's configured/provider default applies. Used
-// when promoting an autosaved draft on
+// Build the conversation_options bundle from the composer's settings: its
+// profile (for the system prompt), and what the composer shows for the rest,
+// which override the profile's. Used when promoting an autosaved draft on
 // first send — the draft is created (via POST /draft autosave) without
 // options, so the selection only reaches the server on the promoting chat
 // request.
-function buildConversationOptions(): ChatRequest["conversation_options"] | undefined {
-  const hasOverrides = Object.keys(toolOverrides.value).length > 0;
-  const explicitThinking = thinkingLevel.value === "default" ? undefined : thinkingLevel.value;
-  const hasThinking = explicitThinking !== undefined;
-  if (!hasOverrides && !hasThinking) return undefined;
+function buildConversationOptions(): ChatRequest["conversation_options"] {
+  const {
+    thinking_level,
+    tool_overrides,
+    compact_nudge_tokens,
+    idle_compaction_minutes,
+    idle_compaction_prompt,
+    cache_keep_warm_minutes,
+  } = composerSettings.value;
   return {
-    ...(hasOverrides ? { tool_overrides: { ...toolOverrides.value } } : {}),
-    ...(explicitThinking ? { thinking_level: explicitThinking } : {}),
+    profile: composerProfile.value?.name,
+    thinking_level,
+    tool_overrides: { ...tool_overrides },
+    compact_nudge_tokens,
+    idle_compaction_minutes,
+    idle_compaction_prompt,
+    cache_keep_warm_minutes,
+  };
+}
+
+// A narrated review recorded outside a live conversation goes, like a
+// composer recording, to this page's draft; if the page has moved on by the
+// time it's sent (or is archived), elsewhere (see ReviewConversationStart).
+function startReviewConversation(): ReviewConversationStart {
+  if (!canSendWithModel(selectedModel.value, readyModelIds.value)) {
+    throw new Error(noModelErrorMessage());
+  }
+  const sessionVersion = draftSessionVersion;
+  const archived = !!props.currentConversation?.archived;
+  const onPage = () => !archived && sessionVersion === draftSessionVersion;
+  const settings = () => ({
+    model: selectedModel.value,
+    conversation_options: buildConversationOptions(),
+  });
+  return {
+    settings: settings(),
+    draft: () => (onPage() ? (draftConvId ?? undefined) : undefined),
+    async resolve(cwd) {
+      if (!onPage()) return undefined;
+      // Read before waiting: the page may change while the draft is made.
+      const now = settings();
+      const conversationId = await ensureDraftConversation(inflightDraft?.text ?? draftText, {
+        model: now.model,
+        cwd,
+      });
+      return { conversationId, settings: now };
+    },
+  };
+}
+
+// Shows the conversation a sent review started, unless the user is in a
+// conversation of their own or has moved on since the send began.
+function followReviewConversation() {
+  const sessionVersion = draftSessionVersion;
+  const wanted = (id: string) => {
+    const viewed = props.currentConversation;
+    const inConversation = !!viewed && !viewed.is_draft && !viewed.archived;
+    return !inConversation && sessionVersion === draftSessionVersion && props.conversationId !== id;
+  };
+  return (id: string) => {
+    if (!wanted(id)) return;
+    api
+      .getConversationBySlug(id)
+      .then((started) => {
+        if (started && wanted(id)) props.onSelectConversation?.(started);
+      })
+      .catch((err) => console.error("Failed to open the review's conversation:", err));
   };
 }
 
@@ -2860,8 +3415,7 @@ async function sendFirstMessage(prompt: string) {
     prompt,
     selectedModel.value,
     selectedCwd.value || undefined,
-    Object.keys(toolOverrides.value).length > 0 ? { ...toolOverrides.value } : undefined,
-    thinkingLevel.value === "default" ? undefined : thinkingLevel.value,
+    buildConversationOptions(),
   );
 }
 
@@ -2934,12 +3488,13 @@ function prepareRecording(text: string): RecordingPreparation {
             error.value = null;
             const suffix = context.trim();
             try {
-              await api.sendMessage(conversationId, {
-                message: `${SLASH_COMMANDS.TRANSCRIPTION.command} ${path}${suffix ? `\n${suffix}` : ""}`,
-                ...options,
-              });
+              await postSubmittedDraft(conversationId, text, () =>
+                api.sendMessage(conversationId, {
+                  message: `${SLASH_COMMANDS.TRANSCRIPTION.command} ${path}${suffix ? `\n${suffix}` : ""}`,
+                  ...options,
+                }),
+              );
               accepted = true;
-              clearSubmittedDraft(conversationId, text);
             } catch (err) {
               const detail = err instanceof Error ? err.message : String(err);
               error.value = `Failed to submit recording to ${conversationId}: ${detail}. Retry in that conversation with /transcription ${path}`;
@@ -2963,6 +3518,36 @@ function prepareRecording(text: string): RecordingPreparation {
 function handleRecordingUnsent(path: string, cause: unknown) {
   const detail = cause instanceof Error ? cause.message : String(cause);
   error.value = `${detail}. Retry with /transcription ${path}`;
+}
+
+// Conversation ids with a send from THIS tab in flight. Their pending mirror
+// entries are ours: the reconcile watch must keep treating them as the
+// composer's own text (see CachedDraft.pending), so an echo cannot clear a
+// composer whose send may yet fail.
+const ownSends = new Set<string>();
+
+// postSubmittedDraft runs the chat POST for a composer's text with its mirror
+// entry flagged pending, then clears the accepted text, or unflags it if the
+// POST fails.
+async function postSubmittedDraft<T>(
+  conversationId: string,
+  text: string,
+  post: () => Promise<T>,
+): Promise<T> {
+  const restore = markCachedDraftPending(conversationId, text);
+  ownSends.add(conversationId);
+  let result: T;
+  try {
+    result = await post();
+  } catch (err) {
+    restore();
+    throw err;
+  } finally {
+    ownSends.delete(conversationId);
+  }
+  clearSubmittedDraft(conversationId, text);
+  props.onMessageSent?.(conversationId);
+  return result;
 }
 
 function clearSubmittedDraft(conversationId: string, text: string) {
@@ -3069,19 +3654,20 @@ async function sendMessage(message: string) {
     try {
       sending.value = true;
       error.value = null;
-      const path = window.location.pathname;
-      const startedAt = performance.now();
       const accepted = await api.sendMessage(props.conversationId, {
         message: trimmedMessage,
         model: selectedModel.value,
       });
-      const cwd = trimmedMessage.split("\n")[1]?.trim() || props.currentConversation?.cwd || selectedCwd.value;
+      const cwd =
+        trimmedMessage.split("\n")[1]?.trim() ||
+        props.currentConversation?.cwd ||
+        selectedCwd.value;
       if (accepted.tour && cwd) {
         applyCommitTourStatus(cwd, accepted.tour.hash, accepted.tour);
         if (accepted.tour.status === "present") {
           handleOpenDiffViewer(accepted.tour.hash, cwd);
         } else if (accepted.tour.status === "building") {
-          announceCommitTourRequest(props.conversationId, cwd, accepted.tour.hash, path, startedAt);
+          announceCommitTourRequest(cwd, accepted.tour.hash);
         }
       }
     } catch (err) {
@@ -3112,14 +3698,14 @@ async function sendMessage(message: string) {
     }
     return;
   }
-  // /model is handled server-side synchronously (it switches the model and
-  // returns immediately without starting a turn), so it must NOT flip the
-  // agent-working state — otherwise "Agent working..." would stick on. Send it
-  // like a normal message but skip the working indicator.
-  if (
-    (trimmedMessage === "/model" || trimmedMessage.startsWith("/model ")) &&
-    props.conversationId
-  ) {
+  // /model and /compact-debug are handled server-side synchronously (they
+  // return immediately without starting a turn), so they must NOT flip the
+  // agent-working state — otherwise "Agent working..." would stick on. Send
+  // them like a normal message but skip the working indicator.
+  const syncCommand = ["/model", "/compact-debug"].find(
+    (c) => trimmedMessage === c || trimmedMessage.startsWith(`${c} `),
+  );
+  if (syncCommand && props.conversationId) {
     try {
       sending.value = true;
       error.value = null;
@@ -3128,7 +3714,7 @@ async function sendMessage(message: string) {
         model: selectedModel.value,
       });
     } catch (err) {
-      console.error("Failed to run /model:", err);
+      console.error(`Failed to run ${syncCommand}:`, err);
       error.value = err instanceof Error ? err.message : "Unknown error";
     } finally {
       sending.value = false;
@@ -3185,7 +3771,8 @@ async function sendMessage(message: string) {
     trimmedMessage.startsWith(`${SLASH_COMMANDS.NEW.command} `)
   ) {
     const prompt = trimmedMessage.slice(SLASH_COMMANDS.NEW.command.length).trim();
-    props.onNewConversation();
+    if (!(await props.onNewConversation())) throw new Error("Failed to start new conversation");
+    await nextTick();
     if (!prompt || !props.onFirstMessage) return;
     try {
       sending.value = true;
@@ -3210,6 +3797,7 @@ async function sendMessage(message: string) {
       const terminal: EphemeralTerminal = {
         id: `term-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
         command: shellCommand,
+        closeOnExit: isInteractiveShellLaunch(shellCommand),
         cwd:
           props.currentConversation?.cwd ||
           selectedCwd.value ||
@@ -3221,10 +3809,7 @@ async function sendMessage(message: string) {
         conversationId: props.conversationId ?? null,
       };
       props.setEphemeralTerminals((prev) => [...prev, terminal]);
-      const firstWord = shellCommand.split(/\s+/)[0];
-      const baseName = firstWord.split("/").pop() || firstWord;
-      const interactiveShells = ["bash", "sh", "zsh", "fish", "nu", "nushell"];
-      if (interactiveShells.includes(baseName)) {
+      if (terminal.closeOnExit) {
         terminalAutoFocusId.value = terminal.id;
       }
       setTimeout(() => scrollToBottom(), 100);
@@ -3254,8 +3839,13 @@ async function sendMessage(message: string) {
     if (!effectiveId && props.onFirstMessage) {
       await sendFirstMessage(message.trim());
     } else if (effectiveId) {
-      await api.sendMessage(effectiveId, request);
-      clearSubmittedDraft(effectiveId, submittedDraft);
+      const id = effectiveId;
+      const accepted = await postSubmittedDraft(id, submittedDraft, () =>
+        api.sendMessage(id, request),
+      );
+      // A queued message starts no turn (e.g. it waits behind a failed
+      // recording), so drop the optimistic indicator for the server's state.
+      if (accepted.status === "queued") syncTransientFromStore(id);
     }
   } catch (err) {
     console.error("Failed to send message:", err);
@@ -3320,6 +3910,43 @@ async function handleDistillCompactNewGeneration(instructions?: string) {
   );
 }
 
+/** Compact, then queue `message` behind the compaction (queued messages drain
+ * once distillation ends). The user may switch conversations while the
+ * compaction request is in flight, so pin the queue to the conversation and
+ * model that were active when they clicked. */
+async function compactAndQueue(message: string) {
+  const conversationId = props.conversationId;
+  if (!conversationId || !props.onDistillNewGeneration) return;
+  const model = selectedModel.value;
+  const cwd = props.currentConversation?.cwd || selectedCwd.value || undefined;
+  await props.onDistillNewGeneration(conversationId, model, cwd, "compact");
+  await queueMessageTo(conversationId, model, message);
+}
+
+/** Asks the agent to compact its context in place. A conversation started
+ * without the compact_in_place tool gets it first; the server refuses that
+ * mid-turn (compactInPlaceBusy keeps the button disabled then). */
+async function handleCompactInPlace() {
+  const conversationId = props.conversationId;
+  if (!conversationId) return;
+  if (!compactInPlaceEnabled.value) {
+    error.value = null;
+    let enabled: Conversation;
+    try {
+      enabled = await api.enableCompactInPlace(conversationId);
+    } catch (err) {
+      // The user may have moved on while that was in flight.
+      if (props.conversationId === conversationId) {
+        error.value = err instanceof Error ? err.message : String(err);
+      }
+      return;
+    }
+    props.onConversationUpdate?.(enabled);
+    if (props.conversationId !== conversationId) return;
+  }
+  await sendMessage(COMPACT_IN_PLACE_REQUEST);
+}
+
 async function handleStartNewGeneration() {
   if (!props.conversationId) return;
   const conversation = await api.startNewGeneration(props.conversationId);
@@ -3336,47 +3963,44 @@ async function handleUnarchive() {
   }
 }
 
-function handleOpenDiffViewer(commit: string, cwd?: string) {
+function handleOpenDiffViewer(commit: string, cwd?: string, openOnFiles = false) {
   diffViewerInitialCommit.value = commit;
+  diffViewerOpenOnFiles.value = openOnFiles;
   diffViewerCwd.value = cwd;
   showDiffViewer.value = true;
 }
 
+// Tours requested from this tab are watched until they settle so chat keeps their rows visible.
 const activeTourRequests = new Map<string, () => void>();
+const buildingTours = ref<ReadonlySet<string>>(new Set());
 let unsubscribeTourRequests: (() => void) | null = null;
-let lastUserActivityAt = 0;
-const tourActivityEvents = ["pointerdown", "keydown", "wheel", "touchstart"] as const;
-
-function markTourUserActivity() {
-  lastUserActivityAt = performance.now();
+function setTourBuilding(hash: string, building: boolean) {
+  if (buildingTours.value.has(hash) === building) return;
+  const next = new Set(buildingTours.value);
+  if (building) next.add(hash);
+  else next.delete(hash);
+  buildingTours.value = next;
 }
-
-function watchRequestedTour({ conversationId, cwd, hash, path, startedAt }: CommitTourRequest) {
+function watchRequestedTour({ cwd, hash }: CommitTourRequest) {
   const key = commitTourStatusKey(cwd, hash);
   if (activeTourRequests.has(key)) return;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let unsubscribe = () => {};
+  let stopped = false;
   const stop = () => {
+    stopped = true;
     if (timer) clearTimeout(timer);
     unsubscribe();
     activeTourRequests.delete(key);
   };
   activeTourRequests.set(key, stop);
   unsubscribe = subscribeCommitTourStatus(cwd, hash, (status) => {
+    setTourBuilding(hash, status.status === "building");
     if (status.status === "building") return;
     stop();
-    if (
-      status.status === "present" &&
-      props.conversationId === conversationId &&
-      window.location.pathname === path &&
-      lastUserActivityAt <= startedAt &&
-      document.visibilityState === "visible" &&
-      !showDiffViewer.value &&
-      !draftText.trim()
-    ) {
-      handleOpenDiffViewer(hash, cwd);
-    }
   });
+  // A cached settled status is replayed during subscribe, before unsubscribe is assigned.
+  if (stopped) unsubscribe();
   const poll = async () => {
     try {
       await loadCommitTourStatus(cwd, hash, true);
@@ -3413,7 +4037,8 @@ function openInAppTerminal() {
     "/";
   const terminal: EphemeralTerminal = {
     id: `term-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-    command: 'exec "${SHELL:-bash}" -i',
+    command: INTERACTIVE_SHELL_COMMAND,
+    closeOnExit: true,
     cwd,
     createdAt: new Date(),
     conversationId: props.conversationId ?? null,
@@ -3609,10 +4234,7 @@ async function saveDraft(value: string) {
       if (draftConvId === id && conv.updated_at > draftSyncedAt) {
         draftSyncedAt = conv.updated_at;
       }
-      const cur = loadCachedDraft(id);
-      if (cur && conv.updated_at > cur.basedOn) {
-        saveCachedDraft(id, cur.value, conv.updated_at);
-      }
+      rebaseCachedDraft(id, conv.updated_at);
     }
     return;
   }
@@ -3718,6 +4340,7 @@ function onDiffViewerClose() {
   showDiffViewer.value = false;
   diffViewerInitialCommit.value = undefined;
   diffViewerInitialFile.value = undefined;
+  diffViewerOpenOnFiles.value = false;
   diffViewerCwd.value = undefined;
   if (!showGitGraph.value) focusMessageInputIfUnfocused();
 }
@@ -3767,10 +4390,9 @@ const statusContentProps = computed(() => {
     selectedModel: selectedModel.value,
     sending: sending.value,
     refreshingModels: refreshingModels.value,
-    thinkingLevel: thinkingLevel.value,
-    toolOverrides: toolOverrides.value,
-    toolOverrideList: toolOverrideList.value,
-    toolOverrideCount: toolOverrideCount.value,
+    // A conversation's level is the server's; "" is its model's default.
+    thinkingLevel: conversationLive.value ? conversationLevel() : thinkingLevel.value,
+    knob: knob.value,
     cwdError: cwdError.value,
     onUnarchive: handleUnarchive,
     onClearError: () => (error.value = null),
@@ -3778,11 +4400,13 @@ const statusContentProps = computed(() => {
     onResumeInterrupted: handleResumeInterrupted,
     onDistillNewGeneration: contextBarDistill.value,
     onStartNewGeneration: handleStartNewGeneration,
+    onCompactInPlace: handleCompactInPlace,
+    compactInPlaceBusy: agentWorking.value && !compactInPlaceEnabled.value,
     onSelectModel: setSelectedModel,
     onSelectCombination: setSelectedCombination,
     // The status readout's inline picker only renders for a conversation that
     // already exists, where the model and reasoning level are server state (see
-    // sendModelCommand); the composer's picker only renders before the first
+    // updateConversationSettings); the composer's picker only renders before the first
     // send, where they are not. Separate handlers, not shared ones.
     onSwitchConversationModel: switchConversationModel,
     onSwitchConversationCombination: switchConversationCombination,
@@ -3790,8 +4414,6 @@ const statusContentProps = computed(() => {
     onManageModels: () => props.onOpenModelsModal?.(),
     onRefreshModels: handleRefreshModels,
     onThinkingChange: setThinkingLevel,
-    onSetToolOverride: setToolOverride,
-    onResetToolOverrides: resetToolOverrides,
     onOpenDirectoryPicker: () => (showDirectoryPicker.value = true),
     onUsageNeeded: () => (usageWanted.value = true),
   };
@@ -3806,6 +4428,9 @@ const statusContentProps = computed(() => {
 // Server-driven: applyModel, not setSelectedModel — echoing a row back into a
 // PUT would loop, and while our own picker PUTs are in flight the row is
 // stale, so applying it would revert the pick (see modelPutsInFlight).
+//
+// A conversation under way only shows its model: the composer's pick, in
+// localStorage, stays for the next new conversation.
 watch(
   () => [props.currentConversation?.conversation_id, props.currentConversation?.model] as const,
   () => {
@@ -3813,7 +4438,8 @@ watch(
     if (modelPutsInFlight > 0 && props.currentConversation.conversation_id === modelPutDraftId) {
       return;
     }
-    applyModel(props.currentConversation.model);
+    if (conversationLive.value) selectedModel.value = props.currentConversation.model;
+    else applyModel(props.currentConversation.model);
   },
 );
 
@@ -3824,9 +4450,13 @@ watch(
 // composer last chose locally, i.e. the switch the user just made wouldn't
 // appear. Only follows a conversation that actually recorded a level: a null
 // means "never set", which must not clobber the local default.
+//
+// Only for drafts: a conversation under way shows its level from
+// settingsInEffect, leaving the composer's for the next new conversation.
 watch(
   () => [props.currentConversation?.conversation_id, conversationThinkingLevel.value] as const,
   ([, level]) => {
+    if (conversationLive.value) return;
     if (!level || level === thinkingLevel.value) return;
     if (!THINKING_LEVELS.some((l) => l.value === level)) return;
     setThinkingLevel(level as ThinkingLevel);
@@ -3840,7 +4470,6 @@ watch(
   (id) => {
     if (id === null) {
       cwdInitialized.value = false;
-      showAdvancedSettings.value = false;
     }
   },
 );
@@ -3929,7 +4558,9 @@ watch(
 watch(
   readyModelIds,
   (ready) => {
-    if (!selectedModel.value) return;
+    // A conversation under way keeps its model; the server names the
+    // problem if it's gone.
+    if (!selectedModel.value || conversationLive.value) return;
     if (ready.includes(selectedModel.value)) return;
     // Prefer the server's default (or any ready model) over showing nothing,
     // so a mere catalog reshuffle doesn't strand the composer.
@@ -3944,17 +4575,6 @@ onMounted(() => {
     .getTools()
     .then((r) => (availableTools.value = r.tools))
     .catch(() => {});
-});
-
-// Close advanced settings popover on outside click.
-function onAdvancedSettingsOutside(e: MouseEvent) {
-  if (advancedSettingsRef.value && !advancedSettingsRef.value.contains(e.target as Node)) {
-    showAdvancedSettings.value = false;
-  }
-}
-watch(showAdvancedSettings, (open) => {
-  document.removeEventListener("mousedown", onAdvancedSettingsOutside);
-  if (open) document.addEventListener("mousedown", onAdvancedSettingsOutside);
 });
 
 // Generation bump -> reset context window state.
@@ -4037,6 +4657,7 @@ watch(
     // An annotation view belongs to the image it was opened from; switching
     // conversations leaves it stranded.
     closeImageComment();
+    closeMarkdownDoc();
     clearConversationLoading();
     // Reset scroll bookkeeping so state from the previous conversation can't
     // leak across the switch. lastListHeight/clampBudget are especially
@@ -4065,6 +4686,7 @@ watch(
     // Tail-first mounting is per conversation: cancel the old sweep and mount
     // everything until the new load primes a fresh floor.
     resetTailFirst();
+    expandedCarriedBands.clear();
     if (!id) {
       messages.value = [];
       btwExchanges.value = [];
@@ -4210,20 +4832,35 @@ watch(
     () => props.currentConversation?.updated_at,
     lazyDraftId,
   ],
-  () => {
+  ([id, isDraft], prev) => {
     perfCount("chat.draftReconcileWatch");
+    const sessionId = props.conversationId ?? null;
+    const cached = loadCachedDraft(sessionId);
+    // The row flipping is_draft true->false in place is the draft being sent.
+    const [prevId, prevIsDraft, prevDraft] = prev ?? [];
+    const promotedFrom =
+      prev && id === prevId && prevIsDraft === true && isDraft === false ? prevDraft || "" : null;
     const result = reconcileComposerDraft({
-      conversationId: props.conversationId ?? null,
+      conversationId: sessionId,
       lazyDraftId: lazyDraftId.value,
-      isDraft: !!props.currentConversation?.is_draft,
+      isDraft: !!isDraft,
       serverDraft: props.currentConversation?.draft || "",
       serverUpdatedAt: props.currentConversation?.updated_at || "",
-      cached: loadCachedDraft(props.conversationId ?? null),
+      cached,
+      ownsPending: sessionId !== null && ownSends.has(sessionId),
+      promotedFrom,
       composerValue: draftText,
       lastSeededSession,
       lastSeededValue,
     });
     if (result === null) return;
+    // Entering a session restores even a pending entry (reload mid-send). Unless
+    // the send is this tab's own (still in flight while we navigated away and
+    // back), it died with its page: the text is a plain draft again, or later
+    // echoes would treat it as departing and clear the composer.
+    if (lastSeededSession !== sessionId && cached?.pending && !ownSends.has(sessionId ?? "")) {
+      saveCachedDraft(sessionId, cached.value, cached.basedOn);
+    }
     draftSyncedAt = result.draftSyncedAt;
     seedComposer(result.value);
     lastSeededValue = result.value;
@@ -4298,34 +4935,67 @@ watch(
     const targetEl = userMessageEls[targetIdx] as HTMLElement;
     markUserScrolledUp();
     targetEl.scrollIntoView({ behavior: "smooth", block: "start" });
+    highlightMessage(targetEl);
+  },
+);
+
+function highlightMessage(targetEl: HTMLElement) {
+  if (highlightTimeout) {
+    clearTimeout(highlightTimeout);
+    highlightTimeout = null;
+  }
+  targetEl.classList.remove("message-highlight");
+  void targetEl.offsetWidth;
+  targetEl.classList.add("message-highlight");
+  const removeHighlight = () => {
+    targetEl.classList.remove("message-highlight");
     if (highlightTimeout) {
       clearTimeout(highlightTimeout);
       highlightTimeout = null;
     }
-    targetEl.classList.remove("message-highlight");
-    void targetEl.offsetWidth;
-    targetEl.classList.add("message-highlight");
-    const removeHighlight = () => {
-      targetEl.classList.remove("message-highlight");
-      if (highlightTimeout) {
-        clearTimeout(highlightTimeout);
-        highlightTimeout = null;
-      }
-    };
-    targetEl.addEventListener("animationend", removeHighlight, { once: true });
-    highlightTimeout = window.setTimeout(removeHighlight, 2000);
-  },
-);
+  };
+  targetEl.addEventListener("animationend", removeHighlight, { once: true });
+  highlightTimeout = window.setTimeout(removeHighlight, 2000);
+}
+
+// Scroll to and highlight a message, mounting its chunk and expanding its
+// carried band first if need be.
+async function jumpToMessage(messageId: string) {
+  let pending = revealChunkTarget({ messageId });
+  const band = chunkTargetIndex().bandByMessage.get(messageId);
+  if (band && !expandedCarriedBands.has(band)) {
+    expandedCarriedBands.add(band);
+    pending = true;
+  }
+  if (pending) await nextTick();
+  const container = messagesContainerRef.value;
+  const el = container?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(messageId)}"]`);
+  if (!container || !el) return;
+  // A message already in full view only needs the highlight. Scrolling to it
+  // would not move, and marking the user scrolled up would then stop
+  // following new messages with nothing to undo it.
+  const view = container.getBoundingClientRect();
+  const rect = el.getBoundingClientRect();
+  if (rect.top < view.top || rect.bottom > view.bottom) {
+    markUserScrolledUp();
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+  highlightMessage(el);
+}
 
 // Auto-scroll after DOM updates (mirrors the useLayoutEffect).
 watch(
-  [messages, loading, streamingText, streamingThinking],
+  [messages, loading, streamingText, streamingThinking, liveExchangeTurns],
   () => {
     if (loading.value) return;
     nextTick(() => {
       const wasCatchingUp = catchingUp;
       catchingUp = false;
       const pending = pendingScroll;
+      // A saved reading position waits for the history: against an empty
+      // list it would clamp to the top, which reads as the bottom, and
+      // following the bottom would then carry it away as the history lands.
+      if (pending != null && messages.value.length === 0) return;
       if (pending !== undefined) {
         pendingScroll = undefined;
         if (pending != null) {
@@ -4847,11 +5517,13 @@ onMounted(() => {
     const cwdParam = params.get("cwd") || undefined;
     diffViewerInitialCommit.value = commit;
     diffViewerInitialFile.value = params.get("file") || undefined;
+    diffViewerOpenOnFiles.value = params.get("view") === "files";
     diffViewerCwd.value = cwdParam;
     showDiffViewer.value = true;
     params.delete("diff");
     params.delete("cwd");
     params.delete("file");
+    params.delete("view");
     const qs = params.toString();
     window.history.replaceState(
       {},
@@ -4867,13 +5539,11 @@ onMounted(() => {
   document.addEventListener("keydown", handleScrollKeyDown);
   document.addEventListener("keydown", handleMenuShortcut);
   unsubscribeTourRequests = subscribeCommitTourRequests(watchRequestedTour);
-  for (const event of tourActivityEvents) document.addEventListener(event, markTourUserActivity, true);
 });
 
 onUnmounted(() => {
   unsubscribeTourRequests?.();
   for (const stop of activeTourRequests.values()) stop();
-  for (const event of tourActivityEvents) document.removeEventListener(event, markTourUserActivity, true);
   teardownSubscriptions();
   stopBottomPin();
   tailSweepToken++; // cancel any in-flight background mount sweep
@@ -4896,11 +5566,11 @@ onUnmounted(() => {
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   document.removeEventListener("keydown", handleScrollKeyDown);
   document.removeEventListener("keydown", handleMenuShortcut);
-  document.removeEventListener("mousedown", onAdvancedSettingsOutside);
   mobileMq.removeEventListener("change", onMobileChange);
   if (loadingProgressDelay) clearTimeout(loadingProgressDelay);
   if (highlightTimeout) clearTimeout(highlightTimeout);
-  // Module state: an image left open would reappear over the next conversation.
+  // Module state: a view left open would reappear over the next conversation.
   closeImageComment();
+  closeMarkdownDoc();
 });
 </script>

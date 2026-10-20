@@ -6,15 +6,21 @@
 import { Marked } from "marked";
 import DOMPurify from "dompurify";
 import { rewriteLocalhostLink, type LocalhostLinkOptions } from "./linkify";
+import * as markdownMath from "./markdownMath";
 
 // Maximum size (in characters of the data: URI) we are willing to inline.
 // Keeps the DOM and persisted payloads from ballooning when a model emits a
 // huge base64 image directly in its markdown.
 const MAX_DATA_URI_LENGTH = 2_000_000;
 
-// Prefix of the per-message file endpoint that serves local images. Mirrors
-// the route registered in server/server.go.
+// Prefixes of the per-message endpoints that serve local images and file
+// downloads. Mirror the routes registered in server/server.go.
 const FILE_ENDPOINT_RE = /^\/api\/message\/[^/]+\/file\?path=/;
+const DOWNLOAD_ENDPOINT_RE = /^\/api\/message\/[^/]+\/download\?path=/;
+
+// Links like [name](sandbox:/path/to/file) download that file. The scheme is
+// ChatGPT's convention for files in its sandbox, and models use it unprompted.
+const SANDBOX_SCHEME = "sandbox:";
 
 type ImageKind = "local" | "data" | "remote" | "invalid";
 
@@ -42,6 +48,12 @@ export function fileEndpointURL(messageId: string, path: string): string {
   return `/api/message/${encodeURIComponent(messageId)}/file?path=${encodeURIComponent(path)}`;
 }
 
+// fileDownloadURL builds the same-origin URL that downloads a local file
+// linked by a specific message.
+function fileDownloadURL(messageId: string, path: string): string {
+  return `/api/message/${encodeURIComponent(messageId)}/download?path=${encodeURIComponent(path)}`;
+}
+
 // buildMarked returns a Marked instance that rewrites local-path image tokens
 // to the per-message file endpoint. Remote images are left with their original
 // href (and later stripped by the sanitizer); data images are passed through.
@@ -56,6 +68,13 @@ function buildMarked(messageId?: string, localhostLinks?: LocalhostLinkOptions):
           token.href = messageId ? fileEndpointURL(messageId, token.href) : "";
         }
         // data: kept as-is; remote/invalid left untouched and dropped by sanitize.
+        return;
+      }
+      if (token.type === "link" && token.href.startsWith(SANDBOX_SCHEME)) {
+        // Without the owning message there is nothing to authorize the
+        // download; the untouched href is then stripped by the sanitizer.
+        const path = token.href.slice(SANDBOX_SCHEME.length);
+        if (messageId && path) token.href = fileDownloadURL(messageId, path);
         return;
       }
       if (token.type === "link" && localhostLinks) {
@@ -104,10 +123,15 @@ function linkifyCodeSpans(root: HTMLElement, localhostLinks?: LocalhostLinkOptio
   }
 }
 
-// Make all links open in new tabs, and restrict <input> to checkboxes only.
+// Make links open in new tabs (downloads stay put), and restrict <input> to
+// checkboxes only.
 DOMPurify.addHook("afterSanitizeAttributes", (node) => {
   if (node.tagName === "A") {
-    setLinkTarget(node);
+    if (DOWNLOAD_ENDPOINT_RE.test(node.getAttribute("href") ?? "")) {
+      node.setAttribute("download", "");
+    } else {
+      setLinkTarget(node);
+    }
   }
   // Only allow checkbox inputs (for GFM task lists); remove all others.
   if (node.tagName === "INPUT" && node.getAttribute("type") !== "checkbox") {
@@ -131,6 +155,9 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
 });
 
 const SANITIZE_OPTS = {
+  // DOMPurify 3.3.1's URI policy, extended only for Obsidian's open action.
+  ALLOWED_URI_REGEXP:
+    /^(?:obsidian:\/\/open\?|(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix):|[^a-z]|[a-z+.-]+(?:[^a-z+.:-]|$))/i,
   ALLOWED_TAGS: [
     "p",
     "br",
@@ -220,7 +247,9 @@ export function renderMarkdownToSafeHTML(
   const cached = cacheKey ? runs?.get(cacheKey.runKey) : undefined;
   if (cached !== undefined) return cached;
 
-  const raw = buildMarked(messageId, localhostLinks).parse(text, { async: false }) as string;
+  const raw = buildMarked(messageId, localhostLinks)
+    .use(markdownMath.createMathExtension())
+    .parse(text, { async: false }) as string;
   const root = DOMPurify.sanitize(raw, { ...SANITIZE_OPTS, RETURN_DOM: true }) as HTMLElement;
   linkifyCodeSpans(root, localhostLinks);
   const html = root.innerHTML;

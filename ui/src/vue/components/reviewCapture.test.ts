@@ -10,6 +10,14 @@ const dom = new JSDOM(`<main id="root">
       <diffs-container id="host"></diffs-container>
       <button id="toggle" aria-label="Show full src/app.ts">⤢</button>
     </article>
+    <section data-review="Notes">
+      <p id="long">The recorder keeps every chunk in IndexedDB until the conversation accepts it, so a crash loses nothing. Stopping flushes the last chunk and the pointer timeline. Cancelling instead deletes <code>the stored session</code> outright and never uploads, which is why it asks twice before throwing anything away for good.</p>
+      <pre id="body">first line
+second   line here
+third</pre>
+      <div id="meta"><span id="author">Review Test</span></div>
+      <ul><li id="run-on">${Array.from({ length: 60 }, (_, i) => `word${i}`).join(" ")}</li></ul>
+    </section>
   </div>
 </main>`);
 Object.assign(globalThis, {
@@ -19,9 +27,11 @@ Object.assign(globalThis, {
   HTMLElement: dom.window.HTMLElement,
   ShadowRoot: dom.window.ShadowRoot,
   Node: dom.window.Node,
+  NodeFilter: dom.window.NodeFilter,
 });
 
-const { breadcrumb, collapse, describeNode, describeSelection } = await import("./reviewCapture");
+const { breadcrumb, collapse, describeNode, describeSelection, pointedText } =
+  await import("./reviewCapture");
 
 function assertEqual<T>(actual: T, expected: T, msg: string): void {
   const a = JSON.stringify(actual);
@@ -110,6 +120,63 @@ run("describes prose, controls, and labelled regions", () => {
     { where: "Tour › Commit message", text: "Fix the bug" },
     "heading",
   );
+});
+
+run("narrows long text to what is under the pointer", () => {
+  const long = document.getElementById("long")!;
+  const [opening, code, closing] = Array.from(long.childNodes);
+  const caret = (node: ChildNode, word: string) => ({
+    node: node as Text,
+    offset: node.textContent!.indexOf(word),
+  });
+  assertEqual(
+    pointedText(long, caret(opening, "flushes")),
+    "Stopping flushes the last chunk and the pointer timeline.",
+    "sentence",
+  );
+  assertEqual(
+    pointedText(long, caret(closing, "asks")),
+    "Cancelling instead deletes the stored session outright and never uploads, which is why it asks twice before throwing anything away for good.",
+    "sentence across inline elements",
+  );
+  assertEqual(
+    pointedText(long, caret(code.firstChild!, "stored")),
+    pointedText(long, caret(closing, "asks")),
+    "caret inside inline code",
+  );
+  assertEqual(pointedText(long, null).endsWith("\u2026"), true, "no caret: the clipped block");
+  const body = document.getElementById("body")!.firstChild!;
+  assertEqual(
+    pointedText(document.getElementById("body")!, caret(body, "here")),
+    "second line here",
+    "preformatted line",
+  );
+  const prose = document.getElementById("prose")!;
+  assertEqual(
+    pointedText(prose, caret(prose.firstChild!, "culprit")),
+    "This line is the culprit.",
+    "short block stays whole",
+  );
+  const runOn = document.getElementById("run-on")!.firstChild!;
+  const clipped = pointedText(runOn.parentElement!, caret(runOn, "word50"));
+  assertEqual(
+    [clipped.length <= 200, clipped.startsWith("…"), clipped.includes("word50")],
+    [true, true, true],
+    "overlong sentence clips around the pointer",
+  );
+  const offsets = [0, 1, 2, 3, 4].map((i) => ({ node: runOn as Text, offset: 150 + i }));
+  assertEqual(
+    new Set(offsets.map((c) => pointedText(runOn.parentElement!, c))).size,
+    1,
+    "the clip holds still as the pointer moves along",
+  );
+  const author = document.getElementById("author")!;
+  assertEqual(
+    describeNode(author, { node: author.firstChild as Text, offset: 2 }),
+    { where: "Tour › Notes", text: "Review Test" },
+    "text outside a block",
+  );
+  assertEqual(describeNode(author), { where: "Tour › Notes" }, "no caret, no block");
 });
 
 run("off-row diff content is just its region", () => {

@@ -2,7 +2,7 @@
 // Getting this wrong leaks another conversation's terminals into view, or hides
 // a terminal the user just created, so each rule is pinned here.
 
-import { nextActiveTab, visibleTerminals } from "./terminalHelpers";
+import { isInteractiveShellLaunch, nextActiveTab, visibleTerminals } from "./terminalHelpers";
 
 let passed = 0;
 let failed = 0;
@@ -101,6 +101,40 @@ function ids(list: Array<{ id: string }>): string {
 // in the other group.
 {
   assert(nextActiveTab(["g", "a"], [], "a").id === "a", "re-scoping keeps the selection");
+}
+
+for (const command of [
+  "bash",
+  " /bin/bash ",
+  "sh",
+  "/usr/bin/zsh",
+  "fish",
+  "nu",
+  "nushell",
+  "bash -i",
+  "/bin/bash -li",
+  "bash --interactive --login",
+]) {
+  assert(isInteractiveShellLaunch(command), `${command} launches an interactive shell`);
+}
+for (const command of [
+  "",
+  "printf /bin/bash",
+  "bash script.sh",
+  "bash -c 'echo hello'",
+  "bash -ic 'echo hello'",
+  "bash -i -c 'echo hello'",
+  "bash < script.sh",
+  "bash | cat",
+  "bash; echo done",
+  "bash && echo done",
+  "bash &",
+  "bash\n-i",
+  "$(echo /bin/bash)",
+  "/tmp/$(echo path)/bash",
+  "env bash",
+]) {
+  assert(!isInteractiveShellLaunch(command), `${command} retains command output`);
 }
 
 if (failed > 0) {

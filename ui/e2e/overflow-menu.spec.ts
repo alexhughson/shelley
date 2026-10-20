@@ -1,10 +1,58 @@
 import { test, expect } from "@playwright/test";
-import { createConversationViaAPI, testWorkingDirectory } from "./helpers";
+import { createConversationViaAPI, installServerLinks, testWorkingDirectory } from "./helpers";
+
+for (const width of [393, 1280]) {
+  test(`menu follows the requested four groups at ${width}px`, async ({ page, request }) => {
+    await page.setViewportSize({ width, height: 851 });
+    await installServerLinks(page);
+    const slug = await createConversationViaAPI(request, "Hello");
+    await page.goto(`/c/${slug}`);
+    await page.getByRole("button", { name: "More options", exact: true }).click();
+    const panel = page.locator(".overflow-menu-panel");
+    await expect(panel).toBeVisible();
+    const rows = await panel.evaluate((el) =>
+      Array.from(el.children)
+        .filter((child) => child.checkVisibility())
+        .map((child) => {
+          if (child.classList.contains("overflow-menu-divider")) return "separator";
+          if (child.classList.contains("overflow-quick-controls")) return "preferences";
+          const row = child.cloneNode(true) as HTMLElement;
+          row
+            .querySelectorAll(
+              ".overflow-menu-shortcut, .overflow-menu-cwd, .overflow-menu-language, .version-menu-dot",
+            )
+            .forEach((extra) => extra.remove());
+          return row.textContent!.trim().replace(/\s+/g, " ");
+        }),
+    );
+    expect(rows).toEqual([
+      // Phones keep New and the workspace tools here, leaving the header to
+      // Open VM, Call and More options.
+      ...(width < 768 ? ["New Conversation", "Diffs", "Git Graph", "Terminal"] : []),
+      "Command menu",
+      "Manage on exe.dev",
+      "Documentation",
+      "separator",
+      "Edit File…",
+      ...(width < 768 ? ["Directory"] : []),
+      "Export Conversation",
+      "Archive Conversation",
+      "separator",
+      "Edit User AGENTS.md",
+      "MCP Servers",
+      "separator",
+      "preferences",
+      "Change Language",
+      "Check for New Version",
+    ]);
+    await expect(panel.locator(".overflow-menu-divider")).toHaveCount(3);
+  });
+}
 
 // The top-right overflow ("kebab") menu uses a PrimeVue Popover, compact
 // native icon buttons, and the shared Modal for language selection. The
 // DOM contract (.chat-overflow-menu-wrapper / .btn-icon / .overflow-menu-item)
-// is covered by other specs (agents-md-vim, diff-viewer-find).
+// is covered by other specs (agents-md-vim).
 test.describe("Overflow menu (PrimeVue)", () => {
   test("directory item opens the picker and closes the popover on mobile", async ({
     page,
@@ -30,9 +78,8 @@ test.describe("Overflow menu (PrimeVue)", () => {
 
     await expect(popover).toBeVisible();
     await expect(directory).toBeVisible();
-    await expect(directory.locator("xpath=preceding-sibling::*[1]")).toHaveAccessibleName(
-      /^Terminal\b/,
-    );
+    await expect(popover.getByRole("button", { name: /^Command menu\b/ })).toBeVisible();
+    await expect(popover.getByRole("button", { name: /^Terminal\b/ })).toBeVisible();
     await expect(directory.locator(".overflow-menu-cwd")).toHaveText(testWorkingDirectory());
     await expect(directory.locator(".overflow-menu-cwd")).toHaveAttribute(
       "title",

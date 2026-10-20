@@ -169,7 +169,7 @@ test.describe('Queue Messages', () => {
     await queueMessage(page, 'echo: second queued message');
     await expect(page.getByTestId('queued-badge')).toHaveCount(2, { timeout: 10000 });
 
-    const stopButton = page.getByRole('button', { name: 'Stop' });
+    const stopButton = page.getByRole('button', { name: 'Stop', exact: true });
     const [cancelResp] = await Promise.all([
       page.waitForResponse((resp) => resp.url().includes('/cancel') && resp.status() === 200, {
         timeout: 10000,
@@ -192,7 +192,7 @@ test.describe('Queue Messages', () => {
 
     const messageInput = page.getByTestId('message-input');
     await messageInput.fill('keep this draft');
-    await page.getByRole('button', { name: 'Stop' }).tap();
+    await page.getByRole('button', { name: 'Stop', exact: true }).tap();
 
     await expect(messageInput).toHaveValue('keep this draft');
     await expect(page.getByTestId('queued-badge')).toHaveCount(0, { timeout: 10000 });
@@ -222,7 +222,7 @@ test.describe('Queue Messages', () => {
     void queueMessage(page, 'echo: pending steering');
     await queueStarted;
 
-    await page.getByRole('button', { name: 'Stop' }).tap();
+    await page.getByRole('button', { name: 'Stop', exact: true }).tap();
     await expect(page.getByTestId('message-input')).toHaveValue('echo: pending steering');
 
     releaseQueue?.();
@@ -252,6 +252,32 @@ test.describe('Queue Messages', () => {
 
     // The agent processes the queued message — predictable echoes it back
     await page.waitForFunction(() => document.body.textContent?.includes('queued drain test') ?? false, undefined, { timeout: 30000 });
+  });
+
+  test('a message queued while idle does not show the agent working', async ({ page, request }) => {
+    // The server queues without starting a turn when an earlier item blocks
+    // the queue, e.g. a recording whose transcription failed.
+    const messageInput = await openConversation(page, request);
+    await page.route('**/api/conversation/*/chat', (route) =>
+      route.fulfill({ status: 202, contentType: 'application/json', body: '{"status":"queued"}' }),
+    );
+    await messageInput.fill('waits behind a failed recording');
+    await page.getByTestId('send-button').tap();
+    await expect(messageInput).toHaveValue('');
+    await expect(page.getByTestId('agent-thinking')).toHaveCount(0);
+  });
+
+  test('a message queued while working keeps the agent working', async ({ page, request }) => {
+    await openConversation(page, request);
+    await sendAndWaitForWorking(page, 'delay: 15');
+    await queueMessage(page, 'echo: first queued');
+    await expect(page.getByTestId('queued-badge')).toHaveCount(1);
+    // A plain send joins the existing queue rather than starting a turn.
+    const messageInput = page.getByTestId('message-input');
+    await messageInput.fill('echo: second queued');
+    await page.getByTestId('send-button').tap();
+    await expect(page.getByTestId('queued-badge')).toHaveCount(2);
+    await expect(page.getByTestId('agent-thinking')).toBeVisible();
   });
 
   test('send button still works normally during agent working', async ({ page, request }) => {

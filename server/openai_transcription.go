@@ -19,11 +19,9 @@ import (
 )
 
 const (
-	openAITranscriptionModel            = "gpt-transcribe"
-	openAITimestampedTranscriptionModel = "whisper-1"
-	maxTranscriptionUpload              = 25_000_000
-	maxTranscriptionErrorBody           = 64 << 10
-	maxTranscriptionResponse            = 16 << 20
+	maxTranscriptionUpload    = 25_000_000
+	maxTranscriptionErrorBody = 64 << 10
+	maxTranscriptionResponse  = 16 << 20
 )
 
 type transcriptionResult struct {
@@ -41,17 +39,19 @@ type transcriptionAPIOptions struct {
 
 var (
 	textTranscription = transcriptionAPIOptions{
-		Model:          openAITranscriptionModel,
+		Model:          models.TranscriptionTextModel,
 		ResponseFormat: "json",
 	}
 	timestampTranscription = transcriptionAPIOptions{
-		Model:                  openAITimestampedTranscriptionModel,
+		Model:                  models.TranscriptionTimestampsModel,
 		ResponseFormat:         "verbose_json",
 		TimestampGranularities: []string{"word", "segment"},
 	}
 )
 
 type recordingTranscriber interface {
+	// Available reports why recordings cannot be transcribed, or nil.
+	Available() error
 	Transcribe(context.Context, string, string, bool) (transcriptionResult, error)
 }
 
@@ -95,13 +95,14 @@ func (e *transcriptionHTTPError) Error() string {
 	return fmt.Sprintf("OpenAI transcription failed (%s): %s", e.Status, e.Message)
 }
 
-func newOpenAIRecordingTranscriber(provider LLMProvider) recordingTranscriber {
+// With predictableOnly every route is ignored, as real LLM models are.
+func newOpenAIRecordingTranscriber(provider LLMProvider, predictableOnly bool) recordingTranscriber {
 	return &openAIRecordingTranscriber{
 		client: http.DefaultClient,
 		resolveModel: func(modelName string) (models.TranscriptionModel, error) {
 			modelProvider, ok := provider.(transcriptionModelProvider)
-			if !ok {
-				return models.TranscriptionModel{}, fmt.Errorf("transcription model %q is not available", modelName)
+			if !ok || predictableOnly {
+				return models.TranscriptionModel{}, errTranscriptionModelUnavailable(modelName)
 			}
 			available, err := modelProvider.GetTranscriptionModels(modelName)
 			if err != nil {
@@ -113,25 +114,53 @@ func newOpenAIRecordingTranscriber(provider LLMProvider) recordingTranscriber {
 	}
 }
 
+// selectTranscriptionModel prefers an exe.dev LLM integration (the llm one
+// first), then a custom model, then a route derived from OpenAI credentials.
 func selectTranscriptionModel(modelName string, available []models.TranscriptionModel) (models.TranscriptionModel, error) {
 	var selected *models.TranscriptionModel
+	best := 0
 	for i := range available {
 		if available[i].Model != modelName || available[i].Endpoint == "" {
 			continue
 		}
-		if selected == nil {
-			selected = &available[i]
-		}
-		parsed, err := url.Parse(available[i].Endpoint)
-		if err == nil && strings.HasPrefix(parsed.Hostname(), "llm.int.") {
-			selected = &available[i]
-			break
+		if rank := transcriptionRouteRank(available[i]); rank > best {
+			selected, best = &available[i], rank
 		}
 	}
 	if selected == nil {
-		return models.TranscriptionModel{}, fmt.Errorf("transcription model %q is not available", modelName)
+		return models.TranscriptionModel{}, errTranscriptionModelUnavailable(modelName)
 	}
 	return *selected, nil
+}
+
+func transcriptionRouteRank(route models.TranscriptionModel) int {
+	switch parsed, err := url.Parse(route.Endpoint); {
+	case route.FromCredentials:
+		return 1
+	case route.Source == models.SourceCustomLabel:
+		return 2
+	case err == nil && strings.HasPrefix(parsed.Hostname(), "llm.int."):
+		return 4
+	default:
+		return 3
+	}
+}
+
+var errNoTranscriptionRoute = errors.New("set OPENAI_API_KEY or connect an exe.dev LLM integration")
+
+func errTranscriptionModelUnavailable(modelName string) error {
+	return fmt.Errorf("transcription model %q is not available; %w", modelName, errNoTranscriptionRoute)
+}
+
+// Available checks both models: screen and review recordings also need
+// whisper-1's word timings.
+func (t *openAIRecordingTranscriber) Available() error {
+	for _, model := range []string{textTranscription.Model, timestampTranscription.Model} {
+		if _, err := t.resolveModel(model); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (t *openAIRecordingTranscriber) Transcribe(ctx context.Context, mediaPath, prompt string, timestamps bool) (transcriptionResult, error) {

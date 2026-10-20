@@ -1,12 +1,20 @@
 package lazycue
 
 import (
+	"bytes"
 	"context"
+	"image"
+	_ "image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/target"
+	"github.com/chromedp/chromedp"
 )
 
 // newBrowserOrSkip launches a headless browser, skipping the test cleanly when
@@ -321,4 +329,197 @@ func TestPressKeyRejectsUnknownKeysAndModifiers(t *testing.T) {
 			t.Errorf("pressKey(%q): %v", name, err)
 		}
 	}
+}
+
+// TestTabsShareProfile: a step with "tab" acts in a second tab of the same
+// browser profile, so the two behave like a user's two tabs: separate globals,
+// shared localStorage down to the cross-window storage event, and both
+// visible. (headless-shell, which runs these tests, reports every tab visible;
+// the new window openTab asks for matters only under full Chrome.)
+func TestTabsShareProfile(t *testing.T) {
+	br := newBrowserOrSkip(t)
+	url := serveHTML(t, `<!doctype html><html><body><p id="o">nothing yet</p>
+<script>window.addEventListener('storage', function(e){document.getElementById('o').textContent = e.newValue;});</script>
+</body></html>`)
+
+	steps := []Step{
+		{Action: ActionNavigate, URL: url + "/page?x=1"},
+		{Action: ActionEval, Expression: "window.__mine = 'main'; 'set'", Expect: "set"},
+		// No URL: tab B opens on the first tab's current page.
+		{Action: ActionNavigate, Tab: "B"},
+		{Action: ActionAssertURL, Value: url + "/page?x=1", Tab: "B"},
+		{Action: ActionEval, Expression: "String(window.__mine)", Expect: "undefined", Tab: "B"},
+		{Action: ActionEval, Expression: "document.visibilityState", Expect: "visible", Tab: "B"},
+		{Action: ActionEval, Expression: "document.visibilityState", Expect: "visible"},
+		{Action: ActionEval, Expression: "localStorage.setItem('k', 'from B'); 'stored'", Expect: "stored", Tab: "B"},
+		{Action: ActionAssertText, Selector: "#o", Text: "from B"},
+		{Action: ActionEval, Expression: "localStorage.getItem('k')", Expect: "from B"},
+	}
+	results, err := br.ExecuteSteps(context.Background(), url, steps)
+	if err != nil {
+		t.Fatalf("ExecuteSteps error: %v (results=%+v)", err, results)
+	}
+}
+
+// TestTabsGetTheInitScript: the init script (the recording tests' media mock)
+// is installed per tab in Chrome, so a tab opened by a step needs it too.
+func TestTabsGetTheInitScript(t *testing.T) {
+	if os.Getenv("LAZYCUE_INTEGRATION") == "" {
+		t.Skip("set LAZYCUE_INTEGRATION=1 to run LazyCue browser tests")
+	}
+	br, err := NewBrowser(context.Background(), "window.__init = 'ran'")
+	if err != nil {
+		t.Skipf("no browser available: %v", err)
+	}
+	t.Cleanup(br.Close)
+	url := serveHTML(t, `<!doctype html><html><body></body></html>`)
+	if _, err := br.ExecuteSteps(context.Background(), url, []Step{
+		{Action: ActionNavigate, URL: url},
+		{Action: ActionEval, Expression: "window.__init", Expect: "ran"},
+		{Action: ActionNavigate, URL: url, Tab: "B"},
+		{Action: ActionEval, Expression: "window.__init", Expect: "ran", Tab: "B", Timeout: "3s"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTabMustBeOpenedByNavigate: only navigate opens a tab; any other step on
+// an unopened tab fails at once, naming the tab, so the generating agent gets a
+// hint instead of a 15s timeout. close_tab closes the tab (in Chrome, not just
+// in the script's bookkeeping) while the main tab keeps working, and so does
+// the end of the script: the next script in the same browser starts with only
+// the first tab.
+func TestTabMustBeOpenedByNavigate(t *testing.T) {
+	br := newBrowserOrSkip(t)
+	url := serveHTML(t, `<!doctype html><html><body><p id="o">hi</p></body></html>`)
+
+	start := time.Now()
+	_, err := br.ExecuteSteps(context.Background(), url, []Step{
+		{Action: ActionNavigate, URL: url},
+		{Action: ActionAssertText, Selector: "#o", Text: "hi", Tab: "B"},
+	})
+	if err == nil || !strings.Contains(err.Error(), `tab "B" is not open`) {
+		t.Fatalf("step on unopened tab: got %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("unopened tab took %v to fail; it should not poll", time.Since(start))
+	}
+
+	_, err = br.ExecuteSteps(context.Background(), url, []Step{
+		{Action: ActionNavigate, URL: url, Tab: "B"},
+		{Action: ActionAssertText, Selector: "#o", Text: "hi", Tab: "B"},
+		{Action: ActionCloseTab, Tab: "B"},
+		{Action: ActionAssertText, Selector: "#o", Text: "hi"},
+		{Action: ActionAssertText, Selector: "#o", Text: "hi", Tab: "B"},
+	})
+	if err == nil || !strings.Contains(err.Error(), `step 4`) || !strings.Contains(err.Error(), `tab "B" is not open`) {
+		t.Fatalf("step on closed tab: got %v", err)
+	}
+	waitForPageCount(t, br, 1)
+
+	if _, err := br.ExecuteSteps(context.Background(), url, []Step{{Action: ActionNavigate, URL: url, Tab: "B"}}); err != nil {
+		t.Fatal(err)
+	}
+	waitForPageCount(t, br, 2)
+	_, err = br.ExecuteSteps(context.Background(), url, []Step{{Action: ActionAssertText, Selector: "#o", Text: "hi", Tab: "B"}})
+	if err == nil || !strings.Contains(err.Error(), `tab "B" is not open`) {
+		t.Fatalf("tab left open by the previous script: got %v", err)
+	}
+	waitForPageCount(t, br, 1)
+
+	if _, err := br.ExecuteSteps(context.Background(), url, []Step{{Action: ActionCloseTab}}); err == nil {
+		t.Fatal("close_tab without a tab name must fail; the main tab stays open")
+	}
+}
+
+// TestNavigateWithoutURL: for another tab it means the first tab's current
+// page, which must exist; for the first tab it is the base URL, as before tabs.
+func TestNavigateWithoutURL(t *testing.T) {
+	br := newBrowserOrSkip(t)
+	url := serveHTML(t, `<!doctype html><html><body><p id="o">hi</p></body></html>`)
+
+	_, err := br.ExecuteSteps(context.Background(), url, []Step{{Action: ActionNavigate, Tab: "B"}})
+	if err == nil || !strings.Contains(err.Error(), "first tab has not been navigated") {
+		t.Fatalf("tab opened on a first tab still on about:blank: got %v", err)
+	}
+	if _, err := br.ExecuteSteps(context.Background(), url, []Step{
+		{Action: ActionNavigate},
+		{Action: ActionAssertURL, Value: url + "/"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestScreenshotsFollowTheStepsTab: the per-step screenshot shows the tab the
+// step acted on, so a trace of a two-tab test shows what each step saw.
+func TestScreenshotsFollowTheStepsTab(t *testing.T) {
+	br := newBrowserOrSkip(t)
+	red := serveHTML(t, `<!doctype html><html><body style="margin:0;background:#f00"><div id="d" style="height:100vh"></div></body></html>`)
+	blue := serveHTML(t, `<!doctype html><html><body style="margin:0;background:#00f"><div id="d" style="height:100vh"></div></body></html>`)
+
+	shots := map[int][]byte{}
+	br.SetScreenshotSink(func(i int, _ string, png []byte) { shots[i] = png })
+	steps := []Step{
+		{Action: ActionNavigate, URL: red},
+		{Action: ActionNavigate, URL: blue, Tab: "B"},
+		{Action: ActionAssertVisible, Selector: "#d"},
+		{Action: ActionAssertVisible, Selector: "#d", Tab: "B"},
+	}
+	if _, err := br.ExecuteSteps(context.Background(), red, steps); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range map[int]string{2: "red", 3: "blue"} {
+		if got := dominantHue(t, shots[i]); got != want {
+			t.Errorf("screenshot after step %d shows %s, want %s", i, got, want)
+		}
+	}
+	if _, err := br.Screenshot(context.Background(), "B"); err != nil {
+		t.Fatalf("Screenshot of tab B: %v", err)
+	}
+	if _, err := br.Screenshot(context.Background(), "C"); err == nil {
+		t.Fatal("Screenshot of an unopened tab must fail")
+	}
+}
+
+// waitForPageCount polls until Chrome reports want page targets; closing a
+// target is asynchronous.
+func waitForPageCount(t *testing.T, br *Browser, want int) {
+	t.Helper()
+	var got int
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		got = 0
+		err := chromedp.Run(br.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+			infos, err := target.GetTargets().Do(cdp.WithExecutor(ctx, chromedp.FromContext(ctx).Browser))
+			for _, info := range infos {
+				if info.Type == "page" {
+					got++
+				}
+			}
+			return err
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == want {
+			return
+		}
+	}
+	t.Fatalf("Chrome has %d page targets, want %d", got, want)
+}
+
+func dominantHue(t *testing.T, png []byte) string {
+	t.Helper()
+	img, _, err := image.Decode(bytes.NewReader(png))
+	if err != nil {
+		t.Fatalf("decode screenshot: %v", err)
+	}
+	b := img.Bounds()
+	r, _, bl, _ := img.At(b.Min.X+b.Dx()/2, b.Min.Y+b.Dy()/2).RGBA()
+	switch {
+	case r > bl:
+		return "red"
+	case bl > r:
+		return "blue"
+	}
+	return "neither"
 }

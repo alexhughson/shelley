@@ -1,8 +1,11 @@
 <!-- Vue port of components/SubagentTool.tsx.
-     Preserves: .tool, .tool-header, .tool-summary, .tool-emoji ⚡, .tool-name,
+     Preserves: .tool, .tool-header, .tool-summary, .tool-emoji ⚡,
      .tool-badge, .subagent-model-badge, .tool-command, .tool-toggle, .tool-details, .tool-section,
      .tool-label, .tool-code, .tool-time, .subagent-link,
      data-testid tool-call-running/completed.
+
+     Header: the subagent's slug, its model as a muted tag, and the first line
+     of the prompt, laid out like the bash card's command line.
 
      Live view: while the subagent is working (per the conversation list's
      authoritative working flag, injected from App via subagentLive), a strip
@@ -20,8 +23,9 @@
     <div class="tool-header" @click="isExpanded = !isExpanded">
       <div class="tool-summary">
         <span class="tool-emoji" :class="{ running: isRunning }">⚡</span>
-        <span class="tool-name">subagent</span>
-        <span class="tool-command" :title="prompt">{{ commandText }}</span>
+        <span class="tool-command subagent-tool-slug">{{ slug }}</span>
+        <span v-if="model" class="tool-tag">{{ model }}</span>
+        <span class="tool-command" :title="prompt">{{ firstLine }}</span>
       </div>
       <button
         class="tool-toggle"
@@ -32,18 +36,7 @@
       </button>
     </div>
 
-    <button
-      v-if="showLive"
-      type="button"
-      class="subagent-live"
-      data-testid="subagent-live"
-      :title="`Open subagent '${liveSlug}'`"
-      @click.stop="openSubagent"
-    >
-      <span class="working-indicator" aria-hidden="true" />
-      <span class="subagent-live-slug">{{ liveSlug }}&nbsp;↗</span>
-      <span class="subagent-live-activity">{{ activity || "working\u2026" }}</span>
-    </button>
+    <SubagentLiveStrip v-if="showLive" :slug="liveSlug" :activity="activity" />
 
     <div v-if="isExpanded" class="tool-details">
       <RunningToolTime v-if="isRunning" :start-time="toolInvokedAt" />
@@ -51,8 +44,6 @@
         <div class="tool-label">
           Prompt to '{{ slug }}':
           <span v-if="model" class="tool-badge subagent-model-badge">{{ model }}</span>
-          <span v-if="!wait" class="tool-badge">fire-and-forget</span>
-          <span v-if="timeout !== 60" class="tool-badge">timeout: {{ timeout }}s</span>
         </div>
         <div class="tool-code">{{ prompt || "(no prompt)" }}</div>
       </div>
@@ -83,6 +74,7 @@
 import { computed, ref } from "vue";
 import type { LLMContent } from "../../../types";
 import { useSubagentLive, navigateToConversationSlug } from "../../composables/subagentLive";
+import SubagentLiveStrip from "../SubagentLiveStrip.vue";
 import ToolChevron from "./ToolChevron.vue";
 import RunningToolTime from "./RunningToolTime.vue";
 
@@ -90,8 +82,6 @@ interface SubagentInput {
   slug?: string;
   prompt?: string;
   model?: string;
-  timeout_seconds?: number;
-  wait?: boolean;
 }
 
 const props = defineProps<{
@@ -117,8 +107,6 @@ const input = computed<SubagentInput>(() =>
 const slug = computed(() => props.displayData?.slug || input.value.slug || "subagent");
 const prompt = computed(() => input.value.prompt || "");
 const model = computed(() => input.value.model || "");
-const wait = computed(() => input.value.wait !== false);
-const timeout = computed(() => input.value.timeout_seconds || 60);
 
 // Live subagent state (working flag + current activity), joined from the
 // conversation list + messageStore via the injected app context.
@@ -126,15 +114,10 @@ const { conv, working, activity } = useSubagentLive(
   slug,
   computed(() => props.displayData?.conversation_id),
 );
-// The subagent can still be working after this tool call completed
-// (wait=false, or a wait timeout returned a progress summary), so the strip
-// keys off the conversation's working flag, not the tool-call state.
+// The subagent keeps working after this tool call completes (the call only
+// acknowledges dispatch), so the strip keys off the conversation's working flag, not the tool-call state.
 const showLive = computed(() => working.value || (!!props.isRunning && !!conv.value));
 const liveSlug = computed(() => conv.value?.slug || slug.value);
-
-function openSubagent() {
-  navigateToConversationSlug(liveSlug.value);
-}
 
 // Extract result text
 const resultText = computed(
@@ -145,29 +128,8 @@ const resultText = computed(
       .join("\n") || "",
 );
 
-// Truncate prompt for display
-const truncateText = (text: string, maxLen = 60) => {
-  if (!text) return "";
-  const firstLine = text.split("\n")[0];
-  if (firstLine.length <= maxLen) return firstLine;
-  return firstLine.substring(0, maxLen) + "...";
-};
-
-const displayPrompt = computed(() => truncateText(prompt.value));
+const firstLine = computed(() => prompt.value.trim().split(/\r?\n/)[0]);
 const isComplete = computed(() => !props.isRunning && props.toolResult !== undefined);
-
-// Mirror the React JSX text exactly:
-//   Subagent '{slug}'{model ? ` (${model})` : ""}{" "}
-//   {isRunning ? (wait ? "running..." : "started") : ""}
-//   {displayPrompt && !isRunning && ` ${displayPrompt}`}
-const commandText = computed(() => {
-  let s = `Subagent '${slug.value}'`;
-  if (model.value) s += ` (${model.value})`;
-  s += " ";
-  s += props.isRunning ? (wait.value ? "running..." : "started") : "";
-  if (displayPrompt.value && !props.isRunning) s += ` ${displayPrompt.value}`;
-  return s;
-});
 
 function onLinkClick(e: MouseEvent) {
   // Let the browser handle cmd/ctrl/shift/middle-click (open in new tab/window).
@@ -177,3 +139,10 @@ function onLinkClick(e: MouseEvent) {
   navigateToConversationSlug(liveSlug.value);
 }
 </script>
+
+<style scoped>
+.subagent-tool-slug {
+  flex-shrink: 0;
+  max-width: 40%;
+}
+</style>

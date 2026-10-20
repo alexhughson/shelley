@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { createConversationViaAPI } from "./helpers";
+import { openWorkspaceTool, createConversationViaAPI } from "./helpers";
 
 // This test exercises the Ctrl+F find widget inside the diff viewer.
 // It verifies that:
@@ -29,14 +29,7 @@ test.describe("Diff viewer find widget", () => {
     await page.goto(`/c/${slug}`);
     await page.waitForLoadState("domcontentloaded");
 
-    // Open the overflow menu and click the diffs button.
-    const overflowBtn = page.locator(".chat-overflow-menu-wrapper .btn-icon");
-    await expect(overflowBtn).toBeVisible({ timeout: 10000 });
-    await overflowBtn.click();
-
-    const diffsBtn = page.locator(".overflow-menu-item").filter({ hasText: /diffs/i });
-    await expect(diffsBtn).toBeVisible();
-    await diffsBtn.click();
+    await openWorkspaceTool(page, "Diffs");
 
     // Wait for the diff viewer overlay to appear.
     const overlay = page.locator(".diff-viewer-overlay");

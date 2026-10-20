@@ -70,7 +70,6 @@
         <Column :header="t('columnName')" field="name">
           <template #body="{ data }">
             <span class="models-cell-name">{{ data.name }}</span>
-            <span v-for="tag in data.tags" :key="tag" class="models-cell-tag">{{ tag }}</span>
           </template>
         </Column>
         <Column :header="t('columnModelId')" field="modelId">
@@ -228,7 +227,6 @@ interface TableRow {
   modelId: string;
   apiShape: string | null;
   endpoint: string;
-  tags: string[];
   supportsImages: boolean;
   imageTitle: string;
   imageAuto: boolean;
@@ -261,7 +259,6 @@ const tableRows = computed<TableRow[]>(() => {
         modelId: m.id,
         apiShape: (m.api_type && API_TYPE_LABELS[m.api_type]) || null,
         endpoint: common ? "" : m.base_url || "",
-        tags: [],
         supportsImages: m.supports_images ?? true,
         imageTitle: (m.supports_images ?? true) ? t("imageSupportYes") : t("imageSupportNo"),
         imageAuto: false,
@@ -279,10 +276,6 @@ const tableRows = computed<TableRow[]>(() => {
       modelId: m.model_name,
       apiShape: PROVIDER_LABELS[m.provider_type],
       endpoint: m.endpoint,
-      tags: (m.tags || "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
       supportsImages: customModelSupportsImages(m),
       imageTitle: customModelImageTitle(m),
       imageAuto: (m.image_support ?? "auto") === "auto",

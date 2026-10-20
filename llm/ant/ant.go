@@ -29,6 +29,7 @@ const (
 )
 
 const (
+	Claude55Haiku  = "claude-haiku-5-5"
 	Claude45Haiku  = "claude-haiku-4-5-20251001"
 	Claude4Sonnet  = "claude-sonnet-4-20250514"
 	Claude45Sonnet = "claude-sonnet-4-5-20250929"
@@ -71,16 +72,25 @@ func ClaudeModelName(userName string) string {
 
 func (s *Service) Provider() string { return "anthropic" }
 
+// SetReasoningOverride configures endpoint controls before the service is used.
+func (s *Service) SetReasoningOverride(caps *modelsdev.ReasoningCapabilities) {
+	s.ReasoningOverride = caps
+}
+
+func (s *Service) PatchProfile() string {
+	return llm.ModelPatchProfile(s.Model)
+}
+
 func (s *Service) SupportsReasoning() bool {
-	caps, found := modelsdev.LookupReasoningCapabilities(s.URL, cmp.Or(s.Model, DefaultModel))
+	caps, found := s.ReasoningOverride.Lookup(s.URL, cmp.Or(s.Model, DefaultModel))
 	return !found || caps.Supported
 }
 
-// SupportedReasoningLevels advertises exact effort levels from models.dev.
+// SupportedReasoningLevels advertises endpoint effort levels before models.dev.
 // Budget-token and unknown models return nil and retain the historical
 // standard-level fallback.
 func (s *Service) SupportedReasoningLevels() []llm.ThinkingLevel {
-	caps, found := modelsdev.LookupReasoningCapabilities(s.URL, cmp.Or(s.Model, DefaultModel))
+	caps, found := s.ReasoningOverride.Lookup(s.URL, cmp.Or(s.Model, DefaultModel))
 	if !found {
 		return nil
 	}
@@ -97,12 +107,16 @@ func (s *Service) SupportsServerSideWebSearch() bool {
 	return strings.HasPrefix(strings.ToLower(cmp.Or(s.Model, DefaultModel)), "claude")
 }
 
-// DefaultReasoningLevel reports the reasoning level applied to requests that
-// carry no per-conversation override. applyAnthropicThinking treats both
-// ThinkingLevelDefault and ThinkingLevelOff as "send no thinking", so those
-// surface as "off"; any other configured level surfaces by name.
+// DefaultReasoningLevel reports the configured level. Explicit endpoint
+// controls also apply the same capability checks and clamping as the request.
 func (s *Service) DefaultReasoningLevel() string {
+	if s.ReasoningOverride != nil && !s.ReasoningOverride.Supported {
+		return ""
+	}
 	eff := s.ThinkingLevel
+	if s.ReasoningOverride != nil && s.ReasoningOverride.Levels != nil {
+		eff = s.effectiveThinkingLevel(eff)
+	}
 	if eff == llm.ThinkingLevelDefault || eff == llm.ThinkingLevelOff {
 		return "off"
 	}
@@ -154,6 +168,8 @@ func (s *Service) MaxImageBytes() int {
 // Service provides Claude completions.
 // Fields should not be altered concurrently with calling any method on Service.
 type Service struct {
+	// ReasoningOverride is advertised for this model at this endpoint; nil uses models.dev.
+	ReasoningOverride     *modelsdev.ReasoningCapabilities
 	HTTPC                 *http.Client      // defaults to http.DefaultClient if nil
 	URL                   string            // defaults to DefaultURL if empty
 	APIKey                string            // must be non-empty
@@ -835,7 +851,7 @@ func (s *Service) buildRequest(r *llm.Request, stripThinking bool) *request {
 		System:     mapped(r.System, fromLLMSystem),
 	}
 
-	applyAnthropicThinking(req, model, llm.EffectiveThinkingLevel(s.ThinkingLevel, r.ThinkingLevel), maxTokens, s.supportsThinkingBinding())
+	s.applyAnthropicThinking(req, llm.EffectiveThinkingLevel(s.ThinkingLevel, r.ThinkingLevel), maxTokens, s.supportsThinkingBinding())
 	if req.Thinking != nil && req.Thinking.Type == "adaptive" && r.ToolChoice != nil {
 		switch r.ToolChoice.Type {
 		case llm.ToolChoiceTypeAny, llm.ToolChoiceTypeTool:
@@ -848,20 +864,34 @@ func (s *Service) buildRequest(r *llm.Request, stripThinking bool) *request {
 
 const minAnthropicThinkingBudget = 1024
 
+func (s *Service) adaptiveThinking() bool {
+	// An explicit effort list describes effort controls, not a token budget.
+	return useAdaptiveThinking(cmp.Or(s.Model, DefaultModel)) || s.ReasoningOverride != nil && len(s.ReasoningOverride.Levels) > 0
+}
+
+func (s *Service) effectiveThinkingLevel(level llm.ThinkingLevel) llm.ThinkingLevel {
+	if s.ReasoningOverride != nil {
+		return s.ReasoningOverride.ResolveLevel(level)
+	}
+	// Leave the legacy budget/adaptive behavior and native-model lookup intact.
+	if useAdaptiveThinking(cmp.Or(s.Model, DefaultModel)) {
+		caps, found := modelsdev.LookupReasoningCapabilities("", cmp.Or(s.Model, DefaultModel))
+		if found && len(caps.Levels) > 0 {
+			return llm.ClampThinkingLevel(level, caps.Levels)
+		}
+		if level == llm.ThinkingLevelMinimal {
+			return llm.ThinkingLevelLow
+		}
+	}
+	return level
+}
+
 // applyAnthropicThinking sets the Thinking / OutputConfig fields without
 // increasing the configured output allowance. Budget-style thinking shares
 // max_tokens with the final answer, so leave 1024 tokens for that answer.
-func applyAnthropicThinking(req *request, model string, level llm.ThinkingLevel, maxTokens int, supportsBinding bool) {
-	adaptive := useAdaptiveThinking(model)
-	if adaptive {
-		caps, found := modelsdev.LookupReasoningCapabilities("", model)
-		if found && len(caps.Levels) > 0 {
-			level = llm.ClampThinkingLevel(level, caps.Levels)
-		} else if level == llm.ThinkingLevelMinimal {
-			// Historical fallback for adaptive models without exact metadata.
-			level = llm.ThinkingLevelLow
-		}
-	}
+func (s *Service) applyAnthropicThinking(req *request, level llm.ThinkingLevel, maxTokens int, supportsBinding bool) {
+	level = s.effectiveThinkingLevel(level)
+	adaptive := s.adaptiveThinking()
 	if level == llm.ThinkingLevelOff || level == llm.ThinkingLevelDefault {
 		return
 	}
@@ -1340,12 +1370,7 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			return nil, errors.Join(errs, err)
 		}
 
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-API-Key", s.APIKey)
-		req.Header.Set("Anthropic-Version", "2023-06-01")
-		if request.Thinking != nil && request.Thinking.BlockBinding != nil {
-			req.Header.Set("Anthropic-Beta", thinkingBindingBeta)
-		}
+		s.setHeaders(req, request)
 
 		resp, err := httpc.Do(req)
 		if err != nil {
@@ -1434,6 +1459,68 @@ func (s *Service) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error
 			}
 		}
 	}
+}
+
+func (s *Service) setHeaders(req *http.Request, request *request) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", s.APIKey)
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	if request.Thinking != nil && request.Thinking.BlockBinding != nil {
+		req.Header.Set("Anthropic-Beta", thinkingBindingBeta)
+	}
+}
+
+// CacheTTL is the lifetime of the default "ephemeral" cache_control.
+func (s *Service) CacheTTL() time.Duration { return 5 * time.Minute }
+
+// WarmCache replays ir with max_tokens 0: Anthropic prefills and refreshes the
+// cached prefix without generating output. Budget thinking requires
+// max_tokens above its budget, and changing thinking would change the cache
+// key, so such requests are not warmed. It makes one attempt: a late retry
+// would pay for a fresh cache write rather than refresh one.
+func (s *Service) WarmCache(ctx context.Context, ir *llm.Request) (llm.Usage, error) {
+	ir, err := llm.PrepareRequestCitations(ctx, ir, "anthropic", adaptCitation)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	request := s.fromLLMRequest(ir)
+	if request.Thinking != nil && request.Thinking.Type == "enabled" {
+		return llm.Usage{}, fmt.Errorf("%w: budget thinking needs output tokens", llm.ErrCacheWarmUnsupported)
+	}
+	request.MaxTokens = 0
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	url := cmp.Or(s.URL, DefaultURL)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	s.setHeaders(req, request)
+	resp, err := cmp.Or(s.HTTPC, http.DefaultClient).Do(req)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return llm.Usage{}, fmt.Errorf("anthropic cache warm: status %v (url=%s, model=%s): %s", resp.Status, url, request.Model, body)
+	}
+	var out response
+	if err := json.Unmarshal(body, &out); err != nil {
+		return llm.Usage{}, fmt.Errorf("anthropic cache warm: %w", err)
+	}
+	if len(out.Content) > 0 || out.StopReason != "max_tokens" {
+		return llm.Usage{}, fmt.Errorf("anthropic cache warm generated output: stop_reason %q, %d content blocks", out.StopReason, len(out.Content))
+	}
+	usage := toLLMUsage(out.Usage)
+	usage.CostUSD = llm.CostUSDFromResponse(resp.Header)
+	usage.Model = out.Model
+	return usage, nil
 }
 
 // ConfigDetails returns configuration information for logging

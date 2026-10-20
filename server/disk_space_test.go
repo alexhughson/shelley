@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -49,7 +50,7 @@ func TestDiskSpaceBoundaryAndEpisodes(t *testing.T) {
 	database.Pool().OnCommit(func() { writes.Add(1) })
 	available := diskspace.Threshold
 	calls := initTestDiskSpace(t, s, &available)
-	m := s.diskSpace
+	m := s.diskSpace.Load()
 	if got := m.snapshot(); got.Active || got.AvailableBytes != available || got.EpisodeID != 0 || calls.Load() != 1 || writes.Load() != 0 {
 		t.Fatalf("exact boundary/startup: %+v, probes=%d, writes=%d", got, calls.Load(), writes.Load())
 	}
@@ -110,7 +111,7 @@ func TestDiskSpaceDismissalPersistence(t *testing.T) {
 	s, database, _ := newTestServer(t)
 	available := diskspace.Threshold - 1
 	initTestDiskSpace(t, s, &available)
-	dismissed, err := s.diskSpace.dismiss(t.Context(), s.diskSpace.snapshot().EpisodeID)
+	dismissed, err := s.diskSpace.Load().dismiss(t.Context(), s.diskSpace.Load().snapshot().EpisodeID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,18 +128,18 @@ func TestDiskSpaceDismissalPersistence(t *testing.T) {
 	var writes atomic.Int32
 	reopened.Pool().OnCommit(func() { writes.Add(1) })
 	initTestDiskSpace(t, restarted, &available)
-	if got := restarted.diskSpace.snapshot(); got != dismissed || writes.Load() != 0 {
+	if got := restarted.diskSpace.Load().snapshot(); got != dismissed || writes.Load() != 0 {
 		t.Fatalf("restart lost dismissal: %+v, want %+v; writes=%d", got, dismissed, writes.Load())
 	}
 	// A startup observation of recovery also rearms the next episode.
 	available = diskspace.Threshold
 	initTestDiskSpace(t, restarted, &available)
-	if got := restarted.diskSpace.snapshot(); got.Active || got.Dismissed || got.EpisodeID != dismissed.EpisodeID {
+	if got := restarted.diskSpace.Load().snapshot(); got.Active || got.Dismissed || got.EpisodeID != dismissed.EpisodeID {
 		t.Fatalf("startup recovery: %+v", got)
 	}
 	available--
 	initTestDiskSpace(t, restarted, &available)
-	if got := restarted.diskSpace.snapshot(); !got.Active || got.Dismissed || got.EpisodeID <= dismissed.EpisodeID {
+	if got := restarted.diskSpace.Load().snapshot(); !got.Active || got.Dismissed || got.EpisodeID <= dismissed.EpisodeID {
 		t.Fatalf("next startup episode: %+v", got)
 	}
 }
@@ -147,15 +148,15 @@ func TestDiskSpaceProbeErrors(t *testing.T) {
 	t.Parallel()
 	s, _, _ := newTestServer(t)
 	probeErr := errors.New("probe failed")
-	if err := s.initDiskSpace(t.Context(), func(string) (uint64, uint64, error) { return 0, 0, probeErr }); !errors.Is(err, probeErr) || s.diskSpace != nil {
-		t.Fatalf("startup must fail, not report healthy: monitor=%v, err=%v", s.diskSpace, err)
+	if err := s.initDiskSpace(t.Context(), func(string) (uint64, uint64, error) { return 0, 0, probeErr }); !errors.Is(err, probeErr) || s.diskSpace.Load() != nil {
+		t.Fatalf("startup must fail, not report healthy: monitor=%v, err=%v", s.diskSpace.Load(), err)
 	}
 	available := diskspace.Threshold - 1
 	initTestDiskSpace(t, s, &available)
-	before := s.diskSpace.snapshot()
-	s.diskSpace.probe = func(string) (uint64, uint64, error) { return 0, 0, probeErr }
-	if err := s.diskSpace.check(t.Context()); !errors.Is(err, probeErr) || s.diskSpace.snapshot() != before {
-		t.Fatalf("probe error changed status: %+v, err=%v", s.diskSpace.snapshot(), err)
+	before := s.diskSpace.Load().snapshot()
+	s.diskSpace.Load().probe = func(string) (uint64, uint64, error) { return 0, 0, probeErr }
+	if err := s.diskSpace.Load().check(t.Context()); !errors.Is(err, probeErr) || s.diskSpace.Load().snapshot() != before {
+		t.Fatalf("probe error changed status: %+v, err=%v", s.diskSpace.Load().snapshot(), err)
 	}
 	if _, _, err := diskBytes(filepath.Join(t.TempDir(), "missing.db")); err == nil {
 		t.Fatal("statfs on missing path succeeded")
@@ -187,21 +188,21 @@ func TestDiskSpaceDismissRoute(t *testing.T) {
 	initTestDiskSpace(t, s, &available)
 	mux := http.NewServeMux()
 	s.RegisterRoutes(mux)
-	initial := s.diskSpace.snapshot()
+	initial := s.diskSpace.Load().snapshot()
 	if stale := dismissDiskSpaceHTTP(t, mux, initial.EpisodeID+1); stale != initial {
 		t.Fatalf("unknown ID changed status: %+v", stale)
 	}
 	dismissed := dismissDiskSpaceHTTP(t, mux, initial.EpisodeID)
-	if !dismissed.Dismissed || dismissed != s.diskSpace.snapshot() {
+	if !dismissed.Dismissed || dismissed != s.diskSpace.Load().snapshot() {
 		t.Fatalf("response is not authoritative: %+v", dismissed)
 	}
 	if got := dismissDiskSpaceHTTP(t, mux, initial.EpisodeID); got != dismissed {
 		t.Fatalf("repeat dismissal: %+v", got)
 	}
 	available = diskspace.Threshold
-	checkDiskSpace(t, s.diskSpace)
+	checkDiskSpace(t, s.diskSpace.Load())
 	available--
-	later := checkDiskSpace(t, s.diskSpace)
+	later := checkDiskSpace(t, s.diskSpace.Load())
 	if got := dismissDiskSpaceHTTP(t, mux, initial.EpisodeID); got != later {
 		t.Fatalf("stale route dismissal changed later episode: %+v", got)
 	}
@@ -214,8 +215,7 @@ func TestDiskSpaceDismissRoute(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/disk-space/dismiss", nil))
-	// Non-POST requests fall through to the server's catch-all handler.
-	if w.Code != http.StatusNotFound {
+	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET dismissal: HTTP %d", w.Code)
 	}
 
@@ -239,7 +239,7 @@ func TestDiskSpaceDismissWriteError(t *testing.T) {
 	s, database, _ := newTestServer(t)
 	available := diskspace.Threshold - 1
 	initTestDiskSpace(t, s, &available)
-	before := s.diskSpace.snapshot()
+	before := s.diskSpace.Load().snapshot()
 	// Fail at COMMIT, not in the settings statement itself.
 	if err := database.Pool().Exec(t.Context(), `
 		CREATE TABLE disk_parent (id INTEGER PRIMARY KEY);
@@ -253,11 +253,11 @@ func TestDiskSpaceDismissWriteError(t *testing.T) {
 	s.RegisterRoutes(mux)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/disk-space/dismiss", strings.NewReader(`{"episode_id":1}`)))
-	if w.Code != http.StatusInternalServerError || s.diskSpace.snapshot() != before {
-		t.Fatalf("failed commit reported a saved dismissal: HTTP %d, status=%+v", w.Code, s.diskSpace.snapshot())
+	if w.Code != http.StatusInternalServerError || s.diskSpace.Load().snapshot() != before {
+		t.Fatalf("failed commit reported a saved dismissal: HTTP %d, status=%+v", w.Code, s.diskSpace.Load().snapshot())
 	}
 	initTestDiskSpace(t, s, &available)
-	if s.diskSpace.snapshot() != before {
+	if s.diskSpace.Load().snapshot() != before {
 		t.Fatal("failed commit persisted dismissal")
 	}
 }
@@ -325,7 +325,7 @@ func TestDiskSpaceStreamSnapshotAndGlobalDelivery(t *testing.T) {
 	a, closeA := openDiskSpaceStream(t, httpServer.URL+"/api/stream2")
 	defer closeA()
 	initial := readDiskSpaceFrame(t, a)
-	if initial != s.diskSpace.snapshot() || initial.AvailableBytes != available || calls.Load() != 2 {
+	if initial != s.diskSpace.Load().snapshot() || initial.AvailableBytes != available || calls.Load() != 2 {
 		t.Fatalf("initial snapshot: %+v, probes=%d", initial, calls.Load())
 	}
 	// Also cover caught-up reconnects, where no initial list patch is sent.
@@ -348,11 +348,11 @@ func TestDiskSpaceStreamSnapshotAndGlobalDelivery(t *testing.T) {
 		}
 	}
 	available--
-	low := checkDiskSpace(t, s.diskSpace)
+	low := checkDiskSpace(t, s.diskSpace.Load())
 	assertBoth(low)
 	// Sustained low while visible pushes the fresh number on the same revision.
 	available--
-	refreshed := checkDiskSpace(t, s.diskSpace)
+	refreshed := checkDiskSpace(t, s.diskSpace.Load())
 	if refreshed.Revision != low.Revision || refreshed.AvailableBytes != available {
 		t.Fatalf("refresh: %+v", refreshed)
 	}
@@ -368,9 +368,9 @@ func TestDiskSpaceStreamSnapshotAndGlobalDelivery(t *testing.T) {
 		t.Fatalf("dismissed reconnect: %+v, probes=%d", got, calls.Load())
 	}
 	available = diskspace.Threshold
-	assertBoth(checkDiskSpace(t, s.diskSpace))
+	assertBoth(checkDiskSpace(t, s.diskSpace.Load()))
 	available--
-	assertBoth(checkDiskSpace(t, s.diskSpace))
+	assertBoth(checkDiskSpace(t, s.diskSpace.Load()))
 }
 
 type diskSpaceLogWriter struct{ lines chan string }
@@ -390,25 +390,25 @@ func TestDiskSpaceRefreshAtTurnEnd(t *testing.T) {
 	calls := initTestDiskSpace(t, s, &available)
 	available--
 	s.refreshDiskSpace(t.Context())
-	if got := s.diskSpace.snapshot(); !got.Active || calls.Load() != 2 {
+	if got := s.diskSpace.Load().snapshot(); !got.Active || calls.Load() != 2 {
 		t.Fatalf("turn-end refresh did not sample: %+v, probes=%d", got, calls.Load())
 	}
-	before := s.diskSpace.snapshot()
-	s.diskSpace.probe = func(string) (uint64, uint64, error) { return 0, 0, errors.New("turn-end probe failed") }
+	before := s.diskSpace.Load().snapshot()
+	s.diskSpace.Load().probe = func(string) (uint64, uint64, error) { return 0, 0, errors.New("turn-end probe failed") }
 	lines := make(chan string, 1)
 	s.logger = slog.New(slog.NewTextHandler(diskSpaceLogWriter{lines}, nil))
 	s.refreshDiskSpace(t.Context())
 	if line := <-lines; !strings.Contains(line, "turn-end probe failed") {
 		t.Fatalf("missing error log: %s", line)
 	}
-	if s.diskSpace.snapshot() != before {
+	if s.diskSpace.Load().snapshot() != before {
 		t.Fatal("probe error cleared warning")
 	}
 
 	// Dismissed: sustained-low samples are silent; the next event is recovery.
 	next, _ := s.streamPub.SubscribeWithStatus(t.Context(), -1)
-	s.diskSpace.probe = func(string) (uint64, uint64, error) { return available, 100_000_000_000, nil }
-	if _, err := s.diskSpace.dismiss(t.Context(), before.EpisodeID); err != nil {
+	s.diskSpace.Load().probe = func(string) (uint64, uint64, error) { return available, 100_000_000_000, nil }
+	if _, err := s.diskSpace.Load().dismiss(t.Context(), before.EpisodeID); err != nil {
 		t.Fatal(err)
 	}
 	if ev, ok := next(); !ok || ev.DiskSpaceStatus == nil || !ev.DiskSpaceStatus.Dismissed {
@@ -428,7 +428,7 @@ func TestDiskSpaceCriticalEscalation(t *testing.T) {
 	s, database, _ := newTestServer(t)
 	available := diskspace.Threshold - 1
 	initTestDiskSpace(t, s, &available)
-	m := s.diskSpace
+	m := s.diskSpace.Load()
 	low := m.snapshot()
 	if low.Critical {
 		t.Fatalf("low is not critical: %+v", low)
@@ -488,7 +488,161 @@ func TestDiskSpaceCriticalEscalation(t *testing.T) {
 	}
 	restarted := NewServer(database, s.llmManager, s.toolSetConfig, s.logger, true, "predictable", "")
 	initTestDiskSpace(t, restarted, &available)
-	if got := restarted.diskSpace.snapshot(); !got.Critical || !got.Dismissed || got.EpisodeID != low.EpisodeID+2 {
+	if got := restarted.diskSpace.Load().snapshot(); !got.Critical || !got.Dismissed || got.EpisodeID != low.EpisodeID+2 {
 		t.Fatalf("after restart: %+v", got)
+	}
+}
+
+// fillTestDB stops the database file from growing, then uses up its free pages
+// and the slack in the settings table, so inserts there (and anything that
+// needs a new page) fail with a real SQLITE_FULL.
+func fillTestDB(t *testing.T, database *db.DB) {
+	t.Helper()
+	ctx := t.Context()
+	p := database.Pool()
+	if err := p.Exec(ctx, "CREATE TABLE disk_full_filler (b BLOB)"); err != nil {
+		t.Fatal(err)
+	}
+	var pages int
+	if err := p.Rx(ctx, func(ctx context.Context, rx *db.Rx) error {
+		return rx.QueryRow("PRAGMA page_count").Scan(&pages)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Exec(ctx, fmt.Sprintf("PRAGMA max_page_count=%d", pages)); err != nil {
+		t.Fatal(err)
+	}
+	for _, insert := range []func(i int) error{
+		func(int) error { return p.Exec(ctx, "INSERT INTO disk_full_filler VALUES (zeroblob(100))") },
+		func(i int) error { return database.SetSetting(ctx, fmt.Sprintf("test.filler.%d", i), "x") },
+	} {
+		for i := 0; ; i++ {
+			err := insert(i)
+			if db.IsDiskFull(err) {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if i > 100_000 {
+				t.Fatal("database never filled up")
+			}
+		}
+	}
+}
+
+// When the disk fills up, a failed write tells the client so and raises the
+// notice right away, even though the notice itself cannot be persisted yet.
+func TestDiskFullWriteReportsAndRaisesNotice(t *testing.T) {
+	t.Parallel()
+	s, database, _ := newTestServer(t)
+	fillTestDB(t, database) // before init, so filling raises nothing
+	available := diskspace.Threshold
+	initTestDiskSpace(t, s, &available)
+	m := s.diskSpace.Load()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	next, _ := s.streamPub.SubscribeWithStatus(ctx, -1)
+
+	available = 0
+	body := `{"message":"hi","model":"predictable"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/conversations/new", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleNewConversation(w, req)
+	if w.Code != http.StatusInsufficientStorage || !strings.Contains(w.Body.String(), "database or disk is full") {
+		t.Fatalf("got HTTP %d %q, want 507 with the sqlite error", w.Code, w.Body.String())
+	}
+
+	var raised *diskspace.DiskSpaceStatus
+	for raised == nil {
+		ev, ok := next()
+		if !ok {
+			t.Fatal("disk-full write did not raise the notice")
+		}
+		raised = ev.DiskSpaceStatus
+	}
+	if !raised.Active || !raised.Critical || raised.Dismissed || raised.AvailableBytes != 0 {
+		t.Fatalf("raised notice: %+v", raised)
+	}
+	m.mu.Lock() // the background check has finished (and failed to persist)
+	m.mu.Unlock()
+	if value, err := database.GetSetting(t.Context(), diskSpaceSettingKey); err != nil || value != "" {
+		t.Fatalf("notice persisted on a full disk? %q, err=%v", value, err)
+	}
+
+	// Once there is room again, the next check catches the persisted episode up.
+	if err := database.Pool().Exec(t.Context(), "PRAGMA max_page_count=1073741823"); err != nil {
+		t.Fatal(err)
+	}
+	status := checkDiskSpace(t, m)
+	value, err := database.GetSetting(t.Context(), diskSpaceSettingKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved diskSpaceEpisode
+	if err := json.Unmarshal([]byte(value), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.Revision != status.Revision || !saved.Active || !saved.Critical {
+		t.Fatalf("saved %+v, want %+v", saved, status)
+	}
+}
+
+// Starting on a full disk must not fail: the notice is shown and saved later.
+func TestDiskSpaceInitOnFullDisk(t *testing.T) {
+	t.Parallel()
+	s, database, _ := newTestServer(t)
+	fillTestDB(t, database)
+	available := uint64(0)
+	initTestDiskSpace(t, s, &available)
+	if status := s.diskSpace.Load().snapshot(); !status.Active || !status.Critical {
+		t.Fatalf("status = %+v, want active and critical", status)
+	}
+	if value, err := database.GetSetting(t.Context(), diskSpaceSettingKey); err != nil || value != "" {
+		t.Fatalf("notice persisted on a full disk? %q, err=%v", value, err)
+	}
+}
+
+// A full disk at startup must not stop Shelley serving, or the user only sees
+// the proxy's bare 502. Clearing agent_working left by a turn that was running
+// when the disk filled is a write the full disk can fail.
+func TestStartOnFullDiskWithWorkingConversation(t *testing.T) {
+	t.Parallel()
+	s, database, _ := newTestServer(t)
+	seedInterruptedConversation(t, database, nil)
+	// In-place updates need no new pages, so make them grow the database.
+	if err := database.Pool().Exec(t.Context(), `CREATE TRIGGER grow_on_update AFTER UPDATE ON conversations BEGIN
+		INSERT OR REPLACE INTO settings (key, value) VALUES ('test.grow', hex(zeroblob(4096)));
+	END`); err != nil {
+		t.Fatal(err)
+	}
+	fillTestDB(t, database)
+	if _, err := database.ConsumeResumeAfterUpgrade(t.Context()); !db.IsDiskFull(err) {
+		t.Fatalf("ConsumeResumeAfterUpgrade error = %v, want disk full", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	started := make(chan error, 1)
+	go func() { started <- s.StartWithListeners(listener, "") }()
+	served := make(chan error, 1)
+	go func() {
+		resp, err := http.Get("http://" + listener.Addr().String() + "/api/conversations")
+		if err == nil {
+			resp.Body.Close()
+		}
+		served <- err
+	}()
+	select {
+	case err := <-started:
+		t.Fatalf("server exited: %v", err)
+	case err := <-served:
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }

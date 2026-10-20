@@ -80,7 +80,7 @@ func createLiveMessage(t *testing.T, srv *Server, database *db.DB, convID, text 
 	if err != nil {
 		t.Fatalf("CreateMessage(%s): %v", convID, err)
 	}
-	srv.notifySubscribersNewMessage(ctx, convID, msg)
+	srv.notifySubscribers(ctx, convID, *msg)
 }
 
 // TestUnifiedStreamMultiplexesTwoConversations: a single /api/stream2
@@ -93,7 +93,7 @@ func TestUnifiedStreamMultiplexesTwoConversations(t *testing.T) {
 
 	convA := seedConversation(t, database, 0)
 	convB := seedConversation(t, database, 0)
-	// Activate managers so notifySubscribersNewMessage will publish.
+	// Activate managers so notifySubscribers will publish.
 	if _, err := srv.getOrCreateConversationManager(t.Context(), convA, ""); err != nil {
 		t.Fatalf("activate A: %v", err)
 	}

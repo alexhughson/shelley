@@ -31,8 +31,13 @@
         <span class="status-readout-cwd-path status-readout-affordance">{{
           tildifyPath(cwd)
         }}</span>
+        <span class="status-readout-cwd-leaf status-readout-affordance" aria-hidden="true">{{
+          cwdLeaf
+        }}</span>
       </button>
-      <span class="status-readout-sep hide-on-mobile" aria-hidden="true">·</span>
+      <span class="status-readout-sep status-readout-sep-cwd hide-on-mobile" aria-hidden="true"
+        >·</span
+      >
     </template>
 
     <ContextUsageBar
@@ -45,14 +50,15 @@
       :messages="messages"
       :on-distill-new-generation="onDistillNewGeneration"
       :on-start-new-generation="onStartNewGeneration"
+      :on-compact-in-place="onCompactInPlace"
+      :compact-in-place-busy="compactInPlaceBusy"
       :on-usage-needed="onUsageNeeded"
-      :agent-working="agentWorking"
     />
 
     <template v-if="selectedModel">
-      <span class="status-readout-sep" aria-hidden="true">·</span>
-      <!-- Switching model rebuilds the conversation's loop, which cancels a
-           running turn (ApplyModelSettings -> CancelConversation). Disable the
+      <span class="status-readout-sep status-readout-sep-model" aria-hidden="true">·</span>
+      <!-- Changing settings rebuilds the conversation's loop, which cancels a
+           running turn (ApplySettings -> CancelConversation). Disable the
            picker while the agent works rather than silently killing the turn the
            user is watching, and say why two ways: the tooltip has to hang off
            this wrapper (PrimeVue gives a disabled control pointer-events: none,
@@ -76,6 +82,7 @@
           :thinking-level="thinkingLevel"
           :disabled="agentWorking"
           :refreshing="refreshingModels"
+          :knob="knob"
           @select-model="onSwitchConversationModel"
           @select-combination="onSwitchConversationCombination"
           @thinking-change="onSwitchConversationThinkingLevel"
@@ -94,6 +101,7 @@ import type { OtherUsageRow, UsageEntry } from "../../utils/tokenCostGraph";
 import { tildifyPath } from "../../utils/tildify";
 import { useI18n } from "../composables/i18n";
 import type { ThinkingLevel } from "./thinkingLevel";
+import type { SettingsKnob } from "../composables/profiles";
 import ContextUsageBar from "./ContextUsageBar.vue";
 import ModelPicker from "./ModelPicker.vue";
 
@@ -112,6 +120,8 @@ const props = defineProps<{
   agentWorking?: boolean;
   onDistillNewGeneration?: () => Promise<void> | void;
   onStartNewGeneration?: () => Promise<void> | void;
+  onCompactInPlace?: () => Promise<void> | void;
+  compactInPlaceBusy?: boolean;
   onUsageNeeded?: () => void;
   onChangeConversationCwd?: () => void;
   onSwitchConversationModel: (model: string) => void;
@@ -122,9 +132,15 @@ const props = defineProps<{
   onSwitchConversationThinkingLevel: (level: ThinkingLevel) => void;
   onManageModels: () => void;
   onRefreshModels: () => void;
+  knob?: SettingsKnob;
 }>();
 
 const { t } = useI18n();
+
+const cwdLeaf = computed(() => {
+  const normalized = props.cwd?.replace(/[\\/]+$/, "");
+  return normalized?.split(/[\\/]/).pop() || normalized || "";
+});
 
 // Undefined rather than "" when idle: v-tooltip treats an empty string as a
 // tooltip to render, and the ModelPicker prop is optional.

@@ -52,14 +52,6 @@ func (b *Buffer) Insert(pos int, new string) {
 	b.q = append(b.q, edit{pos, pos, new})
 }
 
-// Delete deletes the text old[start:end].
-func (b *Buffer) Delete(start, end int) {
-	if end < start || start < 0 || end > len(b.old) {
-		panic("invalid edit position")
-	}
-	b.q = append(b.q, edit{start, end, ""})
-}
-
 // Replace replaces old[start:end] with new.
 func (b *Buffer) Replace(start, end int, new string) {
 	if end < start || start < 0 || end > len(b.old) {

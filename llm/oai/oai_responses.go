@@ -13,20 +13,26 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"shelley.exe.dev/llm"
 	"shelley.exe.dev/llm/imageutil"
 	"shelley.exe.dev/llm/llmhttp"
+	"shelley.exe.dev/models/modelsdev"
 )
 
 // ResponsesService provides chat completions using the OpenAI Responses API.
 // This API is required for models like gpt-5.3-codex.
 // Fields should not be altered concurrently with calling any method on ResponsesService.
 type ResponsesService struct {
+	// ReasoningOverride is advertised for this model at this endpoint; nil uses models.dev.
+	ReasoningOverride *modelsdev.ReasoningCapabilities
+
 	HTTPC         *http.Client      // defaults to http.DefaultClient if nil
 	APIKey        string            // optional, if not set will try to load from env var
 	Model         Model             // defaults to DefaultModel if zero value
@@ -116,19 +122,24 @@ func fitResponsesContentToPatchLimit(contents []llm.Content, patchSize, maxPatch
 // Responses API request/response types
 
 type responsesRequest struct {
-	Model             string               `json:"model"`
-	Instructions      string               `json:"instructions,omitempty"`
-	Store             bool                 `json:"store"`
-	Stream            bool                 `json:"stream"`
-	Input             []responsesInputItem `json:"input"`
-	Tools             []responsesTool      `json:"tools,omitempty"`
-	ToolChoice        any                  `json:"tool_choice,omitempty"`
-	ParallelToolCalls bool                 `json:"parallel_tool_calls,omitempty"`
-	MaxOutputTokens   int                  `json:"max_output_tokens,omitempty"`
-	Reasoning         *responsesReasoning  `json:"reasoning,omitempty"`
-	Include           []string             `json:"include,omitempty"`
-	PromptCacheKey    string               `json:"prompt_cache_key,omitempty"`
-	Text              *responsesText       `json:"text,omitempty"`
+	Model              string                       `json:"model"`
+	Instructions       string                       `json:"instructions,omitempty"`
+	Store              bool                         `json:"store"`
+	Stream             bool                         `json:"stream"`
+	Input              []responsesInputItem         `json:"input"`
+	Tools              []responsesTool              `json:"tools,omitempty"`
+	ToolChoice         any                          `json:"tool_choice,omitempty"`
+	ParallelToolCalls  bool                         `json:"parallel_tool_calls,omitempty"`
+	MaxOutputTokens    int                          `json:"max_output_tokens,omitempty"`
+	Reasoning          *responsesReasoning          `json:"reasoning,omitempty"`
+	Include            []string                     `json:"include,omitempty"`
+	PromptCacheKey     string                       `json:"prompt_cache_key,omitempty"`
+	PromptCacheOptions *responsesPromptCacheOptions `json:"prompt_cache_options,omitempty"`
+	Text               *responsesText               `json:"text,omitempty"`
+}
+
+type responsesPromptCacheOptions struct {
+	Prewarm bool `json:"prewarm,omitempty"`
 }
 
 type responsesReasoning struct {
@@ -621,6 +632,9 @@ func (s *ResponsesService) Provider() string { return s.ProviderName }
 // neither is set, no reasoning field is emitted and the provider applies its
 // own default (which Shelley cannot name), so it returns "".
 func (s *ResponsesService) DefaultReasoningLevel() string {
+	if effort, ok := overrideReasoningEffort(s.ReasoningOverride, &llm.Request{}, s.ThinkingLevel, s.ReasoningEffort); ok {
+		return defaultReasoningLevel(effort)
+	}
 	if s.ReasoningEffort != "" {
 		return s.ReasoningEffort
 	}
@@ -632,18 +646,23 @@ func (s *ResponsesService) DefaultReasoningLevel() string {
 
 func (s *ResponsesService) SupportsServerSideWebSearch() bool { return true }
 
-// SupportsReasoning reports the models.dev capability when known. Unknown
-// models retain the historical default of supporting reasoning controls.
+// SetReasoningOverride configures endpoint controls before the service is used.
+func (s *ResponsesService) SetReasoningOverride(caps *modelsdev.ReasoningCapabilities) {
+	s.ReasoningOverride = caps
+}
+
+// SupportsReasoning uses endpoint metadata before models.dev. Unknown models
+// retain the historical default of supporting reasoning controls.
 func (s *ResponsesService) SupportsReasoning() bool {
-	caps, found := modelReasoningCapabilities(s.ModelURL, cmp.Or(s.Model, DefaultModel))
+	caps, found := modelReasoningCapabilities(s.ReasoningOverride, s.ModelURL, cmp.Or(s.Model, DefaultModel))
 	return !found || caps.Supported
 }
 
-// SupportedReasoningLevels advertises exact effort levels from models.dev.
+// SupportedReasoningLevels advertises endpoint effort levels before models.dev.
 // Nil means the model has no exact effort metadata and callers use the
 // historical provider fallback.
 func (s *ResponsesService) SupportedReasoningLevels() []llm.ThinkingLevel {
-	caps, found := modelReasoningCapabilities(s.ModelURL, cmp.Or(s.Model, DefaultModel))
+	caps, found := modelReasoningCapabilities(s.ReasoningOverride, s.ModelURL, cmp.Or(s.Model, DefaultModel))
 	return advertisedReasoningLevels(caps, found)
 }
 
@@ -666,13 +685,13 @@ func (s *ResponsesService) MaxImageBytes() int {
 }
 
 // Do sends a request to OpenAI using the Responses API.
-func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error) {
+// buildRequest converts ir into a streaming Responses API request.
+func (s *ResponsesService) buildRequest(ctx context.Context, ir *llm.Request) (responsesRequest, string, llm.MessageOrigin, error) {
 	var err error
 	ir, err = llm.PrepareRequestCitations(ctx, ir, "openai-responses", s.adaptCitation)
 	if err != nil {
-		return nil, err
+		return responsesRequest{}, "", llm.MessageOrigin{}, err
 	}
-	httpc := cmp.Or(s.HTTPC, http.DefaultClient)
 	model := cmp.Or(s.Model, DefaultModel)
 	openAIResponses := s.isOpenAIResponses()
 	reasoningReplay := responsesReasoningReplayNone
@@ -691,7 +710,7 @@ func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Respon
 	if openAIResponses {
 		fittedMessages, err := fitResponsesImagesToPatchLimit(messages, responsesImagePatchSize, responsesMaxImagePatchCount)
 		if err != nil {
-			return nil, fmt.Errorf("prepare Responses API images: %w", err)
+			return responsesRequest{}, "", llm.MessageOrigin{}, fmt.Errorf("prepare Responses API images: %w", err)
 		}
 		messages = fittedMessages
 	}
@@ -700,7 +719,7 @@ func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Respon
 		msg = filterReasoningForOrigin(msg, origin)
 		for j, c := range msg.Content {
 			if len(c.Citations) > 0 && c.Text == "" {
-				return nil, fmt.Errorf("openai-responses messages[%d].content[%d]: cannot replay citations on empty assistant text", i, j)
+				return responsesRequest{}, "", llm.MessageOrigin{}, fmt.Errorf("openai-responses messages[%d].content[%d]: cannot replay citations on empty assistant text", i, j)
 			}
 		}
 		items := fromLLMMessageResponses(msg, reasoningReplay)
@@ -784,6 +803,9 @@ func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Respon
 			}
 		}
 	}
+	if explicit, ok := overrideReasoningEffort(s.ReasoningOverride, ir, s.ThinkingLevel, s.ReasoningEffort); ok {
+		effort = explicit
+	}
 	if effort != "" {
 		req.Reasoning = &responsesReasoning{Effort: effort}
 		if s.supportsReasoningSummaries() {
@@ -795,6 +817,17 @@ func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Respon
 	if ir.ToolChoice != nil {
 		req.ToolChoice = fromLLMToolChoice(ir.ToolChoice)
 	}
+
+	return req, fullURL, origin, nil
+}
+
+func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Response, error) {
+	req, fullURL, origin, err := s.buildRequest(ctx, ir)
+	if err != nil {
+		return nil, err
+	}
+	httpc := cmp.Or(s.HTTPC, http.DefaultClient)
+	model := cmp.Or(s.Model, DefaultModel)
 
 	// Marshal the request
 	reqJSON, err := json.Marshal(req)
@@ -1031,8 +1064,92 @@ func (s *ResponsesService) Do(ctx context.Context, ir *llm.Request) (*llm.Respon
 		result := s.toLLMResponseFromResponses(&resp, httpResp.Header)
 		result.URL = fullURL
 		result.Origin = &origin
+		endTime := time.Now()
+		result.StartTime = &retryStart
+		result.EndTime = &endTime
 		return result, nil
 	}
+}
+
+// prewarmModel matches GPT-5.6 and later: the models with a 30-minute prompt
+// cache and prompt_cache_options.prewarm.
+var prewarmModel = regexp.MustCompile(`^gpt-(\d+)(?:\.(\d+))?(?:$|-)`)
+
+func (s *ResponsesService) supportsPrewarm() bool {
+	m := prewarmModel.FindStringSubmatch(cmp.Or(s.Model, DefaultModel).ModelName)
+	if !s.isOpenAIResponses() || m == nil {
+		return false
+	}
+	major, _ := strconv.Atoi(m[1])
+	minor, _ := strconv.Atoi(m[2])
+	return major > 5 || major == 5 && minor >= 6
+}
+
+// CacheTTL is OpenAI's minimum cache lifetime after the last write or read on
+// models that can prewarm; others cannot warm, so they report 0.
+func (s *ResponsesService) CacheTTL() time.Duration {
+	if !s.supportsPrewarm() {
+		return 0
+	}
+	return 30 * time.Minute
+}
+
+// prewarmOutputCap bounds output in case prewarm is ignored (e.g. dropped by
+// a gateway); OpenAI's minimum max_output_tokens. It is not part of the cache key.
+const prewarmOutputCap = 16
+
+// WarmCache sends ir as Do would, with prompt_cache_options.prewarm, which
+// refreshes the cached prefix without generating output. It makes one
+// non-streaming attempt; any output is an error.
+func (s *ResponsesService) WarmCache(ctx context.Context, ir *llm.Request) (llm.Usage, error) {
+	if !s.supportsPrewarm() {
+		return llm.Usage{}, fmt.Errorf("%w: %s cannot prewarm", llm.ErrCacheWarmUnsupported, cmp.Or(s.Model, DefaultModel).ModelName)
+	}
+	req, url, _, err := s.buildRequest(ctx, ir)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	req.Stream = false
+	req.MaxOutputTokens = prewarmOutputCap
+	req.PromptCacheOptions = &responsesPromptCacheOptions{Prewarm: true}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+s.APIKey)
+	if s.Org != "" {
+		httpReq.Header.Set("OpenAI-Organization", s.Org)
+	}
+	httpResp, err := cmp.Or(s.HTTPC, http.DefaultClient).Do(httpReq)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	defer httpResp.Body.Close()
+	body, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return llm.Usage{}, err
+	}
+	if httpResp.StatusCode != http.StatusOK {
+		return llm.Usage{}, fmt.Errorf("openai prewarm: status %v (url=%s, model=%s): %s", httpResp.Status, url, req.Model, body)
+	}
+	var resp responsesResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return llm.Usage{}, fmt.Errorf("openai prewarm: %w", err)
+	}
+	if resp.Error != nil {
+		return llm.Usage{}, fmt.Errorf("openai prewarm: %s", resp.Error.Message)
+	}
+	if len(resp.Output) > 0 || resp.Usage.OutputTokens > 0 {
+		return llm.Usage{}, fmt.Errorf("openai prewarm generated output: status %q, %d output items, %d tokens", resp.Status, len(resp.Output), resp.Usage.OutputTokens)
+	}
+	usage := s.toLLMUsageFromResponses(resp.Usage, httpResp.Header)
+	usage.Model = resp.Model
+	return usage, nil
 }
 
 func (s *ResponsesService) isOpenAIResponses() bool {
@@ -1295,7 +1412,7 @@ func (s *ResponsesService) PatchProfile() string {
 	if s.isOpenAIResponses() && s.Model.SupportsApplyPatch {
 		return "codex_apply_patch"
 	}
-	return "flat"
+	return llm.ModelPatchProfile(s.Model.ModelName)
 }
 
 // ConfigDetails returns configuration information for logging

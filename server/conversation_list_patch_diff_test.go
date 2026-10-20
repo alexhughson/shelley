@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"shelley.exe.dev/db"
 	"shelley.exe.dev/db/generated"
 )
 
@@ -12,13 +13,15 @@ func mkConv(id, slug string, working bool) ConversationWithState {
 	s := slug
 	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	return ConversationWithState{
-		Conversation: generated.Conversation{
-			ConversationID:      id,
-			Slug:                &s,
-			UserInitiated:       true,
-			CreatedAt:           now,
-			UpdatedAt:           now,
-			ConversationOptions: "{}",
+		ConversationListItem: db.ConversationListItem{
+			Conversation: generated.Conversation{
+				ConversationID:      id,
+				Slug:                &s,
+				UserInitiated:       true,
+				CreatedAt:           now,
+				UpdatedAt:           now,
+				ConversationOptions: "{}",
+			},
 		},
 		Working: working,
 	}

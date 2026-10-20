@@ -575,7 +575,7 @@ await run("disk_space_status frames reach onDiskSpaceStatus (no conversation_id)
   const handle = connectGlobalStream({
     getHash: () => "hash0",
     onListPatch: () => {},
-    onDiskSpaceStatus: (status) => seen.push(status),
+    onDiskSpaceStatus: (status, snapshot) => seen.push({ status, snapshot }),
   });
   latest().emitOpen();
   latest().emitMessage({ heartbeat: true });
@@ -588,8 +588,21 @@ await run("disk_space_status frames reach onDiskSpaceStatus (no conversation_id)
     available_bytes: 1_600_000_000,
   };
   latest().emitMessage({ disk_space_status: status });
-  assert(seen.length === 1, "disk_space_status delivered");
-  assert((seen[0] as typeof status).episode_id === 1, "payload passed through");
+  latest().emitMessage({ disk_space_status: { ...status, revision: 2 } });
+  type Seen = { status: typeof status; snapshot: boolean };
+  const got = seen as Seen[];
+  assert(got.length === 2, "disk_space_status delivered");
+  assert(got[0].status.episode_id === 1, "payload passed through");
+  assert(got[0].snapshot, "first status on a connection is its snapshot");
+  assert(!got[1].snapshot, "later statuses are transitions");
+  // A restarted server may resend an older revision (an unpersisted
+  // transition was lost), so each new connection's first status is again a
+  // snapshot.
+  latest().emitError();
+  advance(1000);
+  latest().emitOpen();
+  latest().emitMessage({ disk_space_status: status });
+  assert(got.length === 3 && got[2].snapshot, "first status after reconnect is a snapshot");
   handle.close();
 });
 

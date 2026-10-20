@@ -19,6 +19,9 @@ type Step struct {
 	Key        string `json:"key,omitempty"`
 	Modifiers  string `json:"modifiers,omitempty"`
 	Count      int    `json:"count,omitempty"`
+	// Tab names the browser tab the step acts on; empty is the tab the browser
+	// started with. A navigate step to a name not yet open opens that tab.
+	Tab string `json:"tab,omitempty"`
 }
 
 // Supported action names.
@@ -43,6 +46,7 @@ const (
 	ActionAssertTitle        = "assert_title"
 	ActionAssertCount        = "assert_count"
 	ActionSleep              = "sleep"
+	ActionCloseTab           = "close_tab"
 )
 
 // ParseSteps parses a JSON array of steps.
@@ -62,8 +66,18 @@ func FormatSteps(steps []Step) ([]byte, error) {
 // StepSummary returns a short human-readable summary of a step, e.g.
 // "navigate /new" or "click #login-button" or "assert_text .title \"Hello\"".
 func StepSummary(s Step) string {
+	if s.Tab != "" {
+		return "[" + s.Tab + "] " + stepSummary(s)
+	}
+	return stepSummary(s)
+}
+
+func stepSummary(s Step) string {
 	switch s.Action {
 	case ActionNavigate:
+		if s.URL == "" && s.Tab != "" {
+			return "navigate to the first tab's page"
+		}
 		return "navigate " + s.URL
 	case ActionWaitVisible, ActionWaitHidden, ActionAssertVisible, ActionAssertNotVisible:
 		return s.Action + " " + s.Selector

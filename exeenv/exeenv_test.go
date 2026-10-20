@@ -1,9 +1,163 @@
 package exeenv
 
 import (
+	"errors"
+	"io"
+	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func metadataResponse(body string) *http.Response {
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}
+}
+
+func TestCurrentOutsideExeVMDoesNotProbeMetadata(t *testing.T) {
+	r := &resolver{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		t.Fatalf("unexpected metadata request outside exe.dev: %s", req.URL)
+		return nil, nil
+	})}}
+	env, err := currentOnVM(filepath.Join(t.TempDir(), "missing-exe-dev-marker"), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := env.ReflectionURL(); got != "https://reflection.int.exe.xyz" {
+		t.Errorf("ReflectionURL() = %q, want prod", got)
+	}
+}
+
+func TestCurrentInsideExeVMProbesMetadata(t *testing.T) {
+	calls := 0
+	r := &resolver{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return metadataResponse(`{"reflection_url":"http://reflection.int.exe.cloud"}`), nil
+	})}}
+	env, err := currentOnVM(t.TempDir(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := env.ReflectionURL(); got != "http://reflection.int.exe.cloud" {
+		t.Errorf("ReflectionURL() = %q, want local", got)
+	}
+	if calls != 1 {
+		t.Errorf("metadata requests = %d, want 1", calls)
+	}
+}
+
+func TestMetadataEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+		want string
+	}{
+		{"production", "https://reflection.int.exe.xyz", "https://llm.team.exe.xyz"},
+		{"local", "http://reflection.int.exe.cloud", "http://llm.team.exe.cloud"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			r := resolver{client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.URL.String() != "http://169.254.169.254/" {
+					t.Fatalf("metadata request URL = %q", req.URL)
+				}
+				return metadataResponse(`{"name":"my-box","source_ip":"10.42.0.42","reflection_url":"` + tc.url + `"}`), nil
+			})}}
+			for range 2 {
+				env, err := r.current()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := env.ReflectionURL(); got != tc.url {
+					t.Errorf("ReflectionURL() = %q, want %q", got, tc.url)
+				}
+				if got := env.IntegrationURL("llm", true); got != tc.want {
+					t.Errorf("IntegrationURL(llm, true) = %q, want %q", got, tc.want)
+				}
+			}
+			if calls != 1 {
+				t.Errorf("metadata requests = %d, want one cached success", calls)
+			}
+		})
+	}
+}
+
+func TestMetadataFallbackStaysProd(t *testing.T) {
+	calls := 0
+	r := resolver{
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return nil, errors.New("metadata unavailable")
+			}
+			return metadataResponse(`{"reflection_url":"http://reflection.int.exe.cloud"}`), nil
+		})},
+	}
+	for range 3 {
+		env, err := r.current()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := env.ReflectionURL(); got != "https://reflection.int.exe.xyz" {
+			t.Errorf("fallback ReflectionURL() = %q", got)
+		}
+	}
+	if calls != 1 {
+		t.Errorf("metadata requests = %d, want a single attempt", calls)
+	}
+}
+
+func TestMetadataMissingFieldFallsBackToProd(t *testing.T) {
+	r := resolver{client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return metadataResponse(`{"name":"old-box","source_ip":"10.42.0.42"}`), nil
+	})}}
+	env, err := r.current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := env.ReflectionURL(); got != "https://reflection.int.exe.xyz" {
+		t.Errorf("fallback ReflectionURL() = %q", got)
+	}
+}
+
+func TestMetadataUnavailableStatusFallsBackToProd(t *testing.T) {
+	r := resolver{client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("not ready"))}, nil
+	})}}
+	env, err := r.current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := env.ReflectionURL(); got != "https://reflection.int.exe.xyz" {
+		t.Errorf("fallback ReflectionURL() = %q", got)
+	}
+}
+
+func TestMetadataMalformedURLDoesNotSilentlyFallBack(t *testing.T) {
+	for _, badURL := range []string{"ftp://reflection.int.exe.xyz", "https://other.example", "https://reflection.int.exe.xyz/path", "https://reflection.int.exe.xyz:443"} {
+		t.Run(badURL, func(t *testing.T) {
+			r := resolver{client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return metadataResponse(`{"reflection_url":"` + badURL + `"}`), nil
+			})}}
+			if _, err := r.current(); err == nil {
+				t.Fatalf("accepted invalid reflection_url %q", badURL)
+			}
+		})
+	}
+}
+
+func TestMalformedMetadataDoesNotSilentlyFallBack(t *testing.T) {
+	r := resolver{client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return metadataResponse(`{"reflection_url":`), nil
+	})}}
+	if _, err := r.current(); err == nil {
+		t.Fatal("malformed metadata should return an error")
+	}
+}
 
 func TestNewBuildsConfiguredEnvironment(t *testing.T) {
 	env, err := New("https", "example.test")
@@ -60,52 +214,5 @@ func TestCurrentPrefersConfiguredEnvironment(t *testing.T) {
 	}
 	if got.ReflectionURL() != env.ReflectionURL() {
 		t.Fatalf("Current().ReflectionURL() = %q, want %q", got.ReflectionURL(), env.ReflectionURL())
-	}
-}
-
-func TestFromHostnameBuildsEnvironmentURLs(t *testing.T) {
-	tests := []struct {
-		name           string
-		hostname       string
-		reflectionURL  string
-		personalLLMURL string
-		teamLLMURL     string
-	}{
-		{
-			name:           "production",
-			hostname:       "box.exe.xyz",
-			reflectionURL:  "https://reflection.int.exe.xyz",
-			personalLLMURL: "https://llm.int.exe.xyz",
-			teamLLMURL:     "https://llm.team.exe.xyz",
-		},
-		{
-			name:           "development",
-			hostname:       "box.exe.cloud",
-			reflectionURL:  "http://reflection.int.exe.cloud",
-			personalLLMURL: "http://llm.int.exe.cloud",
-			teamLLMURL:     "http://llm.team.exe.cloud",
-		},
-		{
-			name:           "development subdomain",
-			hostname:       "box.shelley.exe.cloud",
-			reflectionURL:  "http://reflection.int.exe.cloud",
-			personalLLMURL: "http://llm.int.exe.cloud",
-			teamLLMURL:     "http://llm.team.exe.cloud",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			env := FromHostname(tt.hostname)
-			if got := env.ReflectionURL(); got != tt.reflectionURL {
-				t.Errorf("ReflectionURL() = %q, want %q", got, tt.reflectionURL)
-			}
-			if got := env.IntegrationURL("llm", false); got != tt.personalLLMURL {
-				t.Errorf("IntegrationURL(personal) = %q, want %q", got, tt.personalLLMURL)
-			}
-			if got := env.IntegrationURL("llm", true); got != tt.teamLLMURL {
-				t.Errorf("IntegrationURL(team) = %q, want %q", got, tt.teamLLMURL)
-			}
-		})
 	}
 }

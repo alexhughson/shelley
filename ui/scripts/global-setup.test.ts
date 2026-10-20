@@ -86,7 +86,10 @@ async function checkDarwinSessionFormat() {
     '8103 8102 8103 cafe0123 sleep 120',
     '8104 1 8104 baddcafe sleep 120',
     '8105 1 8105 baddcafe exe-scroll: session /tmp/unrelated/terminals/x.sock',
+    // Busy CI hosts can produce more than execFileSync's default 1 MiB buffer.
+    ...Array(1500).fill(`8106 1 8106 baddcafe unrelated ${'x'.repeat(800)}`),
   ].join('\n');
+  assert.ok(Buffer.byteLength(rows) > 1024 * 1024);
   try {
     writeFileSync(join(fakeBin, 'ps'), `#!/bin/sh\ncat <<'PS'\n${rows}\nPS\n`, { mode: 0o755 });
     process.env.PATH = `${fakeBin}:${originalPath}`;

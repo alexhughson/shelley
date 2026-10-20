@@ -11,7 +11,15 @@ import {
   GitFileDiff,
   VersionInfo,
   CommitInfo,
+  ConversationSettings,
+  Profile,
+  Settings,
+  SettingsChange,
+  SystemPromptInfo,
+  TemplateProblem,
 } from "../types";
+
+export type LiveConversationSettings = Pick<ChatRequest, "model" | "cwd" | "conversation_options">;
 
 // Extract a useful error message from a failed fetch response. Prefers the
 // response body (which may contain a server-side detail like a hook error),
@@ -36,6 +44,14 @@ async function responseError(response: Response, prefix: string): Promise<ApiErr
     detail = response.statusText || `HTTP ${response.status}`;
   }
   return new ApiError(`${prefix}: ${detail}`, response.status);
+}
+
+// A backgrounded bash command that has not exited (server BackgroundJobInfo).
+export interface BackgroundJob {
+  job_id: string;
+  command: string;
+  tail: string;
+  started_at: string;
 }
 
 export interface AvailableModel {
@@ -121,6 +137,7 @@ export interface GitTourBuildStatus {
   worker_conversation_id?: string;
   worker_slug?: string;
   error?: string;
+  progress?: { step: string; at: string }[];
 }
 
 export interface GitTourResponse {
@@ -147,21 +164,13 @@ class ApiService {
     "Content-Type": "application/json",
   };
 
-  async getConversations(): Promise<ConversationWithState[]> {
-    const response = await fetch(`${this.baseUrl}/conversations`);
-    if (!response.ok) {
-      throw new Error(`Failed to get conversations: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
   async getConversationsSnapshot(): Promise<{
     conversations: ConversationWithState[];
     hash: string;
   }> {
     const response = await fetch(`${this.baseUrl}/conversations/snapshot`);
     if (!response.ok) {
-      throw new Error(`Failed to get conversations snapshot: ${response.statusText}`);
+      throw await responseError(response, "Failed to load conversations");
     }
     return response.json();
   }
@@ -169,7 +178,7 @@ class ApiService {
   async getModels(): Promise<AvailableModel[]> {
     const response = await fetch(`${this.baseUrl}/models`);
     if (!response.ok) {
-      throw new Error(`Failed to get models: ${response.statusText}`);
+      throw await responseError(response, "Failed to get models");
     }
     return response.json();
   }
@@ -230,7 +239,7 @@ class ApiService {
   }> {
     const response = await fetch(`${this.baseUrl}/tools`);
     if (!response.ok) {
-      throw new Error(`Failed to get tools: ${response.statusText}`);
+      throw await responseError(response, "Failed to get tools");
     }
     return response.json();
   }
@@ -244,7 +253,7 @@ class ApiService {
     const params = new URLSearchParams({ q: query });
     const response = await fetch(`${this.baseUrl}/conversations/search?${params}`, { signal });
     if (!response.ok) {
-      throw new Error(`Failed to search conversations: ${response.statusText}`);
+      throw await responseError(response, "Failed to search conversations");
     }
     return response.json();
   }
@@ -323,7 +332,7 @@ class ApiService {
       }),
     });
     if (!response.ok) {
-      throw new Error(`Failed to distill into new generation: ${response.statusText}`);
+      throw await responseError(response, "Failed to distill into new generation");
     }
     return response.json();
   }
@@ -333,7 +342,7 @@ class ApiService {
       method: "POST",
     });
     if (!response.ok) {
-      throw new Error(`Failed to start new generation: ${response.statusText}`);
+      throw await responseError(response, "Failed to start new generation");
     }
     return response.json();
   }
@@ -411,7 +420,7 @@ class ApiService {
       `${this.baseUrl}/conversation/${conversationId}?last_sequence_id=${sinceSequenceId}`,
     );
     if (!response.ok) {
-      throw new Error(`Failed to get messages since ${sinceSequenceId}: ${response.statusText}`);
+      throw await responseError(response, `Failed to get messages since ${sinceSequenceId}`);
     }
     return response.json();
   }
@@ -449,6 +458,52 @@ class ApiService {
     }
     const body = await response.text();
     return body ? (JSON.parse(body) as ChatAcceptedResponse) : {};
+  }
+
+  // Exchanges a browser WebRTC offer for a GPT-Live session. The server holds
+  // the API key; the browser then talks to OpenAI directly.
+  async createLiveSession(
+    conversationId: string,
+    sdp: string,
+    signal: AbortSignal,
+    settings?: LiveConversationSettings,
+  ): Promise<{ session: { id: string }; transport: { sdp: string } }> {
+    const response = await fetch(`${this.baseUrl}/conversation/${conversationId}/live-session`, {
+      method: "POST",
+      headers: this.postHeaders,
+      body: JSON.stringify({ sdp, ...settings }),
+      signal,
+    });
+    if (!response.ok) throw await responseError(response, "Failed to start live session");
+    return response.json();
+  }
+
+  // Live's events for the server's side of a call, which decides what the
+  // user's speech becomes and answers on liveCallInstructionsURL.
+  async sendLiveEvents(
+    conversationId: string,
+    sessionId: string,
+    events: unknown[],
+  ): Promise<void> {
+    const response = await fetch(this.liveCallURL(conversationId, sessionId) + "/events", {
+      method: "POST",
+      headers: this.postHeaders,
+      body: JSON.stringify({ events }),
+    });
+    if (!response.ok) throw await responseError(response, "Failed to relay the call to Shelley");
+  }
+
+  liveCallInstructionsURL(conversationId: string, sessionId: string): string {
+    return this.liveCallURL(conversationId, sessionId) + "/stream";
+  }
+
+  async endLiveCall(conversationId: string, sessionId: string): Promise<void> {
+    const response = await fetch(this.liveCallURL(conversationId, sessionId), { method: "DELETE" });
+    if (!response.ok) throw await responseError(response, "Failed to end the call");
+  }
+
+  private liveCallURL(conversationId: string, sessionId: string): string {
+    return `${this.baseUrl}/conversation/${encodeURIComponent(conversationId)}/live-session/${encodeURIComponent(sessionId)}`;
   }
 
   async listBtwReaders(conversationId: string): Promise<BtwReaderDescriptor[]> {
@@ -570,7 +625,7 @@ class ApiService {
       method: "POST",
     });
     if (!response.ok) {
-      throw new Error(`Failed to cancel conversation: ${response.statusText}`);
+      throw await responseError(response, "Failed to cancel conversation");
     }
   }
 
@@ -579,7 +634,7 @@ class ApiService {
       method: "POST",
     });
     if (!response.ok) {
-      throw new Error(`Failed to cancel queued messages: ${response.statusText}`);
+      throw await responseError(response, "Failed to cancel queued messages");
     }
   }
 
@@ -600,7 +655,7 @@ class ApiService {
       { method: "POST" },
     );
     if (!response.ok) {
-      throw new Error(`Failed to cancel queued message: ${response.statusText}`);
+      throw await responseError(response, "Failed to cancel queued message");
     }
   }
 
@@ -618,7 +673,7 @@ class ApiService {
   async validateCwd(path: string): Promise<{ valid: boolean; error?: string }> {
     const response = await fetch(`${this.baseUrl}/validate-cwd?path=${encodeURIComponent(path)}`);
     if (!response.ok) {
-      throw new Error(`Failed to validate cwd: ${response.statusText}`);
+      throw await responseError(response, "Failed to validate cwd");
     }
     return response.json();
   }
@@ -641,7 +696,7 @@ class ApiService {
       : `${this.baseUrl}/list-directory`;
     const response = await fetch(url);
     if (!response.ok) {
-      throw new Error(`Failed to list directory: ${response.statusText}`);
+      throw await responseError(response, "Failed to list directory");
     }
     return response.json();
   }
@@ -653,7 +708,7 @@ class ApiService {
       body: JSON.stringify({ path }),
     });
     if (!response.ok) {
-      throw new Error(`Failed to create directory: ${response.statusText}`);
+      throw await responseError(response, "Failed to create directory");
     }
     return response.json();
   }
@@ -661,7 +716,7 @@ class ApiService {
   async getArchivedConversations(): Promise<ConversationWithParticipants[]> {
     const response = await fetch(`${this.baseUrl}/conversations/archived`);
     if (!response.ok) {
-      throw new Error(`Failed to get archived conversations: ${response.statusText}`);
+      throw await responseError(response, "Failed to get archived conversations");
     }
     return response.json();
   }
@@ -671,7 +726,7 @@ class ApiService {
       method: "POST",
     });
     if (!response.ok) {
-      throw new Error(`Failed to archive conversation: ${response.statusText}`);
+      throw await responseError(response, "Failed to archive conversation");
     }
     return response.json();
   }
@@ -681,7 +736,7 @@ class ApiService {
       method: "POST",
     });
     if (!response.ok) {
-      throw new Error(`Failed to unarchive conversation: ${response.statusText}`);
+      throw await responseError(response, "Failed to unarchive conversation");
     }
     return response.json();
   }
@@ -691,7 +746,7 @@ class ApiService {
       method: "POST",
     });
     if (!response.ok) {
-      throw new Error(`Failed to delete conversation: ${response.statusText}`);
+      throw await responseError(response, "Failed to delete conversation");
     }
   }
 
@@ -703,7 +758,7 @@ class ApiService {
       return null;
     }
     if (!response.ok) {
-      throw new Error(`Failed to get conversation by slug: ${response.statusText}`);
+      throw await responseError(response, "Failed to get conversation by slug");
     }
     return response.json();
   }
@@ -712,9 +767,11 @@ class ApiService {
   async getGitDiffs(
     cwd: string,
     commit?: string,
+    includeStats = true,
   ): Promise<{ diffs: GitDiffInfo[]; gitRoot: string }> {
     const params = new URLSearchParams({ cwd });
     if (commit) params.set("commit", commit);
+    if (!includeStats) params.set("stats", "false");
     const response = await fetch(`${this.baseUrl}/git/diffs?${params}`);
     if (!response.ok) {
       const text = await response.text();
@@ -746,16 +803,6 @@ class ApiService {
 
   gitTourMediaURL(cwd: string, blob: string): string {
     return `${this.baseUrl}/git/tour/media?${new URLSearchParams({ cwd, blob })}`;
-  }
-
-  async hasGitTour(cwd: string, hash: string): Promise<boolean> {
-    const params = new URLSearchParams({ cwd, hash });
-    const response = await fetch(`${this.baseUrl}/git/tour?${params}`, { method: "HEAD" });
-    if (response.status === 404) return false;
-    if (!response.ok) {
-      throw await responseError(response, "Failed to check commit tour");
-    }
-    return true;
   }
 
   async getGitTour(cwd: string, hash: string): Promise<GitTourResponse> {
@@ -799,7 +846,7 @@ class ApiService {
       `${this.baseUrl}/git/diffs/${diffId}/files?cwd=${encodeURIComponent(cwd)}${toParam}`,
     );
     if (!response.ok) {
-      throw new Error(`Failed to get diff files: ${response.statusText}`);
+      throw await responseError(response, "Failed to get diff files");
     }
     return response.json();
   }
@@ -821,7 +868,7 @@ class ApiService {
       `${this.baseUrl}/git/file-diff/${diffId}/${encodedPath}?cwd=${encodeURIComponent(cwd)}${toParam}${oldPathParam}`,
     );
     if (!response.ok) {
-      throw new Error(`Failed to get file diff: ${response.statusText}`);
+      throw await responseError(response, "Failed to get file diff");
     }
     return response.json();
   }
@@ -836,7 +883,7 @@ class ApiService {
       `${this.baseUrl}/git/commit-messages?cwd=${encodeURIComponent(cwd)}&from=${encodeURIComponent(from)}${toParam}`,
     );
     if (!response.ok) {
-      throw new Error(`Failed to get commit messages: ${response.statusText}`);
+      throw await responseError(response, "Failed to get commit messages");
     }
     return response.json();
   }
@@ -943,6 +990,37 @@ class ApiService {
     return response.json();
   }
 
+  // Turns the compact_in_place tool on in a conversation started without it
+  // (the Compact in Place button). Refused mid-turn; the message says so.
+  async enableCompactInPlace(conversationId: string): Promise<Conversation> {
+    const response = await fetch(
+      `${this.baseUrl}/conversation/${conversationId}/enable-compact-in-place`,
+      { method: "POST", headers: this.postHeaders },
+    );
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(
+        text.trim() || `Failed to enable compacting in place: ${response.statusText}`,
+      );
+    }
+    return response.json();
+  }
+
+  // Changes an existing conversation's settings (see SettingsChange). The
+  // server records a marker and broadcasts the updated conversation.
+  async updateConversationSettings(
+    conversationId: string,
+    change: SettingsChange,
+  ): Promise<ConversationSettings> {
+    const response = await fetch(`${this.baseUrl}/conversation/${conversationId}/settings`, {
+      method: "POST",
+      headers: this.postHeaders,
+      body: JSON.stringify(change),
+    });
+    if (!response.ok) throw await responseError(response, "Failed to change settings");
+    return response.json();
+  }
+
   async updateConversationTags(conversationId: string, tags: string[]): Promise<Conversation> {
     const response = await fetch(`${this.baseUrl}/conversation/${conversationId}/tags`, {
       method: "POST",
@@ -950,17 +1028,29 @@ class ApiService {
       body: JSON.stringify({ tags }),
     });
     if (!response.ok) {
-      throw new Error(`Failed to update tags: ${response.statusText}`);
+      throw await responseError(response, "Failed to update tags");
     }
     return response.json();
   }
 
-  async getSubagents(conversationId: string): Promise<Conversation[]> {
-    const response = await fetch(`${this.baseUrl}/conversation/${conversationId}/subagents`);
+  async getBackgroundJobs(conversationId: string): Promise<BackgroundJob[]> {
+    const response = await fetch(
+      `${this.baseUrl}/conversation/${encodeURIComponent(conversationId)}/background-jobs`,
+    );
     if (!response.ok) {
-      throw new Error(`Failed to get subagents: ${response.statusText}`);
+      throw await responseError(response, "Failed to get background jobs");
     }
     return response.json();
+  }
+
+  async killBackgroundJob(conversationId: string, jobId: string): Promise<void> {
+    const response = await fetch(
+      `${this.baseUrl}/conversation/${encodeURIComponent(conversationId)}/background-jobs/${encodeURIComponent(jobId)}/kill`,
+      { method: "POST" },
+    );
+    if (!response.ok) {
+      throw await responseError(response, "Failed to kill background job");
+    }
   }
 
   // Version check APIs
@@ -968,7 +1058,7 @@ class ApiService {
     const url = forceRefresh ? "/version-check?refresh=true" : "/version-check";
     const response = await fetch(url);
     if (!response.ok) {
-      throw new Error(`Failed to check version: ${response.statusText}`);
+      throw await responseError(response, "Failed to check version");
     }
     return response.json();
   }
@@ -977,7 +1067,7 @@ class ApiService {
     const params = new URLSearchParams({ current: currentTag, latest: latestTag });
     const response = await fetch(`/version-changelog?${params}`);
     if (!response.ok) {
-      throw new Error(`Failed to get changelog: ${response.statusText}`);
+      throw await responseError(response, "Failed to get changelog");
     }
     return response.json();
   }
@@ -1012,7 +1102,7 @@ class ApiService {
       method: "POST",
     });
     if (!response.ok) {
-      throw new Error(`Failed to exit: ${response.statusText}`);
+      throw await responseError(response, "Failed to exit");
     }
     return response.json();
   }
@@ -1020,7 +1110,7 @@ class ApiService {
   async getSettings(): Promise<Record<string, string>> {
     const response = await fetch("/settings");
     if (!response.ok) {
-      throw new Error(`Failed to get settings: ${response.statusText}`);
+      throw await responseError(response, "Failed to get settings");
     }
     return response.json();
   }
@@ -1073,7 +1163,7 @@ export interface FeatureFlag {
 export const featureFlagsApi = {
   async list(): Promise<FeatureFlag[]> {
     const r = await fetch("/feature-flags");
-    if (!r.ok) throw new Error(`Failed to load feature flags: ${r.statusText}`);
+    if (!r.ok) throw await responseError(r, "Failed to load feature flags");
     return r.json();
   },
   async set(name: string, value: unknown): Promise<void> {
@@ -1091,6 +1181,31 @@ export const featureFlagsApi = {
       body: JSON.stringify({ name }),
     });
     if (!r.ok) throw new Error((await r.text()) || r.statusText);
+  },
+};
+
+// The favicon emoji comes from exe.dev when the VM has one; otherwise it is
+// Shelley's own stored emoji, which set() changes. href is the favicon data URI.
+export interface FaviconEmoji {
+  emoji: string;
+  source: "exe.dev" | "shelley";
+  href: string;
+}
+
+export const faviconEmojiApi = {
+  async get(): Promise<FaviconEmoji> {
+    const r = await fetch("/api/favicon-emoji");
+    if (!r.ok) throw await responseError(r, "Failed to load favicon emoji");
+    return r.json();
+  },
+  async set(emoji: string): Promise<FaviconEmoji> {
+    const r = await fetch("/api/favicon-emoji", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "X-Shelley-Request": "1" },
+      body: JSON.stringify({ emoji }),
+    });
+    if (!r.ok) throw await responseError(r, "Failed to save favicon emoji");
+    return r.json();
   },
 };
 
@@ -1117,7 +1232,7 @@ export const modelCostsApi = {
         headers: { "Content-Type": "application/json", "X-Shelley-Request": "1" },
         body: JSON.stringify({ models: missing }),
       });
-      if (!r.ok) throw new Error(`Failed to load model costs: ${r.statusText}`);
+      if (!r.ok) throw await responseError(r, "Failed to load model costs");
       const data = (await r.json()) as { costs: Record<string, ModelCostDTO | null> };
       for (const m of missing) modelCostCache.set(m.model, data.costs[m.model] ?? null);
     }
@@ -1158,7 +1273,7 @@ export const subagentUsageApi = {
       headers: { "X-Shelley-Request": "1" },
       signal,
     });
-    if (!r.ok) throw new Error(`Failed to load subagent usage: ${r.statusText}`);
+    if (!r.ok) throw await responseError(r, "Failed to load subagent usage");
     return (await r.json()) as SubagentUsageDTO;
   },
 };
@@ -1172,7 +1287,6 @@ export interface CustomModel {
   api_key: string;
   model_name: string;
   max_tokens: number;
-  tags: string; // Comma-separated tags (e.g., "slug" for slug generation)
   reasoning_effort: string; // Legacy provider-verbatim default
   reasoning_replay: "auto" | "none" | "reasoning_content";
   resolved_reasoning_replay?: "none" | "reasoning_content";
@@ -1190,7 +1304,6 @@ export interface CreateCustomModelRequest {
   api_key: string;
   model_name: string;
   max_tokens: number;
-  tags: string; // Comma-separated tags
   reasoning_effort: string; // Legacy provider-verbatim default
   reasoning_replay: "auto" | "none" | "reasoning_content";
   reasoning_support: "auto" | "yes" | "no";
@@ -1290,6 +1403,141 @@ class CustomModelsApi {
 }
 
 export const customModelsApi = new CustomModelsApi();
+
+export interface McpServer {
+  name: string;
+  url: string;
+  description: string;
+  headers: Record<string, string>;
+  auth?: "" | "logged_in" | "login_required";
+  login_url?: string;
+  integration?: string;
+}
+
+// The parts of a tool's input JSON Schema that ToolDescriptionCard shows.
+export interface ToolSchema {
+  properties?: Record<string, { type?: string | string[]; description?: string; enum?: unknown[] }>;
+  required?: string[];
+}
+
+export interface McpTool {
+  name: string;
+  description?: string;
+  inputSchema: ToolSchema;
+}
+
+async function mcpFetch(path: string, failure: string, init?: RequestInit): Promise<Response> {
+  const response = await fetch(`/api/mcp/servers${path}`, init);
+  if (!response.ok) throw await responseError(response, failure);
+  return response;
+}
+
+const mcpPath = (name: string) => `/${encodeURIComponent(name)}`;
+
+export const mcpServersApi = {
+  async list(): Promise<McpServer[]> {
+    return (await mcpFetch("", "Failed to load MCP servers")).json();
+  },
+  async save(server: McpServer, isNew: boolean): Promise<void> {
+    await mcpFetch(isNew ? "" : mcpPath(server.name), "Failed to save MCP server", {
+      method: isNew ? "POST" : "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(server),
+    });
+  },
+  async remove(name: string): Promise<void> {
+    await mcpFetch(mcpPath(name), "Failed to delete MCP server", { method: "DELETE" });
+  },
+  async logout(name: string): Promise<void> {
+    await mcpFetch(`${mcpPath(name)}/logout`, "Failed to log out", { method: "POST" });
+  },
+  async tools(name: string, signal: AbortSignal): Promise<McpTool[]> {
+    const response = await mcpFetch(`${mcpPath(name)}/tools`, "Failed to list tools", { signal });
+    return ((await response.json()) as { tools: McpTool[] }).tools;
+  },
+};
+
+async function profilesFetch(path: string, failure: string, init?: RequestInit) {
+  const response = await fetch(`/api${path}`, init);
+  if (!response.ok) throw await responseError(response, failure);
+  return response;
+}
+
+export const profilesApi = {
+  async list(): Promise<Profile[]> {
+    return (await profilesFetch("/profiles", "Failed to load profiles")).json();
+  },
+  /** voicePrompt, if given, is saved too; else a new profile has none and
+   *  an updated one keeps its own. */
+  async create(name: string, settings: Settings, voicePrompt?: string): Promise<Profile> {
+    const response = await profilesFetch("/profiles", "Failed to save profile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, ...settings, voice_prompt: voicePrompt }),
+    });
+    return response.json();
+  },
+  async update(name: string, settings: Settings, voicePrompt?: string): Promise<Profile> {
+    const response = await profilesFetch(
+      `/profiles/${encodeURIComponent(name)}`,
+      "Failed to save profile",
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...settings, voice_prompt: voicePrompt }),
+      },
+    );
+    return response.json();
+  },
+  async makeDefault(name: string): Promise<Profile> {
+    const response = await profilesFetch(
+      `/profiles/${encodeURIComponent(name)}/default`,
+      "Failed to change the default profile",
+      { method: "POST" },
+    );
+    return response.json();
+  },
+  async restore(name: string): Promise<Profile> {
+    const response = await profilesFetch(
+      `/profiles/${encodeURIComponent(name)}/restore`,
+      "Failed to restore profile defaults",
+      { method: "POST" },
+    );
+    return response.json();
+  },
+  async remove(name: string): Promise<void> {
+    await profilesFetch(`/profiles/${encodeURIComponent(name)}`, "Failed to delete profile", {
+      method: "DELETE",
+    });
+  },
+  /** A voice prompt written from a profile's model and system prompt, for
+   *  the editor; nothing is saved. */
+  async generateVoicePrompt(model: string, systemPrompt: string): Promise<string> {
+    const response = await profilesFetch(
+      "/profiles/voice-prompt/generate",
+      "Failed to generate a voice prompt",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model, system_prompt: systemPrompt }),
+      },
+    );
+    return ((await response.json()) as { voice_prompt: string }).voice_prompt;
+  },
+  async systemPrompt(): Promise<SystemPromptInfo> {
+    return (await profilesFetch("/system-prompt", "Failed to load the system prompt")).json();
+  },
+  /** Why template can't be rendered, or null if it can. */
+  async checkSystemPrompt(template: string, signal: AbortSignal): Promise<TemplateProblem | null> {
+    const response = await profilesFetch("/system-prompt/check", "Failed to check the template", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ template }),
+      signal,
+    });
+    return ((await response.json()) as { error: TemplateProblem | null }).error;
+  },
+};
 
 // Notification channels API
 export interface NotificationChannelAPI {

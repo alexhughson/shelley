@@ -18,6 +18,15 @@ import (
 	"shelley.exe.dev/llm/predictable"
 )
 
+func testProdExeEnv(t *testing.T) exeenv.Environment {
+	t.Helper()
+	env, err := exeenv.New("https", "exe.xyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
 // withReflectionStatus swaps in a fake reflection client that replies with the
 // given status and body, restoring the original client on cleanup.
 func withReflectionStatus(t *testing.T, status int, body string) {
@@ -196,6 +205,28 @@ func TestIndexInitDataCarriesUserEmail(t *testing.T) {
 	init := indexInitDataWithEmail(t, srv, " alice@example.com ")
 	if got := init["user_email"]; got != "alice@example.com" {
 		t.Fatalf("user_email = %#v, want alice@example.com", got)
+	}
+}
+
+func TestIndexInitDataLinksToVMManagement(t *testing.T) {
+	if !isExeDev() {
+		t.Skip("VM management links are only provided on exe.dev")
+	}
+	srv, _, _ := newTestServer(t)
+	init := indexInitData(t, srv)
+	hostname := init["hostname"].(string)
+	links := init["links"].([]any)
+	if len(links) != 2 {
+		t.Fatalf("links = %#v, want VM website and management links", links)
+	}
+	website := links[0].(map[string]any)
+	if website["title"] != hostname || website["url"] != "https://"+hostname {
+		t.Fatalf("VM website link = %#v", website)
+	}
+	management := links[1].(map[string]any)
+	wantURL := "https://exe.dev/vm/" + strings.SplitN(hostname, ".", 2)[0]
+	if management["title"] != "Manage on exe.dev" || management["url"] != wantURL {
+		t.Fatalf("management link = %#v, want Manage on exe.dev at %s", management, wantURL)
 	}
 }
 
@@ -442,7 +473,7 @@ const llmCatalogWithModels = `{"schema_version":1,"models":[{"id":"openai/gpt-5.
 // (modelsources.go:505). So reflection being down is NOT the blocker and must
 // not be reported as the thing to fix.
 func TestReflectionDownButLLMServing(t *testing.T) {
-	env := exeenv.FromHostname("box.exe.xyz")
+	env := testProdExeEnv(t)
 	withReflectionAndLLM(t, env, http.StatusForbidden, "", http.StatusOK, llmCatalogWithModels)
 	if got := modelSetupHintIn(t.Context(), true); got == modelSetupHintMissingLLM {
 		t.Fatalf("hint = %q, but llm.int is serving models; must not blame the llm integration", got)
@@ -458,7 +489,7 @@ func TestReflectionDownButLLMServing(t *testing.T) {
 // attaching llm, so llm must lead the remedy — reflection alone would not have
 // helped.
 func TestBothIntegrationsDetached(t *testing.T) {
-	env := exeenv.FromHostname("box.exe.xyz")
+	env := testProdExeEnv(t)
 	withReflectionAndLLM(t, env, http.StatusForbidden, "", http.StatusForbidden, "")
 	if got := modelSetupHintIn(t.Context(), true); got != modelSetupHintMissingBoth {
 		t.Fatalf("hint with both detached = %q, want %q", got, modelSetupHintMissingBoth)
@@ -469,7 +500,7 @@ func TestBothIntegrationsDetached(t *testing.T) {
 // evidence that the integration is missing. Never send a user to mutate
 // working integrations because of a blip.
 func TestLLMTransientFailureIsNotDiagnosed(t *testing.T) {
-	env := exeenv.FromHostname("box.exe.xyz")
+	env := testProdExeEnv(t)
 	withReflectionAndLLM(t, env, http.StatusForbidden, "", http.StatusInternalServerError, "")
 	if got := modelSetupHintIn(t.Context(), true); got != modelSetupHintUnknown {
 		t.Fatalf("hint with llm 500 = %q, want %q", got, modelSetupHintUnknown)
@@ -484,7 +515,7 @@ func TestLLMTransientFailureIsNotDiagnosed(t *testing.T) {
 // rules, otherwise it reports "llm is fine" about a catalog that produces
 // nothing.
 func TestLLMCatalogWithNoServeableModels(t *testing.T) {
-	env := exeenv.FromHostname("box.exe.xyz")
+	env := testProdExeEnv(t)
 	const unserveable = `{"schema_version":1,"models":[{"id":"weird/model","provider":"weird","native_id":"weird","apis":["telepathy"]}]}`
 	withReflectionAndLLM(t, env, http.StatusForbidden, "", http.StatusOK, unserveable)
 	if got := cachedReflectionState(t.Context(), env); got == reflectionLLMReachable {

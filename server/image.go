@@ -18,11 +18,6 @@ import (
 // cache headers. This allows the UI to load images on demand instead of
 // receiving all base64 blobs in the conversation JSON.
 func (s *Server) handleMessageImage(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	messageID := r.PathValue("message_id")
 	contentIdxStr := r.PathValue("content_index")
 	trIdxStr := r.PathValue("toolresult_index")

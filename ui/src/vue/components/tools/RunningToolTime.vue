@@ -1,6 +1,6 @@
 <template>
   <div v-if="elapsed" class="tool-running-elapsed" data-testid="tool-running-elapsed">
-    Running for {{ elapsed }}
+    <slot :elapsed="elapsed">Running for {{ elapsed }}</slot>
   </div>
 </template>
 

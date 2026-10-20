@@ -3,6 +3,12 @@ package models
 import "testing"
 
 func TestAssignTiers(t *testing.T) {
+	t.Run("haiku 5.5 supersedes haiku 4.5", func(t *testing.T) {
+		tiers := AssignTiers([]string{"claude-haiku-5.5", "claude-haiku-4.5"})
+		if tiers["claude-haiku-5.5"] != Tier1 || tiers["claude-haiku-4.5"] != Tier2 {
+			t.Fatalf("tiers = %v", tiers)
+		}
+	})
 	t.Run("opus 5.5 shadows older Opus and Sonnet 5", func(t *testing.T) {
 		ids := []string{"claude-opus-5.5", "claude-opus-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-5"}
 		tiers := AssignTiers(ids)

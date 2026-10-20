@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createConversationViaAPI, makePNG, withTempDir } from "./helpers";
+import { openWorkspaceTool, createConversationViaAPI, makePNG, withTempDir } from "./helpers";
 
 // Tours can carry key design decisions, questions for the reader, and
 // screenshots or recordings. Each is commentable, and every comment lands in
@@ -35,8 +35,7 @@ async function openDiffViewer(page: Page, slug: string): Promise<Locator> {
   await page.addInitScript(() => localStorage.setItem("diff-viewer-layout", "sidebar"));
   await page.goto(`/c/${slug}`);
   await expect(page.getByTestId("message-input")).toBeVisible({ timeout: 30000 });
-  await page.locator(".chat-overflow-menu-wrapper .btn-icon").click();
-  await page.locator(".overflow-menu-item", { hasText: /diffs/i }).click();
+  await openWorkspaceTool(page, "Diffs");
   const overlay = page.locator(".diff-viewer-overlay");
   await expect(overlay).toBeVisible({ timeout: 30000 });
   return overlay;
@@ -165,5 +164,23 @@ test("tour decisions, questions, and media are shown and commentable", async ({
     await expect(input).toHaveValue(
       new RegExp(`> video demo\\.webm \\(git blob ${demoBlob}\\) at 0:00\\.0\\nToo fast\\.\\n\\n$`),
     );
+
+    // A collapsed section must not leave a recording playing without controls.
+    await video.evaluate(async (player: HTMLVideoElement) => {
+      player.muted = true;
+      player.loop = true;
+      await player.play();
+    });
+    await expect
+      .poll(() => video.evaluate((player: HTMLVideoElement) => player.paused))
+      .toBe(false);
+    await overlay.getByRole("button", { name: "Collapse What it looks like", exact: true }).click();
+    await expect(video).toBeHidden();
+    await expect.poll(() => video.evaluate((player: HTMLVideoElement) => player.paused)).toBe(true);
+    const pausedAt = await video.evaluate((player: HTMLVideoElement) => player.currentTime);
+    await overlay.getByRole("button", { name: "Expand What it looks like", exact: true }).click();
+    await expect(video).toBeVisible();
+    expect(await video.evaluate((player: HTMLVideoElement) => player.paused)).toBe(true);
+    expect(await video.evaluate((player: HTMLVideoElement) => player.currentTime)).toBe(pausedAt);
   });
 });

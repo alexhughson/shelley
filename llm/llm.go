@@ -4,6 +4,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -28,6 +29,36 @@ type Service interface {
 	MaxImageBytes() int
 	// SupportsImages reports whether the service accepts image inputs.
 	SupportsImages() bool
+}
+
+// CacheWarmer refreshes a provider prompt cache by replaying a previously
+// successful request without generating output. Implementations must not
+// execute or return tool calls.
+type CacheWarmer interface {
+	// CacheTTL is how long a cached prefix lives after its last write or read.
+	CacheTTL() time.Duration
+	WarmCache(context.Context, *Request) (Usage, error)
+}
+
+// CacheTTL returns s's prompt-cache lifetime, or 0 if s cannot warm its cache.
+func CacheTTL(s Service) time.Duration {
+	if w, ok := s.(CacheWarmer); ok {
+		return w.CacheTTL()
+	}
+	return 0
+}
+
+// ErrCacheWarmUnsupported reports that a service cannot warm req's cache
+// without generating output or changing the cached prefix.
+var ErrCacheWarmUnsupported = errors.New("prompt cache warming unsupported")
+
+// WarmCache warms req's cache through s, or returns ErrCacheWarmUnsupported.
+func WarmCache(ctx context.Context, s Service, req *Request) (Usage, error) {
+	w, ok := s.(CacheWarmer)
+	if !ok {
+		return Usage{}, ErrCacheWarmUnsupported
+	}
+	return w.WarmCache(ctx, req)
 }
 
 // ReasoningSupporter reports whether a service accepts reasoning controls and
@@ -107,7 +138,16 @@ func PatchProfile(svc Service) string {
 	if profiler, ok := svc.(PatchProfiler); ok {
 		return profiler.PatchProfile()
 	}
-	return "flat"
+	return "nested"
+}
+
+func ModelPatchProfile(model string) string {
+	model = strings.ToLower(model)
+	model = model[strings.LastIndex(model, "/")+1:]
+	if model == "glm" || strings.HasPrefix(model, "glm-") {
+		return "simple"
+	}
+	return "nested"
 }
 
 // DefaultReasoner is implemented by services that can report the reasoning
@@ -125,7 +165,8 @@ type DefaultReasoner interface {
 	// replicate the per-model effort clamping some request builders apply
 	// (e.g. chat backends downgrading "xhigh"->"high"). That only diverges
 	// when a service-level default is itself set to a clamped level, which
-	// does not happen for the shipped defaults (all "medium").
+	// does not happen for the shipped defaults (all "medium"). Explicit endpoint
+	// controls instead report the effective value after their overrides.
 	DefaultReasoningLevel() string
 }
 
@@ -311,6 +352,9 @@ type Tool struct {
 	CustomGrammar string
 	// EndsTurn indicates that this tool should cause the model to end its turn when used
 	EndsTurn bool
+	// EndsTurnWhen identifies inputs that may end the turn. Those calls must
+	// run alone, so the loop checks before starting any sibling tools.
+	EndsTurnWhen func(json.RawMessage) bool `json:"-"`
 	// Sequential runs sibling calls to this tool one at a time in request order.
 	// Other tools in the same sibling batch still run concurrently.
 	Sequential bool
@@ -363,6 +407,10 @@ type ToolOut struct {
 	// LLMContent is the output of the tool to be sent back to the LLM.
 	// May be nil on error.
 	LLMContent []Content
+	// EndTurn stops the current turn after this tool result is persisted.
+	// Unlike Tool.EndsTurn, this is chosen per call (e.g. message_parent
+	// distinguishes a progress report from a final report).
+	EndTurn bool
 	// Display is content to be displayed to the user.
 	// The type of content is set by the tool and coordinated with the UIs.
 	// It should be JSON-serializable.
@@ -457,32 +505,6 @@ type Content struct {
 
 func StringContent(s string) Content {
 	return Content{Type: ContentTypeText, Text: s}
-}
-
-// ContentsAttr returns contents as a slog.Attr.
-// It is meant for logging.
-func ContentsAttr(contents []Content) slog.Attr {
-	var contentAttrs []any // slog.Attr
-	for _, content := range contents {
-		var attrs []any // slog.Attr
-		switch content.Type {
-		case ContentTypeText:
-			attrs = append(attrs, slog.String("text", content.Text))
-		case ContentTypeToolUse:
-			attrs = append(attrs, slog.String("tool_name", content.ToolName))
-			attrs = append(attrs, slog.String("tool_input", string(content.ToolInput)))
-		case ContentTypeToolResult:
-			attrs = append(attrs, slog.Any("tool_result", content.ToolResult))
-			attrs = append(attrs, slog.Bool("tool_error", content.ToolError))
-		case ContentTypeThinking:
-			attrs = append(attrs, slog.String("thinking", content.Thinking))
-		default:
-			attrs = append(attrs, slog.String("unknown_content_type", content.Type.String()))
-			attrs = append(attrs, slog.Any("text", content)) // just log it all raw, better to have too much than not enough
-		}
-		contentAttrs = append(contentAttrs, slog.Group(content.ID, attrs...))
-	}
-	return slog.Group("contents", contentAttrs...)
 }
 
 type (

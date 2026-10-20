@@ -47,6 +47,10 @@ func Capabilities() []string {
 		// conversation when POSTed to /api/conversation/<id>/chat.
 		// See POST /api/conversations/draft, PUT /api/conversation/<id>/draft.
 		"drafts",
+		// "live-call-events": a Live call's delegation runs on the server;
+		// clients relay Live's events and follow its instructions. See
+		// /api/conversation/<id>/live-session/<session>/{stream,events}.
+		"live-call-events",
 	}
 }
 

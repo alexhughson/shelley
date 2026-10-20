@@ -1647,3 +1647,100 @@ func TestListConversationsWithQueuedTranscriptions(t *testing.T) {
 		t.Fatalf("conversations with queued transcriptions = %#v", got)
 	}
 }
+
+// Every list and search query counts each listed conversation's subagents
+// and running background jobs itself, so the list is one query.
+func TestConversationListCounts(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := t.Context()
+
+	parent, err := db.CreateConversation(ctx, stringPtr("counted-parent"), true, nil, nil, ConversationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := parent.ConversationID
+	for _, slug := range []string{"counted-child-a", "counted-child-b", "counted-child-c"} {
+		if _, err := db.CreateSubagentConversation(ctx, slug, pid, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.QueriesTx(ctx, func(q *generated.Queries) error {
+		for _, id := range []string{"running-1", "running-2", "exited"} {
+			if err := q.InsertBackgroundJob(ctx, generated.InsertBackgroundJobParams{JobID: id, ConversationID: pid, StartedAt: time.Now()}); err != nil {
+				return err
+			}
+		}
+		_, err := q.MarkBackgroundJobExited(ctx, "exited")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	lists := map[string]func() ([]ConversationListItem, error){
+		"ListConversations":    func() ([]ConversationListItem, error) { return db.ListConversations(ctx, 100, 0) },
+		"ListAllConversations": func() ([]ConversationListItem, error) { return db.ListAllConversations(ctx, 100, 0) },
+		"SearchConversations":  func() ([]ConversationListItem, error) { return db.SearchConversations(ctx, "counted-parent", 100, 0) },
+		"SearchConversationsWithMessages": func() ([]ConversationListItem, error) {
+			return db.SearchConversationsWithMessages(ctx, "counted-parent", 100, 0)
+		},
+		"SearchConversationsFTS": func() ([]ConversationListItem, error) {
+			hits, err := db.SearchConversationsFTS(ctx, "counted-parent", 100, 0)
+			items := make([]ConversationListItem, len(hits))
+			for i, h := range hits {
+				items[i] = h.ConversationListItem
+			}
+			return items, err
+		},
+	}
+	for name, list := range lists {
+		items, err := list()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		i := slices.IndexFunc(items, func(c ConversationListItem) bool { return c.ConversationID == pid })
+		if i < 0 {
+			t.Fatalf("%s: parent not listed", name)
+		}
+		if got := items[i]; got.SubagentCount != 3 || got.RunningBackgroundJobs != 2 {
+			t.Errorf("%s: subagents %d, running jobs %d; want 3, 2", name, got.SubagentCount, got.RunningBackgroundJobs)
+		}
+	}
+}
+
+// A subagent slug that many earlier conversations already use still yields a
+// new subagent: base, base-1..base-3, then base-<random>.
+func TestGetOrCreateSubagentConversationCrowdedSlug(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	ctx := t.Context()
+	adapter := &SubagentDBAdapter{DB: db}
+
+	taken := map[string]bool{}
+	for i := range 100 {
+		slug := "review"
+		if i > 0 {
+			slug = fmt.Sprintf("review-%d", i)
+		}
+		if _, err := db.CreateConversation(ctx, &slug, true, nil, nil, ConversationOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		taken[slug] = true
+	}
+	parent, err := db.CreateConversation(ctx, stringPtr("crowded-parent"), true, nil, nil, ConversationOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id, slug, err := adapter.GetOrCreateSubagentConversation(ctx, "review", parent.ConversationID, "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taken[slug] || !strings.HasPrefix(slug, "review-") {
+		t.Fatalf("slug = %q, want a new review-<suffix>", slug)
+	}
+	again, _, err := adapter.GetOrCreateSubagentConversation(ctx, slug, parent.ConversationID, "/tmp")
+	if err != nil || again != id {
+		t.Fatalf("reuse %q: got %q, %v; want %q", slug, again, err, id)
+	}
+}

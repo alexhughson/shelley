@@ -122,16 +122,6 @@ func TestIndexUsesReflectionEmojiDespiteStaleFalseOverride(t *testing.T) {
 	}
 }
 
-func TestIndexUsesShellEmojiWithoutReflectionMetadata(t *testing.T) {
-	srv, _, _ := newTestServer(t)
-	srv.reflectionEmoji = func(context.Context) string { return "" }
-
-	svg := indexFaviconSVG(t, srv)
-	if !strings.Contains(svg, ">🐚</text>") {
-		t.Fatalf("favicon does not default to shell emoji: %s", svg)
-	}
-}
-
 func TestIndexEmojiFaviconEscapesReflectionMetadata(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	srv.reflectionEmoji = func(context.Context) string { return "🐚&" }

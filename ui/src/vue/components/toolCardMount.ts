@@ -11,7 +11,7 @@ export function toolCardPlaceholderKind(
   toolInput?: unknown,
   display?: unknown,
 ): ToolCardPlaceholderKind {
-  if (toolName === "bash" || toolName === "shell") return "bash";
+  if (toolName === "bash") return "bash";
   if (toolName === "patch") return "patch";
   if (toolName === "output_iframe") return "output-iframe";
   if (toolName === "openai_audio_transcription") return "audio";

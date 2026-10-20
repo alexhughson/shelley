@@ -101,93 +101,33 @@
       <section v-if="tools.length > 0" class="system-prompt-section system-prompt-tools">
         <h3 class="system-prompt-section-label">🔧 Tools ({{ tools.length }})</h3>
         <div class="system-prompt-card-grid">
-          <article
+          <ToolDescriptionCard
             v-for="tool in tools"
             :key="tool.name"
-            class="system-prompt-card system-prompt-tool-item"
-            :class="{
-              'system-prompt-card--expanded': isCardExpanded('tool', tool.name),
-            }"
+            v-model:expanded="expandedCards[cardKey('tool', tool.name)]"
+            :name="tool.name"
+            :description="tool.description"
+            :preview="toolPreview(tool)"
+            :parameters="tool.parameters"
           >
-            <button
-              type="button"
-              class="system-prompt-card-summary"
-              :aria-expanded="isCardExpanded('tool', tool.name)"
-              @click="toggleCard('tool', tool.name)"
-            >
-              <span class="system-prompt-card-copy">
-                <code class="system-prompt-card-name system-prompt-tool-name">
-                  {{ tool.name }}
-                </code>
-                <span class="system-prompt-card-preview">{{ toolPreview(tool) }}</span>
-              </span>
-              <ToolChevron :expanded="isCardExpanded('tool', tool.name)" />
-              <span class="sr-only">
-                {{ isCardExpanded("tool", tool.name) ? "Collapse" : "Expand" }}
-              </span>
-            </button>
-
-            <div v-if="isCardExpanded('tool', tool.name)" class="system-prompt-card-detail">
-              <p v-if="tool.description.trim()" class="system-prompt-card-full-description">
-                {{ tool.description.trim() }}
-              </p>
-              <dl class="system-prompt-card-metadata">
-                <div v-if="tool.source_path || tool.origin" class="system-prompt-card-meta-row">
-                  <dt>Source</dt>
-                  <dd>
-                    <code v-if="tool.source_path">{{ tool.source_path }}</code>
-                    <span v-if="tool.origin" class="system-prompt-origin-badge">
-                      {{ tool.origin }}
-                    </span>
-                  </dd>
-                </div>
-                <div v-if="tool.type" class="system-prompt-card-meta-row">
-                  <dt>Type</dt>
-                  <dd>
-                    <code>{{ tool.type }}</code>
-                  </dd>
-                </div>
-              </dl>
-
-              <div v-if="Object.keys(propsOf(tool)).length > 0" class="system-prompt-tool-params">
-                <div class="system-prompt-tool-params-label">Parameters</div>
-                <table class="system-prompt-tool-params-table">
-                  <tbody>
-                    <tr
-                      v-for="[paramName, prop] in Object.entries(propsOf(tool))"
-                      :key="paramName"
-                      class="system-prompt-tool-param-row"
-                    >
-                      <td class="system-prompt-tool-param-name">
-                        <code>{{ paramName }}</code>
-                        <span
-                          v-if="requiredOf(tool).has(paramName)"
-                          class="system-prompt-tool-param-required"
-                          >*</span
-                        >
-                      </td>
-                      <td class="system-prompt-tool-param-type">
-                        <code>{{ typeLabel(prop) }}</code>
-                      </td>
-                      <td class="system-prompt-tool-param-desc">
-                        <span v-if="prop.description">{{ prop.description }}</span>
-                        <span
-                          v-if="prop.enum && prop.enum.length > 0"
-                          class="system-prompt-tool-param-enum"
-                        >
-                          {{ " " }}Allowed values:{{ " " }}
-                          <template v-for="(value, index) in prop.enum" :key="index">
-                            <template v-if="index > 0">, </template>
-                            <code>{{ String(value) }}</code>
-                          </template>
-                        </span>
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
+            <dl class="system-prompt-card-metadata">
+              <div v-if="tool.source_path || tool.origin" class="system-prompt-card-meta-row">
+                <dt>Source</dt>
+                <dd>
+                  <code v-if="tool.source_path">{{ tool.source_path }}</code>
+                  <span v-if="tool.origin" class="system-prompt-origin-badge">
+                    {{ tool.origin }}
+                  </span>
+                </dd>
               </div>
-            </div>
-          </article>
+              <div v-if="tool.type" class="system-prompt-card-meta-row">
+                <dt>Type</dt>
+                <dd>
+                  <code>{{ tool.type }}</code>
+                </dd>
+              </div>
+            </dl>
+          </ToolDescriptionCard>
         </div>
       </section>
 
@@ -199,29 +139,15 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
 import type { Message, LLMContent } from "../../types";
+import type { ToolSchema } from "../../services/api";
 import { extractSystemPromptSkills, type SystemPromptSkill } from "./systemPromptSkills";
 import ToolChevron from "./tools/ToolChevron.vue";
-
-interface JSONSchemaProperty {
-  type?: string | string[];
-  description?: string;
-  enum?: (string | number | boolean | null)[];
-  items?: JSONSchemaProperty;
-  $ref?: string;
-  [key: string]: unknown;
-}
-
-interface JSONSchema {
-  type?: string;
-  properties?: Record<string, JSONSchemaProperty>;
-  required?: string[];
-  [key: string]: unknown;
-}
+import ToolDescriptionCard from "./ToolDescriptionCard.vue";
 
 interface ToolDescription {
   name: string;
   description: string;
-  parameters?: JSONSchema;
+  parameters?: ToolSchema;
   source_path?: string;
   origin?: string;
   type?: string;
@@ -257,18 +183,6 @@ function toggleCard(kind: "skill" | "tool", name: string): void {
 
 function toolPreview(tool: ToolDescription): string {
   return tool.description.trim().split("\n")[0] || "Provider-managed tool.";
-}
-
-function requiredOf(tool: ToolDescription): Set<string> {
-  return new Set(tool.parameters?.required ?? []);
-}
-
-function propsOf(tool: ToolDescription): Record<string, JSONSchemaProperty> {
-  return tool.parameters?.properties ?? {};
-}
-
-function typeLabel(prop: JSONSchemaProperty): string {
-  return Array.isArray(prop.type) ? prop.type.join(" | ") : (prop.type ?? "");
 }
 
 function metadataEntries(skill: SystemPromptSkill): [string, string][] {

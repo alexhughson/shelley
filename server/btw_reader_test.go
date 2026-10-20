@@ -798,10 +798,9 @@ func TestBtwLeavesOrdinaryChatBehaviorUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, err := NewSubagentRunner(server).RunSubagent(
-		t.Context(), child.ConversationID, "echo: ordinary child",
-		false, time.Second, "predictable", "",
+		t.Context(), child.ConversationID, "echo: ordinary child", "predictable", "",
 	)
-	if err != nil || !strings.Contains(status, "started processing") {
+	if err != nil || !strings.Contains(status, "message sent") {
 		t.Fatalf("ordinary subagent status=%q err=%v", status, err)
 	}
 	if call := held.waitCall(t, "echo: ordinary child"); requestHasText(call.request, btwFrozenReferenceBegin) {
@@ -942,11 +941,9 @@ func TestSubagentRunnerRejectsBtwReaderReuse(t *testing.T) {
 		t.Fatalf("slug reuse id=%q want=%q err=%v", reusedID, reader.ConversationID, err)
 	}
 	runner := NewSubagentRunner(server)
-	for _, wait := range []bool{false, true} {
-		if _, err := runner.RunSubagent(t.Context(), reader.ConversationID, "delegated work", wait, time.Second, "predictable", ""); err == nil ||
-			!strings.Contains(err.Error(), "cannot be used as delegated subagent work") {
-			t.Fatalf("wait=%t error=%v", wait, err)
-		}
+	if _, err := runner.RunSubagent(t.Context(), reader.ConversationID, "delegated work", "predictable", ""); err == nil ||
+		!strings.Contains(err.Error(), "cannot be used as delegated subagent work") {
+		t.Fatalf("error=%v", err)
 	}
 	if got := len(listMessages(t, database, reader.ConversationID)); got != before {
 		t.Fatalf("rejected subagent work wrote messages: before=%d after=%d", before, got)
@@ -1014,5 +1011,27 @@ func TestBtwReaderCannotBeForked(t *testing.T) {
 	server.handleForkConversation(w, httptest.NewRequest(http.MethodPost, "/", strings.NewReader("{}")), reader.ConversationID)
 	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "cannot be forked") {
 		t.Fatalf("fork BTW status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// A /btw reader can change its model and reasoning, as /model does, but not
+// its fixed tools and prompt.
+func TestBtwChangesOnlyModelSettings(t *testing.T) {
+	server, database, held, parent := newBtwTest(t)
+	reader := postBtw(t, server, parent.ConversationID, "echo: settings", false)
+	releaseAndWaitIdle(t, server, reader.ConversationID, held.waitCall(t, "echo: settings"))
+	manager, err := server.getOrCreateConversationManager(t.Context(), reader.ConversationID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	high := "high"
+	if _, err := server.changeSettings(t.Context(), manager, SettingsChange{ThinkingLevel: &high}); err != nil {
+		t.Fatalf("changing reasoning: %v", err)
+	}
+	if _, err := server.changeSettings(t.Context(), manager, SettingsChange{ToolOverrides: map[string]string{"bash": "off"}}); !errors.Is(err, errSettingsUnavailable) {
+		t.Fatalf("changing tools: got %v, want errSettingsUnavailable", err)
+	}
+	if got := btwSystemData(t, database, reader.ConversationID, 1); got == "" {
+		t.Fatal("reader lost its system prompt")
 	}
 }
